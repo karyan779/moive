@@ -1,0 +1,139 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@font-face {
+  font-family: 'Noto Sans Myanmar';
+  src: url('/fonts/NotoSansMyanmar-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Sans Myanmar';
+  src: url('/fonts/NotoSansMyanmar-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Serif Myanmar';
+  src: url('/fonts/NotoSerifMyanmar-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Serif Myanmar';
+  src: url('/fonts/NotoSerifMyanmar-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Padauk';
+  src: url('/fonts/Padauk-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Padauk';
+  src: url('/fonts/Padauk-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Pyidaungsu';
+  src: url('/fonts/Pyidaungsu-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Pyidaungsu';
+  src: url('/fonts/Pyidaungsu-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TharLon';
+  src: url('/fonts/Tharlon-Regular.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', 'Noto Sans Myanmar', 'Pyidaungsu', 'Padauk', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-myanmar: 'Noto Sans Myanmar', 'Pyidaungsu', 'Padauk', 'Plus Jakarta Sans', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* TTAK Cinema Studio signature warm amber-to-jade editorial gradient text */
+.shimmer-text,
+.ttak-cine-text {
+  background: linear-gradient(
+    90deg,
+    #f59e0b 0%,
+    #fbbf24 28%,
+    #2dd4bf 58%,
+    #fbbf24 82%,
+    #f59e0b 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ttak-shimmer 5.5s linear infinite;
+}
+
+@keyframes ttak-shimmer {
+  to {
+    background-position: 200% center;
+  }
+}
+
+/* Subtle studio texture for quota / plan cards */
+.sw-diagonal-hatch,
+.ttak-studio-hatch {
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgba(245, 158, 11, 0.08) 1px,
+    transparent 0
+  );
+  background-size: 14px 14px;
+}
+
+/* Smooth tactile slider styling */
+input[type='range'] {
+  accent-color: #f59e0b;
+}
+
+/* Custom sleek scrollbars for Obsidian Slate & Warm Ivory studio */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.32);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 158, 11, 0.55);
+}

@@ -1,0 +1,6 @@
+{
+  "name": "TTAK MOVIE RECAP — AI Movie Recap & Video Dubbing Studio",
+  "description": "TTAK MOVIE RECAP — AI-powered movie recap studio, Burmese & multilingual video dubbing, Auto Subtitles (STT), on-device WebCodecs/Canvas subtitle and watermark blur editor, and automated script prompt engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
