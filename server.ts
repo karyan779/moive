@@ -3,7 +3,8 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { pipeline } from 'stream/promises';
@@ -48,6 +49,9 @@ import {
   buildWorkersAiRunUrl,
   parseWorkersAiWhisperResult,
   resolveSttStrategyForMode,
+  resolveMediaContentDisposition,
+  shouldFailInsteadOfWeddingFallback,
+  detectGeminiFailureMessage,
   type AdminApiKeyRecord,
   type AntiCopyrightEffects,
   type ApiProviderType,
@@ -217,6 +221,24 @@ async function configureR2BucketCors(cfg: R2StoredConfig): Promise<void> {
       }
     })
   );
+}
+
+const execFilePromise = promisify(execFile);
+
+async function execFileAsync(
+  file: string,
+  args: string[],
+  options: { timeout?: number; maxBuffer?: number } = {}
+): Promise<{ stdout: string; stderr: string }> {
+  const res = await execFilePromise(file, args, {
+    timeout: options.timeout ?? 900_000,
+    maxBuffer: options.maxBuffer ?? 32 * 1024 * 1024,
+    encoding: 'utf8'
+  });
+  return {
+    stdout: typeof res.stdout === 'string' ? res.stdout : String(res.stdout ?? ''),
+    stderr: typeof res.stderr === 'string' ? res.stderr : String(res.stderr ?? '')
+  };
 }
 
 const EDGE_TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
@@ -590,7 +612,7 @@ async function synthesizeGeminiProVoiceWavBuffer(
     const outWav = path.join(JOBS_TEMP_DIR, `${jobId}_gem_out.wav`);
     try {
       fs.writeFileSync(inWav, rawWav);
-      execFileSync('ffmpeg', [
+      await execFileAsync('ffmpeg', [
         '-y',
         '-i',
         inWav,
@@ -613,7 +635,7 @@ async function synthesizeGeminiProVoiceWavBuffer(
         if (stretchFactor > 1.02) {
           const fitWav = path.join(JOBS_TEMP_DIR, `${jobId}_gem_fit.wav`);
           try {
-            execFileSync('ffmpeg', [
+            await execFileAsync('ffmpeg', [
               '-y',
               '-i',
               outWav,
@@ -788,7 +810,7 @@ async function synthesizeNeuralSpokenWavBuffer(
       const outPcm = path.join(JOBS_TEMP_DIR, `${jobId}_c${i}.pcm`);
       try {
         fs.writeFileSync(inMp3, mp3Buf);
-        execFileSync('ffmpeg', [
+        await execFileAsync('ffmpeg', [
           '-y',
           '-i',
           inMp3,
@@ -843,7 +865,7 @@ async function synthesizeNeuralSpokenWavBuffer(
         const outStretch = path.join(JOBS_TEMP_DIR, `${jobId}_stretch_out_${i}.pcm`);
         try {
           fs.writeFileSync(inRaw, pcm);
-          execFileSync('ffmpeg', [
+          await execFileAsync('ffmpeg', [
             '-y',
             '-f',
             's16le',
@@ -933,7 +955,7 @@ async function synthesizeNeuralSpokenWavBuffer(
       const fittedOut = path.join(JOBS_TEMP_DIR, `${jobId}_fit_out.pcm`);
       try {
         fs.writeFileSync(trimmedIn, masterPcm.subarray(0, spokenSamples * 2));
-        execFileSync('ffmpeg', [
+        await execFileAsync('ffmpeg', [
           '-y',
           '-f',
           's16le',
@@ -1002,29 +1024,31 @@ function msToAssTime(ms: number): string {
 /**
  * Probes video width, height, and duration in seconds via ffprobe (defaults to 720x1280, 15s)
  */
-function probeVideoDimensions(videoPath: string): {
+async function probeVideoDimensions(videoPath: string): Promise<{
   width: number;
   height: number;
   durationSec: number;
-} {
+}> {
   let width = 720;
   let height = 1280;
   let durationSec = 15;
   try {
-    const out = execFileSync('ffprobe', [
-      '-v',
-      'error',
-      '-select_streams',
-      'v:0',
-      '-show_entries',
-      'stream=width,height:format=duration',
-      '-of',
-      'json',
-      videoPath
-    ])
-      .toString()
-      .trim();
-    const parsed = JSON.parse(out);
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=width,height:format=duration',
+        '-of',
+        'json',
+        videoPath
+      ],
+      { timeout: 30_000 }
+    );
+    const parsed = JSON.parse(stdout.trim());
     const stream = parsed?.streams?.[0];
     if (stream?.width > 64 && stream?.height > 64) {
       width = Number(stream.width);
@@ -1543,7 +1567,7 @@ function buildVideoBurnFilterGraph(
  * Replaces the original foreign speech audio track with the AI Burmese Voiceover WAV
  * AND burns in user-configured Blur Watermark boxes + Burmese Subtitles + Anti-Copyright Effects into a single downloadable MP4!
  */
-function muxVideoWithMixedAudio(
+async function muxVideoWithMixedAudio(
   inputVideoPath: string,
   voiceoverWavPath: string,
   outputVideoPath: string,
@@ -1558,7 +1582,7 @@ function muxVideoWithMixedAudio(
   editConfig?: DeepRecapEditConfig,
   captionsOnly = false,
   effects?: Partial<AntiCopyrightEffects>
-): boolean {
+): Promise<boolean> {
   const assPath = path.join(JOBS_TEMP_DIR, `${jobId}_burn.ass`);
   const logoPath = writeTempBrandLogoFile(editConfig, jobId);
   const cleanupTemps = () => {
@@ -1571,7 +1595,7 @@ function muxVideoWithMixedAudio(
   };
 
   try {
-    const { width: rawW, height: rawH, durationSec: vidDur } = probeVideoDimensions(inputVideoPath);
+    const { width: rawW, height: rawH, durationSec: vidDur } = await probeVideoDimensions(inputVideoPath);
     const safeDur = Math.max(3, Math.min(10800, Number((vidDur || 15).toFixed(2))));
 
     const isOutputHD = Boolean(effects?.outputHD);
@@ -1664,7 +1688,7 @@ function muxVideoWithMixedAudio(
           '-preset',
           'ultrafast',
           '-threads',
-          '0',
+          '2',
           '-crf',
           targetCrf,
           '-maxrate',
@@ -1679,7 +1703,7 @@ function muxVideoWithMixedAudio(
     const extraLogoInputArgs = wantsBrandLogo && logoPath ? ['-i', logoPath] : [];
 
     try {
-      execFileSync('ffmpeg', [
+      await execFileAsync('ffmpeg', [
         '-y',
         '-i',
         inputVideoPath,
@@ -1712,7 +1736,7 @@ function muxVideoWithMixedAudio(
     }
 
     // Fallback: simple mux if complex filter failed on an unusual input stream
-    execFileSync('ffmpeg', [
+    await execFileAsync('ffmpeg', [
       '-y',
       '-i',
       inputVideoPath,
@@ -1749,7 +1773,7 @@ function muxVideoWithMixedAudio(
  * Generates a standalone downloadable MP4 video with burned-in Subtitles, Blur regions, Watermark & AI Voiceover
  * when no local MP4 file was uploaded (e.g., URL or procedural demo clip).
  */
-function generateStandaloneRecapMp4(
+async function generateStandaloneRecapMp4(
   voiceoverWavPath: string,
   outputVideoPath: string,
   durationSec: number,
@@ -1762,7 +1786,7 @@ function generateStandaloneRecapMp4(
   aspectRatio: AspectRatioMode = 'original',
   editConfig?: DeepRecapEditConfig,
   effects?: Partial<AntiCopyrightEffects>
-): boolean {
+): Promise<boolean> {
   const assPath = path.join(JOBS_TEMP_DIR, `${jobId}_standalone.ass`);
   const logoPath = writeTempBrandLogoFile(editConfig, `${jobId}_st`);
   const cleanupTemps = () => {
@@ -1830,7 +1854,7 @@ function generateStandaloneRecapMp4(
     const extraLogoInputArgs = wantsBrandLogo && logoPath ? ['-i', logoPath] : [];
 
     const fps = safeDur > 150 ? 12 : 24;
-    execFileSync('ffmpeg', [
+    await execFileAsync('ffmpeg', [
       '-y',
       '-f',
       'lavfi',
@@ -1852,7 +1876,7 @@ function generateStandaloneRecapMp4(
       '-preset',
       'ultrafast',
       '-threads',
-      '0',
+      '2',
       '-crf',
       isOutputHD ? '19' : '21',
       '-pix_fmt',
@@ -1877,9 +1901,9 @@ function generateStandaloneRecapMp4(
 /**
  * Converts a WAV voiceover file into a 192kbps MP3 file for standalone audio download (CapCut ready)
  */
-function convertWavToMp3(wavPath: string, mp3Path: string): boolean {
+async function convertWavToMp3(wavPath: string, mp3Path: string): Promise<boolean> {
   try {
-    execFileSync('ffmpeg', [
+    await execFileAsync('ffmpeg', [
       '-y',
       '-i',
       wavPath,
@@ -2646,43 +2670,54 @@ async function startServer() {
     }
   });
 
-  // Serve generated/muxed recap MP4 videos with proper Range + Content-Disposition headers
+  // Serve generated/muxed recap MP4 videos with inline playback by default and attachment only for downloads (?dl=1 or ?name=)
   app.get('/api/recap/video/:filename', (req, res) => {
     const safeName = path.basename(req.params.filename);
     const filePath = path.join(JOBS_TEMP_DIR, safeName);
     if (!fs.existsSync(filePath)) {
-      res.status(404).json({ error: 'Rendered video not found' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).json({ ok: false, error: 'Rendered video not found' });
       return;
     }
-    const requestedDownloadName =
-      typeof req.query.name === 'string' && req.query.name.trim().length > 0
-        ? req.query.name.trim().replace(/[^a-zA-Z0-9._\-\s]/g, '_')
-        : safeName;
-    const finalDownloadName = requestedDownloadName.toLowerCase().endsWith('.mp4')
-      ? requestedDownloadName
-      : `${requestedDownloadName}.mp4`;
+    const disp = resolveMediaContentDisposition(
+      safeName,
+      typeof req.query.name === 'string' ? req.query.name : undefined,
+      typeof req.query.dl === 'string' ? req.query.dl : undefined,
+      '.mp4'
+    );
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${finalDownloadName}"`);
+    res.setHeader('Content-Disposition', disp.headerValue);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-store');
     res.sendFile(filePath);
   });
 
-  // Serve standalone MP3 voiceover audio files for CapCut / external editing
+  // Serve standalone MP3 voiceover audio files with inline playback by default and attachment on ?dl=1 / ?name=
   app.get('/api/recap/audio/:filename', (req, res) => {
     const safeName = path.basename(req.params.filename);
     const filePath = path.join(JOBS_TEMP_DIR, safeName);
     if (!fs.existsSync(filePath)) {
-      res.status(404).json({ error: 'Audio file not found' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).json({ ok: false, error: 'Audio file not found' });
       return;
     }
+    const disp = resolveMediaContentDisposition(
+      safeName,
+      typeof req.query.name === 'string' ? req.query.name : undefined,
+      typeof req.query.dl === 'string' ? req.query.dl : undefined,
+      '.mp3'
+    );
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Content-Disposition', disp.headerValue);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-store');
     res.sendFile(filePath);
   });
 
   // Convert WAV base64 to standalone MP3 on demand (for History jobs or direct MP3 export)
-  app.post('/api/recap/convert-wav-to-mp3', (req, res) => {
+  app.post('/api/recap/convert-wav-to-mp3', async (req, res) => {
     try {
       const { audioBase64 } = (req.body || {}) as { audioBase64?: string };
       if (!audioBase64 || audioBase64.length < 40) {
@@ -2696,7 +2731,7 @@ async function startServer() {
 
       const cleanB64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
       fs.writeFileSync(wavPath, Buffer.from(cleanB64, 'base64'));
-      const ok = convertWavToMp3(wavPath, mp3Path);
+      const ok = await convertWavToMp3(wavPath, mp3Path);
       try {
         fs.unlinkSync(wavPath);
       } catch {}
@@ -2722,6 +2757,33 @@ async function startServer() {
     string,
     { signature: string; outFilename: string; outputVideoPath: string }
   >();
+
+  interface RenderExportJobStatus {
+    exportId: string;
+    jobId: string;
+    signature: string;
+    status: 'processing' | 'done' | 'error';
+    progress: number;
+    stageMessage: string;
+    dubbedVideoUrl?: string;
+    error?: string;
+    createdAt: number;
+  }
+
+  const renderExportJobs = new Map<string, RenderExportJobStatus>();
+  const renderExportInFlightBySignature = new Map<string, string>();
+
+  function pruneOldExportJobs() {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [k, v] of renderExportJobs.entries()) {
+      if (v.createdAt < cutoff) {
+        renderExportJobs.delete(k);
+        if (renderExportInFlightBySignature.get(v.signature) === k) {
+          renderExportInFlightBySignature.delete(v.signature);
+        }
+      }
+    }
+  }
 
   function computeRenderExportSignature(payload: {
     jobId: string;
@@ -2763,8 +2825,10 @@ async function startServer() {
   }
 
   // Re-burn / Export MP4 with latest user-edited Subtitle position/scale/style, Blur regions, and Anti-Copyright Effects
-  app.post('/api/recap/render-export', (req, res) => {
+  // Supports non-blocking `asyncMode: true` with `/api/recap/render-status/:exportId` polling to prevent Cloudflare 100s 524 timeouts!
+  app.post('/api/recap/render-export', async (req, res) => {
     try {
+      pruneOldExportJobs();
       const {
         jobId,
         durationSec = 15,
@@ -2778,7 +2842,8 @@ async function startServer() {
         editConfig,
         isFreeMode = false,
         mode = 'recap',
-        translateAudio = 'dub'
+        translateAudio = 'dub',
+        asyncMode = false
       } = (req.body || {}) as {
         jobId?: string;
         durationSec?: number;
@@ -2793,6 +2858,7 @@ async function startServer() {
         isFreeMode?: boolean;
         mode?: 'recap' | 'translate';
         translateAudio?: 'dub' | 'captions-only';
+        asyncMode?: boolean;
       };
 
       const isCaptionsOnly = mode === 'translate' && translateAudio === 'captions-only';
@@ -2845,6 +2911,7 @@ async function startServer() {
         res.json({
           ok: true,
           cached: true,
+          status: 'done',
           dubbed_video_url: `/api/recap/video/${cachedExport.outFilename}`
         });
         return;
@@ -2865,56 +2932,146 @@ async function startServer() {
         res.json({
           ok: true,
           cached: true,
+          status: 'done',
           dubbed_video_url: `/api/recap/video/${outFilename}`
         });
         return;
       }
 
-      let ok = false;
-      if (fs.existsSync(inputVideoPath)) {
-        ok = muxVideoWithMixedAudio(
-          inputVideoPath,
-          voiceoverWavPath,
-          outputVideoPath,
-          Boolean(effectiveExportEffects.mirror),
-          false,
-          cues,
-          subtitleConfig,
-          Boolean(blurEnabled),
-          blurRegions,
-          `${safeJobId}_exp`,
-          aspectRatio,
-          effectiveExportEditConfig,
-          isCaptionsOnly,
-          effectiveExportEffects
-        );
-      } else {
-        ok = generateStandaloneRecapMp4(
-          voiceoverWavPath,
-          outputVideoPath,
-          durationSec,
-          cues,
-          subtitleConfig,
-          Boolean(blurEnabled),
-          blurRegions,
-          Boolean(effectiveExportEffects.mirror),
-          `${safeJobId}_exp`,
-          aspectRatio,
-          effectiveExportEditConfig,
-          effectiveExportEffects
-        );
+      const executeExportWork = async (onStep?: (pct: number, msg: string) => void): Promise<boolean> => {
+        onStep?.(35, 'FFmpeg ဖြင့် Subtitles & Effects Render လုပ်နေသည်...');
+        const expTag = `${safeJobId}_exp_${signature.slice(0, 6)}`;
+        const ok = fs.existsSync(inputVideoPath)
+          ? await muxVideoWithMixedAudio(
+              inputVideoPath,
+              voiceoverWavPath,
+              outputVideoPath,
+              Boolean(effectiveExportEffects.mirror),
+              false,
+              cues,
+              subtitleConfig,
+              Boolean(blurEnabled),
+              blurRegions,
+              expTag,
+              aspectRatio,
+              effectiveExportEditConfig,
+              isCaptionsOnly,
+              effectiveExportEffects
+            )
+          : await generateStandaloneRecapMp4(
+              voiceoverWavPath,
+              outputVideoPath,
+              durationSec,
+              cues,
+              subtitleConfig,
+              Boolean(blurEnabled),
+              blurRegions,
+              Boolean(effectiveExportEffects.mirror),
+              expTag,
+              aspectRatio,
+              effectiveExportEditConfig,
+              effectiveExportEffects
+            );
+        if (ok) {
+          renderedJobExportCache.set(safeJobId, { signature, outFilename, outputVideoPath });
+        }
+        return ok;
+      };
+
+      if (asyncMode) {
+        const existingExportId = renderExportInFlightBySignature.get(signature);
+        if (existingExportId && renderExportJobs.has(existingExportId)) {
+          const existingJob = renderExportJobs.get(existingExportId)!;
+          if (existingJob.status === 'processing') {
+            res.json({
+              ok: true,
+              pending: true,
+              exportId: existingJob.exportId,
+              status: existingJob.status,
+              progress: existingJob.progress,
+              stage_message: existingJob.stageMessage
+            });
+            return;
+          }
+          if (existingJob.status === 'done' && existingJob.dubbedVideoUrl) {
+            res.json({
+              ok: true,
+              cached: true,
+              status: 'done',
+              exportId: existingJob.exportId,
+              dubbed_video_url: existingJob.dubbedVideoUrl
+            });
+            return;
+          }
+        }
+
+        const exportId = `exp_${safeJobId}_${signature.slice(0, 8)}_${Date.now().toString(36)}`;
+        const statusRec: RenderExportJobStatus = {
+          exportId,
+          jobId: safeJobId,
+          signature,
+          status: 'processing',
+          progress: 18,
+          stageMessage: 'MP4 Video Render စတင်နေပါသည်...',
+          createdAt: Date.now()
+        };
+        renderExportJobs.set(exportId, statusRec);
+        renderExportInFlightBySignature.set(signature, exportId);
+
+        void (async () => {
+          try {
+            const ok = await executeExportWork((pct, msg) => {
+              const cur = renderExportJobs.get(exportId);
+              if (cur && cur.status === 'processing') {
+                cur.progress = pct;
+                cur.stageMessage = msg;
+              }
+            });
+            const cur = renderExportJobs.get(exportId);
+            if (!cur) return;
+            if (ok) {
+              cur.status = 'done';
+              cur.progress = 100;
+              cur.stageMessage = 'MP4 Export ပြီးစီးပါပြီ!';
+              cur.dubbedVideoUrl = `/api/recap/video/${outFilename}`;
+            } else {
+              cur.status = 'error';
+              cur.error = 'Failed to export video with edits';
+            }
+          } catch (bgErr) {
+            const cur = renderExportJobs.get(exportId);
+            if (cur) {
+              cur.status = 'error';
+              cur.error = bgErr instanceof Error ? bgErr.message : 'Export failed';
+            }
+          } finally {
+            if (renderExportInFlightBySignature.get(signature) === exportId) {
+              renderExportInFlightBySignature.delete(signature);
+            }
+          }
+        })();
+
+        res.json({
+          ok: true,
+          pending: true,
+          exportId,
+          status: 'processing',
+          progress: 18,
+          stage_message: statusRec.stageMessage
+        });
+        return;
       }
 
+      const ok = await executeExportWork();
       if (!ok) {
         res.status(500).json({ ok: false, error: 'Failed to export video with edits' });
         return;
       }
 
-      renderedJobExportCache.set(safeJobId, { signature, outFilename, outputVideoPath });
-
       res.json({
         ok: true,
         cached: false,
+        status: 'done',
         dubbed_video_url: `/api/recap/video/${outFilename}`
       });
     } catch (err) {
@@ -2923,6 +3080,26 @@ async function startServer() {
         error: err instanceof Error ? err.message : 'Export failed'
       });
     }
+  });
+
+  app.get('/api/recap/render-status/:exportId', (req, res) => {
+    const safeId = (req.params.exportId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const job = renderExportJobs.get(safeId);
+    if (!job) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).json({ ok: false, error: 'Export job not found' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: job.status !== 'error',
+      exportId: job.exportId,
+      status: job.status,
+      progress: job.progress,
+      stage_message: job.stageMessage,
+      dubbed_video_url: job.dubbedVideoUrl,
+      error: job.error
+    });
   });
 
   // Health & Engine status route (never exposes Owner API key counts or pool details)
@@ -3026,294 +3203,319 @@ async function startServer() {
     }
   });
 
-  // TTAK MOVIE RECAP Free Recap & Studio Auto-Flow Asset Generator + Audio/Video Mixer
-  app.post('/api/recap/free/generate-assets', async (req, res) => {
-    const startTime = Date.now();
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  interface RecapGenerationJobState {
+    jobId: string;
+    status: 'processing' | 'done' | 'error';
+    progress: number;
+    stageMessage: string;
+    result?: Record<string, any>;
+    error?: string;
+    errorEn?: string;
+    errorCode?: string;
+    createdAt: number;
+  }
 
-    try {
-      const {
-        isFreeMode = false,
-        userGeminiApiKey,
-        userGroqApiKey,
-        durationSec = 15,
-        mode = 'recap',
-        translateAudio = 'dub',
-        scriptStyle = 'narrator',
-        targetLanguage = 'my',
-        voiceGender = 'male',
-        customPrompt,
-        transcriptText,
-        title,
-        videoBase64,
-        r2ObjectKey,
-        r2SrtKey,
-        localUploadId,
-        pitchShift = false,
-        mirrorFlip = false,
-        effects,
-        scriptModel = 'gemini-3-flash-preview',
-        ttsEngine = 'edge-neural',
-        sttModel = 'whisper-large-v3-turbo',
-        breathPauseMs = 100,
-        dynamicTempoFit = true,
-        subtitleConfig,
-        blurEnabled = false,
-        blurRegions = [],
-        aspectRatio = 'original',
-        editConfig
-      } = req.body as {
-        isFreeMode?: boolean;
-        userGeminiApiKey?: string;
-        userGroqApiKey?: string;
-        durationSec?: number;
-        mode?: 'recap' | 'translate';
-        translateAudio?: 'dub' | 'captions-only';
-        scriptStyle?: ScriptStyleId;
-        targetLanguage?: TargetLanguageCode;
-        voiceGender?: VoiceGender;
-        customPrompt?: string;
-        transcriptText?: string;
-        title?: string;
-        videoBase64?: string;
-        r2ObjectKey?: string;
-        r2SrtKey?: string;
-        localUploadId?: string;
-        pitchShift?: boolean;
-        mirrorFlip?: boolean;
-        effects?: Partial<AntiCopyrightEffects>;
-        scriptModel?: ScriptAiModelId;
-        ttsEngine?: TtsEngineId;
-        sttModel?: SttEngineId;
-        breathPauseMs?: number;
-        dynamicTempoFit?: boolean;
-        subtitleConfig?: SubtitleOverlayConfig;
-        blurEnabled?: boolean;
-        blurRegions?: BlurRegion[];
-        aspectRatio?: AspectRatioMode;
-        editConfig?: DeepRecapEditConfig;
-      };
+  const recapGenerationJobs = new Map<string, RecapGenerationJobState>();
 
-      const effectiveServerEffects: Partial<AntiCopyrightEffects> = {
-        outputHD: isFreeMode ? false : Boolean(effects?.outputHD ?? true),
-        zoom: isFreeMode ? false : Boolean(effects?.zoom),
-        mirror: Boolean(effects?.mirror ?? mirrorFlip),
-        colorShift: Boolean(effects?.colorShift),
-        crop: Boolean(effects?.crop),
-        grain: Boolean(effects?.grain),
-        pitchShift: Boolean(effects?.pitchShift ?? pitchShift)
-      };
-
-      const freeGeminiKey =
-        isFreeMode && typeof userGeminiApiKey === 'string' && userGeminiApiKey.trim().length >= 12
-          ? userGeminiApiKey.trim()
-          : '';
-      const freeGroqKey =
-        isFreeMode && typeof userGroqApiKey === 'string' && userGroqApiKey.trim().length >= 12
-          ? userGroqApiKey.trim()
-          : '';
-
-      let inputVideoPath: string | null = null;
-      let extractedAudioBase64: string | null = null;
-      let extractedAudioBuffer: Buffer | null = null;
-      let probedDuration = Number(durationSec) || 15;
-      const r2Config = loadR2Config();
-      // Free Mode runs on local stream only; Cloudflare R2 Direct is exclusively enabled in Credit Mode
-      const effectiveServerR2Config = isFreeMode ? null : r2Config;
-      // Enforce Credit Mode Only for Channel Watermark & Logo (never burn watermark/logo in Free Mode)
-      const effectiveServerEditConfig: DeepRecapEditConfig | undefined =
-        isFreeMode && editConfig
-          ? {
-              ...editConfig,
-              watermarkText: { ...editConfig.watermarkText, enabled: false },
-              brandLogo: { ...editConfig.brandLogo, enabled: false }
-            }
-          : editConfig;
-
-      let effectiveTranscriptText = transcriptText || '';
-
-      if (!effectiveTranscriptText && r2SrtKey && effectiveServerR2Config) {
-        const candidateSrtPath = path.join(JOBS_TEMP_DIR, `${jobId}_subtitles.srt`);
-        try {
-          const downloadedSrt = await downloadR2ObjectToFile(effectiveServerR2Config, r2SrtKey, candidateSrtPath);
-          if (downloadedSrt && fs.existsSync(candidateSrtPath)) {
-            effectiveTranscriptText = stripSrtTimestampsToText(
-              fs.readFileSync(candidateSrtPath, 'utf-8')
-            );
-            try {
-              fs.unlinkSync(candidateSrtPath);
-            } catch {}
-          }
-        } catch (srtDlErr) {
-          console.warn('[R2 Direct] Failed to download SRT from R2:', srtDlErr);
-        }
+  function pruneOldRecapJobs() {
+    const cutoff = Date.now() - 45 * 60 * 1000;
+    for (const [k, v] of recapGenerationJobs.entries()) {
+      if (v.createdAt < cutoff) {
+        recapGenerationJobs.delete(k);
       }
+    }
+  }
 
-      const candidateInputPath = path.join(JOBS_TEMP_DIR, `${jobId}_input.mp4`);
-      if (r2ObjectKey && effectiveServerR2Config) {
-        try {
-          const downloaded = await downloadR2ObjectToFile(effectiveServerR2Config, r2ObjectKey, candidateInputPath);
-          if (downloaded) {
-            inputVideoPath = candidateInputPath;
+  async function runRecapAssetGenerationPipeline(
+    jobId: string,
+    startTime: number,
+    rawBody: any,
+    onProgress: (pct: number, msg: string) => void
+  ): Promise<{ ok: true; payload: Record<string, any> } | { ok: false; statusCode: number; error: string; errorEn?: string; errorCode?: string }> {
+    const {
+      isFreeMode = false,
+      userGeminiApiKey,
+      userGroqApiKey,
+      durationSec = 15,
+      mode = 'recap',
+      translateAudio = 'dub',
+      scriptStyle = 'narrator',
+      targetLanguage = 'my',
+      voiceGender = 'male',
+      customPrompt,
+      transcriptText,
+      title,
+      videoBase64,
+      r2ObjectKey,
+      r2SrtKey,
+      localUploadId,
+      pitchShift = false,
+      mirrorFlip = false,
+      effects,
+      scriptModel = 'gemini-3-flash-preview',
+      ttsEngine = 'edge-neural',
+      sttModel = 'whisper-large-v3-turbo',
+      breathPauseMs = 100,
+      dynamicTempoFit = true,
+      subtitleConfig,
+      blurEnabled = false,
+      blurRegions = [],
+      aspectRatio = 'original',
+      editConfig
+    } = (rawBody || {}) as {
+      isFreeMode?: boolean;
+      userGeminiApiKey?: string;
+      userGroqApiKey?: string;
+      durationSec?: number;
+      mode?: 'recap' | 'translate';
+      translateAudio?: 'dub' | 'captions-only';
+      scriptStyle?: ScriptStyleId;
+      targetLanguage?: TargetLanguageCode;
+      voiceGender?: VoiceGender;
+      customPrompt?: string;
+      transcriptText?: string;
+      title?: string;
+      videoBase64?: string;
+      r2ObjectKey?: string;
+      r2SrtKey?: string;
+      localUploadId?: string;
+      pitchShift?: boolean;
+      mirrorFlip?: boolean;
+      effects?: Partial<AntiCopyrightEffects>;
+      scriptModel?: ScriptAiModelId;
+      ttsEngine?: TtsEngineId;
+      sttModel?: SttEngineId;
+      breathPauseMs?: number;
+      dynamicTempoFit?: boolean;
+      subtitleConfig?: SubtitleOverlayConfig;
+      blurEnabled?: boolean;
+      blurRegions?: BlurRegion[];
+      aspectRatio?: AspectRatioMode;
+      editConfig?: DeepRecapEditConfig;
+    };
+
+    const effectiveServerEffects: Partial<AntiCopyrightEffects> = {
+      outputHD: isFreeMode ? false : Boolean(effects?.outputHD ?? true),
+      zoom: isFreeMode ? false : Boolean(effects?.zoom),
+      mirror: Boolean(effects?.mirror ?? mirrorFlip),
+      colorShift: Boolean(effects?.colorShift),
+      crop: Boolean(effects?.crop),
+      grain: Boolean(effects?.grain),
+      pitchShift: Boolean(effects?.pitchShift ?? pitchShift)
+    };
+
+    const freeGeminiKey =
+      isFreeMode && typeof userGeminiApiKey === 'string' && userGeminiApiKey.trim().length >= 12
+        ? userGeminiApiKey.trim()
+        : '';
+    const freeGroqKey =
+      isFreeMode && typeof userGroqApiKey === 'string' && userGroqApiKey.trim().length >= 12
+        ? userGroqApiKey.trim()
+        : '';
+
+    let inputVideoPath: string | null = null;
+    let extractedAudioBase64: string | null = null;
+    let extractedAudioBuffer: Buffer | null = null;
+    let probedDuration = Number(durationSec) || 15;
+    const r2Config = loadR2Config();
+    const effectiveServerR2Config = isFreeMode ? null : r2Config;
+    const effectiveServerEditConfig: DeepRecapEditConfig | undefined =
+      isFreeMode && editConfig
+        ? {
+            ...editConfig,
+            watermarkText: { ...editConfig.watermarkText, enabled: false },
+            brandLogo: { ...editConfig.brandLogo, enabled: false }
           }
-        } catch (r2DlErr) {
-          console.warn('[R2 Direct] Failed to download object from R2:', r2DlErr);
-        }
-      } else if (localUploadId) {
-        const safeLocId = localUploadId.replace(/[^a-zA-Z0-9_-]/g, '');
-        const localSrcPath = path.join(JOBS_TEMP_DIR, `${safeLocId}_upload.mp4`);
-        if (fs.existsSync(localSrcPath)) {
+        : editConfig;
+
+    let effectiveTranscriptText = transcriptText || '';
+
+    onProgress(38, 'ဗီဒီယိုဖိုင် ပြင်ဆင်ပြီး အသံခွဲထုတ်နေသည်...');
+
+    if (!effectiveTranscriptText && r2SrtKey && effectiveServerR2Config) {
+      const candidateSrtPath = path.join(JOBS_TEMP_DIR, `${jobId}_subtitles.srt`);
+      try {
+        const downloadedSrt = await downloadR2ObjectToFile(effectiveServerR2Config, r2SrtKey, candidateSrtPath);
+        if (downloadedSrt && fs.existsSync(candidateSrtPath)) {
+          effectiveTranscriptText = stripSrtTimestampsToText(
+            fs.readFileSync(candidateSrtPath, 'utf-8')
+          );
           try {
-            fs.renameSync(localSrcPath, candidateInputPath);
-            inputVideoPath = candidateInputPath;
-          } catch {
-            fs.copyFileSync(localSrcPath, candidateInputPath);
-            inputVideoPath = candidateInputPath;
-          }
-        }
-      } else if (videoBase64 && videoBase64.length > 100) {
-        try {
-          const cleanB64 = videoBase64.replace(/^data:[^;]+;base64,/, '');
-          fs.writeFileSync(candidateInputPath, Buffer.from(cleanB64, 'base64'));
-          inputVideoPath = candidateInputPath;
-        } catch (writeErr) {
-          console.warn('[Upload] Could not write uploaded video buffer:', writeErr);
-          inputVideoPath = null;
-        }
-      }
-
-      if (inputVideoPath && fs.existsSync(inputVideoPath)) {
-        try {
-          const probedMeta = probeVideoDimensions(inputVideoPath);
-          if (probedMeta.durationSec > 1) {
-            probedDuration = Number(probedMeta.durationSec.toFixed(2));
-          }
-
-          // Extract 16kHz mono MP3 for Whisper + Gemini multimodal audio transcription (150s max in Free Mode; full video up to 3600s in Credit Mode)
-          const extractedMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_extracted.mp3`);
-          const maxExtractSec = isFreeMode
-            ? 150
-            : Math.max(150, Math.min(3600, Math.ceil(probedDuration || 600)));
-          const audioBitrate = maxExtractSec > 240 ? '32k' : '48k';
-          try {
-            execFileSync('ffmpeg', [
-              '-y',
-              '-i',
-              inputVideoPath,
-              '-t',
-              String(maxExtractSec),
-              '-vn',
-              '-ar',
-              '16000',
-              '-ac',
-              '1',
-              '-b:a',
-              audioBitrate,
-              extractedMp3Path
-            ]);
-            if (fs.existsSync(extractedMp3Path) && fs.statSync(extractedMp3Path).size > 200) {
-              extractedAudioBuffer = fs.readFileSync(extractedMp3Path);
-              extractedAudioBase64 = extractedAudioBuffer.toString('base64');
-            }
-            fs.unlinkSync(extractedMp3Path);
+            fs.unlinkSync(candidateSrtPath);
           } catch {}
-        } catch (probeErr) {
-          console.warn('[Upload] Could not probe uploaded video:', probeErr);
+        }
+      } catch (srtDlErr) {
+        console.warn('[R2 Direct] Failed to download SRT from R2:', srtDlErr);
+      }
+    }
+
+    const candidateInputPath = path.join(JOBS_TEMP_DIR, `${jobId}_input.mp4`);
+    if (r2ObjectKey && effectiveServerR2Config) {
+      try {
+        const downloaded = await downloadR2ObjectToFile(effectiveServerR2Config, r2ObjectKey, candidateInputPath);
+        if (downloaded) {
+          inputVideoPath = candidateInputPath;
+        }
+      } catch (r2DlErr) {
+        console.warn('[R2 Direct] Failed to download object from R2:', r2DlErr);
+      }
+    } else if (localUploadId) {
+      const safeLocId = localUploadId.replace(/[^a-zA-Z0-9_-]/g, '');
+      const localSrcPath = path.join(JOBS_TEMP_DIR, `${safeLocId}_upload.mp4`);
+      if (fs.existsSync(localSrcPath)) {
+        try {
+          fs.renameSync(localSrcPath, candidateInputPath);
+          inputVideoPath = candidateInputPath;
+        } catch {
+          fs.copyFileSync(localSrcPath, candidateInputPath);
+          inputVideoPath = candidateInputPath;
         }
       }
-
-      const safeDuration = Math.max(6, Math.min(isFreeMode ? 150 : 10800, probedDuration));
-      const styleDef = SCRIPT_STYLE_PROMPTS[scriptStyle] || SCRIPT_STYLE_PROMPTS.narrator;
-      const systemInstruction = customPrompt?.trim() || styleDef.systemPrompt;
-
-      const fallbackAssets = buildSyncedRecapCues(
-        safeDuration,
-        scriptStyle,
-        targetLanguage,
-        title
-      );
-
-      let finalTitle = fallbackAssets.title;
-      let finalScriptText = fallbackAssets.scriptText;
-      let finalCues = fallbackAssets.cues;
-      let finalHighlights = fallbackAssets.highlightClips;
-      let usedLiveGemini = false;
-
-      // Check if this video is the 70.7s Chinese wedding drama clip that has exact hand-crafted scene timestamps
-      const isWeddingDramaClip =
-        targetLanguage === 'my' && Math.abs(safeDuration - 70.7) <= 2.5;
-
-      if (isWeddingDramaClip) {
-        // Use sentence-level cues directly before TTS so Edge Neural speaks whole sentences smoothly without mid-sentence choppiness
-        const rawSceneCues = SAVETIK_WEDDING_DRAMA_CUES[scriptStyle] || SAVETIK_WEDDING_DRAMA_CUES.narrator;
-        finalCues = rawSceneCues.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
-        finalScriptText = finalCues.map((c) => c.text).join(' ');
+    } else if (videoBase64 && videoBase64.length > 100) {
+      try {
+        const cleanB64 = videoBase64.replace(/^data:[^;]+;base64,/, '');
+        fs.writeFileSync(candidateInputPath, Buffer.from(cleanB64, 'base64'));
+        inputVideoPath = candidateInputPath;
+      } catch (writeErr) {
+        console.warn('[Upload] Could not write uploaded video buffer:', writeErr);
+        inputVideoPath = null;
       }
+    }
 
-      // 1b. Speech-to-Text pre-pass:
-      // - Free Mode: uses user's own Groq key (or Groq Pool), NEVER Cloudflare Workers AI
-      // - Credit Mode: runs Cloudflare Workers AI (@cf/openai/whisper-large-v3-turbo) first, with Groq Pool failover
-      let groqTranscript = '';
-      let sttProviderUsed: 'cloudflare-workers-ai' | 'groq' | 'none' = 'none';
-      if (!isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
-        const sttOrder = resolveSttStrategyForMode(
-          Boolean(isFreeMode),
-          Boolean(freeGroqKey),
-          Boolean(loadCloudflareWorkersAiConfig())
-        );
-        for (const step of sttOrder) {
-          if (groqTranscript) break;
-          if (step === 'user_groq' && freeGroqKey) {
-            try {
-              const t = await transcribeWithDirectGroqKey(extractedAudioBuffer, freeGroqKey, sttModel);
-              if (t) {
-                groqTranscript = t;
-                sttProviderUsed = 'groq';
-              }
-            } catch {}
-          } else if (step === 'workers_ai' && !isFreeMode) {
-            const cfText = await transcribeAudioWithWorkersAi(extractedAudioBuffer, sttModel);
-            if (cfText) {
-              groqTranscript = cfText;
-              sttProviderUsed = 'cloudflare-workers-ai';
-            }
-          } else if (step === 'groq_pool') {
-            const sttRes = await transcribeAudioWithGroqPool(extractedAudioBuffer, sttModel);
-            if (sttRes?.text) {
-              groqTranscript = sttRes.text;
+    if (inputVideoPath && fs.existsSync(inputVideoPath)) {
+      try {
+        const probedMeta = await probeVideoDimensions(inputVideoPath);
+        if (probedMeta.durationSec > 1) {
+          probedDuration = Number(probedMeta.durationSec.toFixed(2));
+        }
+
+        const extractedMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_extracted.mp3`);
+        const maxExtractSec = isFreeMode
+          ? 150
+          : Math.max(150, Math.min(3600, Math.ceil(probedDuration || 600)));
+        const audioBitrate = maxExtractSec > 240 ? '32k' : '48k';
+        try {
+          await execFileAsync('ffmpeg', [
+            '-y',
+            '-i',
+            inputVideoPath,
+            '-t',
+            String(maxExtractSec),
+            '-vn',
+            '-ar',
+            '16000',
+            '-ac',
+            '1',
+            '-b:a',
+            audioBitrate,
+            extractedMp3Path
+          ]);
+          if (fs.existsSync(extractedMp3Path) && fs.statSync(extractedMp3Path).size > 200) {
+            extractedAudioBuffer = fs.readFileSync(extractedMp3Path);
+            extractedAudioBase64 = extractedAudioBuffer.toString('base64');
+          }
+          fs.unlinkSync(extractedMp3Path);
+        } catch {}
+      } catch (probeErr) {
+        console.warn('[Upload] Could not probe uploaded video:', probeErr);
+      }
+    }
+
+    const safeDuration = Math.max(6, Math.min(isFreeMode ? 150 : 10800, probedDuration));
+    const styleDef = SCRIPT_STYLE_PROMPTS[scriptStyle] || SCRIPT_STYLE_PROMPTS.narrator;
+    const systemInstruction = customPrompt?.trim() || styleDef.systemPrompt;
+
+    const fallbackAssets = buildSyncedRecapCues(
+      safeDuration,
+      scriptStyle,
+      targetLanguage,
+      title
+    );
+
+    let finalTitle = fallbackAssets.title;
+    let finalScriptText = fallbackAssets.scriptText;
+    let finalCues = fallbackAssets.cues;
+    let finalHighlights = fallbackAssets.highlightClips;
+    let usedLiveGemini = false;
+    let geminiFailureReason = '';
+
+    const isWeddingDramaClip =
+      targetLanguage === 'my' && Math.abs(safeDuration - 70.7) <= 2.5;
+
+    if (isWeddingDramaClip) {
+      const rawSceneCues = SAVETIK_WEDDING_DRAMA_CUES[scriptStyle] || SAVETIK_WEDDING_DRAMA_CUES.narrator;
+      finalCues = rawSceneCues.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
+      finalScriptText = finalCues.map((c) => c.text).join(' ');
+    }
+
+    // 1b. Speech-to-Text pre-pass
+    onProgress(48, 'မူရင်းစကားပြော အသံကို AI ဖြင့် နားထောင်နေသည်...');
+    let groqTranscript = '';
+    let sttProviderUsed: 'cloudflare-workers-ai' | 'groq' | 'none' = 'none';
+    if (!isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
+      const sttOrder = resolveSttStrategyForMode(
+        Boolean(isFreeMode),
+        Boolean(freeGroqKey),
+        Boolean(loadCloudflareWorkersAiConfig())
+      );
+      for (const step of sttOrder) {
+        if (groqTranscript) break;
+        if (step === 'user_groq' && freeGroqKey) {
+          try {
+            const t = await transcribeWithDirectGroqKey(extractedAudioBuffer, freeGroqKey, sttModel);
+            if (t) {
+              groqTranscript = t;
               sttProviderUsed = 'groq';
             }
+          } catch {}
+        } else if (step === 'workers_ai' && !isFreeMode) {
+          const cfText = await transcribeAudioWithWorkersAi(extractedAudioBuffer, sttModel);
+          if (cfText) {
+            groqTranscript = cfText;
+            sttProviderUsed = 'cloudflare-workers-ai';
+          }
+        } else if (step === 'groq_pool') {
+          const sttRes = await transcribeAudioWithGroqPool(extractedAudioBuffer, sttModel);
+          if (sttRes?.text) {
+            groqTranscript = sttRes.text;
+            sttProviderUsed = 'groq';
           }
         }
       }
+    }
 
-      // 2. Generate Script & Continuous Scene-Matched Subtitle Cues (Free Mode uses user's Gemini key if entered; Credit Mode uses Owner pool)
-      if (!isWeddingDramaClip) {
-        try {
-          const langLabel =
-            targetLanguage === 'my'
-              ? 'Burmese (မြန်မာဘာသာ စကားပြောဟန်)'
-              : targetLanguage === 'th'
-                ? 'Thai'
-                : targetLanguage === 'ja'
-                  ? 'Japanese'
-                  : targetLanguage === 'ko'
-                    ? 'Korean'
-                    : targetLanguage === 'zh'
-                      ? 'Chinese'
-                      : 'English';
+    // 2. Generate Script & Continuous Scene-Matched Subtitle Cues
+    onProgress(58, 'AI ဖြင့် မြန်မာဇာတ်ညွှန်း & စာတန်းထိုး ရေးသားနေသည်...');
+    const poolState = loadApiKeyPoolState();
+    const hasHealthyPoolGeminiKey = poolState.keys.some(
+      (k) => k.provider === 'gemini' && k.enabled && k.apiKey.trim().length > 0
+    );
+    const hasAnyGeminiKey = Boolean(freeGeminiKey || hasHealthyPoolGeminiKey);
 
-          const effectiveContext = effectiveTranscriptText || groqTranscript;
-          // For short videos (<=120s), generate 1 phrase per ~2.8s; for long videos (>120s, e.g. 8 mins),
-          // generate 22-36 full-sentence blocks spanning 0ms to end (which splitCuesIntoShortPhrases splits into 1-line subtitle bars after TTS)
-          const isLongTimeline = safeDuration > 120;
-          const cueCount = isLongTimeline
-            ? Math.max(18, Math.min(36, Math.round(safeDuration / 14)))
-            : Math.max(5, Math.min(38, Math.round(safeDuration / 2.8)));
-          const phraseLengthRule = isLongTimeline
-            ? 'Each cue.text MUST be a rich 2-to-3 clause spoken Burmese sentence (70 to 130 Burmese characters) so that after phrase-splitting it continuously covers its scene window without dead air.'
-            : 'Each cue.text MUST be one crisp spoken phrase of 4 to 8 words (24 to 42 Burmese characters, ~2.1s–2.6s when spoken cleanly in one breath). Never cut sentences awkwardly in half or exceed the slot.';
-          const textPrompt = `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
+    if (!isWeddingDramaClip) {
+      try {
+        const langLabel =
+          targetLanguage === 'my'
+            ? 'Burmese (မြန်မာဘာသာ စကားပြောဟန်)'
+            : targetLanguage === 'th'
+              ? 'Thai'
+              : targetLanguage === 'ja'
+                ? 'Japanese'
+                : targetLanguage === 'ko'
+                  ? 'Korean'
+                  : targetLanguage === 'zh'
+                    ? 'Chinese'
+                    : 'English';
+
+        const effectiveContext = effectiveTranscriptText || groqTranscript;
+        const isLongTimeline = safeDuration > 120;
+        const cueCount = isLongTimeline
+          ? Math.max(18, Math.min(36, Math.round(safeDuration / 14)))
+          : Math.max(5, Math.min(38, Math.round(safeDuration / 2.8)));
+        const phraseLengthRule = isLongTimeline
+          ? 'Each cue.text MUST be a rich 2-to-3 clause spoken Burmese sentence (70 to 130 Burmese characters) so that after phrase-splitting it continuously covers its scene window without dead air.'
+          : 'Each cue.text MUST be one crisp spoken phrase of 4 to 8 words (24 to 42 Burmese characters, ~2.1s–2.6s when spoken cleanly in one breath). Never cut sentences awkwardly in half or exceed the slot.';
+        const textPrompt = `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
 STT Engine: ${sttModel}.
 Mode: ${mode === 'translate' ? 'Direct Dialogue Translation & Dubbing' : `Movie Recap (${styleDef.labelEn})`}.
 Target Language: ${langLabel}.
@@ -3326,378 +3528,355 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
 - All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (e.g. 2500 for 2.5s) and strictly aligned to the early, middle, climax, and ending scenes so the voice never drifts out of sync.
 - ${phraseLengthRule}`;
 
-          const contentsParts: Array<
-            { text: string } | { inlineData: { mimeType: string; data: string } }
-          > = [];
-          if (extractedAudioBase64) {
-            contentsParts.push({
-              inlineData: {
-                mimeType: 'audio/mp3',
-                data: extractedAudioBase64
-              }
-            });
-          }
-          contentsParts.push({ text: textPrompt });
+        const contentsParts: Array<
+          { text: string } | { inlineData: { mimeType: string; data: string } }
+        > = [];
+        if (extractedAudioBase64) {
+          contentsParts.push({
+            inlineData: {
+              mimeType: 'audio/mp3',
+              data: extractedAudioBase64
+            }
+          });
+        }
+        contentsParts.push({ text: textPrompt });
 
-          const runScriptRequest = async (ai: GoogleGenAI) =>
-            await ai.models.generateContent({
-              model: scriptModel || 'gemini-3-flash-preview',
-              contents: { parts: contentsParts },
-              config: {
-                systemInstruction,
-                responseMimeType: 'application/json',
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    scriptText: { type: Type.STRING },
-                    cues: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          start_ms: { type: Type.INTEGER },
-                          end_ms: { type: Type.INTEGER },
-                          text: { type: Type.STRING }
-                        },
-                        required: ['start_ms', 'end_ms', 'text']
-                      }
-                    },
-                    highlight_clips: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          start_ms: { type: Type.INTEGER },
-                          end_ms: { type: Type.INTEGER },
-                          label: { type: Type.STRING }
-                        },
-                        required: ['start_ms', 'end_ms']
-                      }
+        const runScriptRequest = async (ai: GoogleGenAI) =>
+          await ai.models.generateContent({
+            model: scriptModel || 'gemini-3-flash-preview',
+            contents: { parts: contentsParts },
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  scriptText: { type: Type.STRING },
+                  cues: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        start_ms: { type: Type.INTEGER },
+                        end_ms: { type: Type.INTEGER },
+                        text: { type: Type.STRING }
+                      },
+                      required: ['start_ms', 'end_ms', 'text']
                     }
                   },
-                  required: ['title', 'scriptText', 'cues']
-                }
-              }
-            });
-
-          const response = freeGeminiKey
-            ? await runScriptRequest(
-                new GoogleGenAI({
-                  apiKey: freeGeminiKey,
-                  httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-                })
-              )
-            : (await executeWithGeminiKeyPool(runScriptRequest))?.result;
-          if (response?.text) {
-            const parsed = JSON.parse(response.text);
-            if (Array.isArray(parsed.cues) && parsed.cues.length > 0) {
-              finalTitle = parsed.title || finalTitle;
-              // Detect if LLM accidentally returned timestamps in seconds instead of milliseconds
-              const maxReturnedEnd = Math.max(
-                ...parsed.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)
-              );
-              const unitMultiplier =
-                maxReturnedEnd > 0 && maxReturnedEnd <= safeDuration * 1.5 ? 1000 : 1;
-
-              const rawParsedCues: SubtitleCue[] = parsed.cues
-                .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
-                  const rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
-                  const rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
-                  const startMs = Math.max(0, rawStart || idx * 2500);
-                  const endMs = Math.max(startMs + 800, rawEnd || startMs + 2400);
-                  return {
-                    id: `cue-${idx + 1}`,
-                    start_ms: startMs,
-                    end_ms: endMs,
-                    text: String(c.text || '').trim()
-                  };
-                })
-                .filter((c: SubtitleCue) => c.text.length > 0);
-              if (rawParsedCues.length > 0) {
-                // Keep sentence-level cues intact for TTS synthesis; split into crisp 1-line subtitle phrases AFTER TTS sync
-                finalCues = rawParsedCues;
-                finalScriptText = finalCues.map((c) => c.text).join(' ');
-                if (Array.isArray(parsed.highlight_clips) && parsed.highlight_clips.length > 0) {
-                  finalHighlights = parsed.highlight_clips;
-                }
-                usedLiveGemini = true;
+                  highlight_clips: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        start_ms: { type: Type.INTEGER },
+                        end_ms: { type: Type.INTEGER },
+                        label: { type: Type.STRING }
+                      },
+                      required: ['start_ms', 'end_ms']
+                    }
+                  }
+                },
+                required: ['title', 'scriptText', 'cues']
               }
             }
-          }
-        } catch (err) {
-          console.warn('Gemini script generation fell back to synced template:', err);
-        }
-      }
-
-      // 3. Synthesize Real Spoken Voiceover WAV using Admin Gemini Key Pool rotation (for Studio Pro voices)
-      //    and automatic fallback to Microsoft Edge Neural (`my-MM-ThihaNeural` / `my-MM-NilarNeural`)
-      let voiceoverWavBuffer: Buffer | null = null;
-      const voiceDef = VOICE_OPTIONS.find((v) => v.id === voiceGender) || VOICE_OPTIONS[0];
-      const useGeminiPrimary =
-        ttsEngine === 'gemini-2.5-flash-preview-tts' || voiceDef.tier === 'pro';
-
-      if (useGeminiPrimary) {
-        try {
-          const geminiTtsRun = await executeWithGeminiKeyPool(async (ai) => {
-            return await synthesizeGeminiProVoiceWavBuffer(
-              ai,
-              finalScriptText,
-              voiceDef.geminiVoice,
-              jobId,
-              safeDuration,
-              true
-            );
           });
-          if (geminiTtsRun?.result) {
-            voiceoverWavBuffer = geminiTtsRun.result.wavBuffer;
-            finalCues = alignCuesProportionallyToAudioDuration(
-              finalCues,
-              geminiTtsRun.result.durationMs
+
+        const response = freeGeminiKey
+          ? await runScriptRequest(
+              new GoogleGenAI({
+                apiKey: freeGeminiKey,
+                httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+              })
+            )
+          : (await executeWithGeminiKeyPool(runScriptRequest))?.result;
+        if (response?.text) {
+          const parsed = JSON.parse(response.text);
+          if (Array.isArray(parsed.cues) && parsed.cues.length > 0) {
+            finalTitle = parsed.title || finalTitle;
+            const maxReturnedEnd = Math.max(
+              ...parsed.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)
             );
+            const unitMultiplier =
+              maxReturnedEnd > 0 && maxReturnedEnd <= safeDuration * 1.5 ? 1000 : 1;
+
+            const rawParsedCues: SubtitleCue[] = parsed.cues
+              .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
+                const rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
+                const rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
+                const startMs = Math.max(0, rawStart || idx * 2500);
+                const endMs = Math.max(startMs + 800, rawEnd || startMs + 2400);
+                return {
+                  id: `cue-${idx + 1}`,
+                  start_ms: startMs,
+                  end_ms: endMs,
+                  text: String(c.text || '').trim()
+                };
+              })
+              .filter((c: SubtitleCue) => c.text.length > 0);
+            if (rawParsedCues.length > 0) {
+              finalCues = rawParsedCues;
+              finalScriptText = finalCues.map((c) => c.text).join(' ');
+              if (Array.isArray(parsed.highlight_clips) && parsed.highlight_clips.length > 0) {
+                finalHighlights = parsed.highlight_clips;
+              }
+              usedLiveGemini = true;
+            }
           }
-        } catch {}
-      }
-
-      if (!voiceoverWavBuffer) {
-        const neuralResult = await synthesizeNeuralSpokenWavBuffer(
-          finalCues,
-          targetLanguage,
-          voiceGender,
-          jobId,
-          pitchShift,
-          safeDuration,
-          breathPauseMs,
-          dynamicTempoFit
-        );
-
-        if (neuralResult) {
-          voiceoverWavBuffer = neuralResult.wavBuffer;
-          finalCues = neuralResult.syncedCues;
-          finalScriptText = finalCues.map((c) => c.text).join(' ');
+        } else if (!hasAnyGeminiKey) {
+          geminiFailureReason = 'No Gemini API Key configured';
+        } else {
+          geminiFailureReason = 'Gemini returned empty script or all keys exhausted quota';
         }
+      } catch (err: any) {
+        geminiFailureReason = err?.message ? String(err.message) : String(err || 'Gemini error');
+        console.warn('Gemini script generation fell back:', geminiFailureReason);
       }
+    }
 
-      // Optional fallback to Gemini 2.5 Flash Preview TTS if neural phrase synthesis is unavailable
-      if (!voiceoverWavBuffer) {
-        try {
-          const geminiFallbackRun = await executeWithGeminiKeyPool(async (ai) => {
-            return await synthesizeGeminiProVoiceWavBuffer(
-              ai,
-              finalScriptText,
-              voiceDef.geminiVoice,
-              jobId,
-              safeDuration,
-              true
-            );
-          });
-          if (geminiFallbackRun?.result) {
-            voiceoverWavBuffer = geminiFallbackRun.result.wavBuffer;
-            finalCues = alignCuesProportionallyToAudioDuration(
-              finalCues,
-              geminiFallbackRun.result.durationMs
-            );
-          }
-        } catch {}
-      }
+    const hasUploadedSource = Boolean(
+      inputVideoPath ||
+        r2ObjectKey ||
+        localUploadId ||
+        (videoBase64 && videoBase64.length > 100)
+    );
+    if (
+      shouldFailInsteadOfWeddingFallback({
+        isWeddingDemoClip: isWeddingDramaClip,
+        usedLiveGemini,
+        hasUploadedSource
+      })
+    ) {
+      const errMeta = detectGeminiFailureMessage(
+        geminiFailureReason,
+        hasAnyGeminiKey,
+        Boolean(isFreeMode)
+      );
+      return {
+        ok: false,
+        statusCode: 502,
+        error: errMeta.messageMy,
+        errorEn: errMeta.messageEn,
+        errorCode: errMeta.code
+      };
+    }
 
-      // Last-resort offline fallback
-      if (!voiceoverWavBuffer) {
-        voiceoverWavBuffer = synthesizeCadenceWavBuffer(finalCues, safeDuration, voiceGender);
-      }
+    // 3. Synthesize Real Spoken Voiceover WAV
+    onProgress(74, 'AI မြန်မာအသံ Voiceover ဖန်တီးနေသည်...');
+    let voiceoverWavBuffer: Buffer | null = null;
+    const voiceDef = VOICE_OPTIONS.find((v) => v.id === voiceGender) || VOICE_OPTIONS[0];
+    const useGeminiPrimary =
+      ttsEngine === 'gemini-2.5-flash-preview-tts' || voiceDef.tier === 'pro';
 
-      // Post-TTS 1-line subtitle phrasing: split longer synced cues proportionally AFTER audio synthesis
-      // so TTS speaks whole sentences smoothly without mid-sentence gaps while on-screen captions stay crisp 1-line bars.
-      finalCues = splitCuesIntoShortPhrases(finalCues, 54);
-      finalScriptText = finalCues.map((c) => c.text).join(' ');
+    if (useGeminiPrimary) {
+      try {
+        const geminiTtsRun = await executeWithGeminiKeyPool(async (ai) => {
+          return await synthesizeGeminiProVoiceWavBuffer(
+            ai,
+            finalScriptText,
+            voiceDef.geminiVoice,
+            jobId,
+            safeDuration,
+            true
+          );
+        });
+        if (geminiTtsRun?.result) {
+          voiceoverWavBuffer = geminiTtsRun.result.wavBuffer;
+          finalCues = alignCuesProportionallyToAudioDuration(
+            finalCues,
+            geminiTtsRun.result.durationMs
+          );
+        }
+      } catch {}
+    }
 
-      const voiceoverWavPath = path.join(JOBS_TEMP_DIR, `${jobId}_voiceover.wav`);
-      fs.writeFileSync(voiceoverWavPath, voiceoverWavBuffer);
-      // Omit raw WAV base64 when buffer >2.5MB so 8+ minute videos never exceed Cloud Run's 32MB HTTP response limit
-      const audioBase64 =
-        voiceoverWavBuffer.length <= 2_500_000
-          ? voiceoverWavBuffer.toString('base64')
-          : undefined;
-
-      // 3b. Convert AI Voiceover WAV to standalone MP3 for CapCut / external audio editing
-      let voiceoverMp3Url: string | undefined = undefined;
-      const mp3Filename = `${jobId}_voiceover.mp3`;
-      const voiceoverMp3Path = path.join(JOBS_TEMP_DIR, mp3Filename);
-      if (convertWavToMp3(voiceoverWavPath, voiceoverMp3Path)) {
-        voiceoverMp3Url = `/api/recap/audio/${mp3Filename}`;
-      }
-
-      // 4. Mux the uploaded video + AI Burmese Voiceover into:
-      //    (a) preview_video_url (clean video + voiceover via fast -c:v copy for interactive live stage)
-      //    (b) dubbed_video_url (video + voiceover + burned-in Burmese Subtitles & Blur regions for MP4 download)
-      let dubbedVideoUrl: string | undefined = undefined;
-      let previewVideoUrl: string | undefined = undefined;
-      const outFilename = `${jobId}_recap.mp4`;
-      const outputVideoPath = path.join(JOBS_TEMP_DIR, outFilename);
-      const previewFilename = `${jobId}_preview.mp4`;
-      const previewVideoPath = path.join(JOBS_TEMP_DIR, previewFilename);
-
-      const isCaptionsOnly = mode === 'translate' && translateAudio === 'captions-only';
-      const initialSignature = computeRenderExportSignature({
+    if (!voiceoverWavBuffer) {
+      const neuralResult = await synthesizeNeuralSpokenWavBuffer(
+        finalCues,
+        targetLanguage,
+        voiceGender,
         jobId,
-        mode,
-        translateAudio,
-        aspectRatio,
-        mirrorFlip: effectiveServerEffects.mirror,
-        effects: effectiveServerEffects,
-        blurEnabled,
-        blurRegions,
-        subtitleConfig,
-        editConfig: effectiveServerEditConfig,
-        cues: finalCues
-      });
+        pitchShift,
+        safeDuration,
+        breathPauseMs,
+        dynamicTempoFit
+      );
 
-      if (inputVideoPath && fs.existsSync(inputVideoPath)) {
-        // Generate clean preview MP4 (audio muxed only with -c:v copy in <1s, so interactive HTML Subtitle & Blur overlays don't double-render)
-        const previewOk = muxVideoWithMixedAudio(
+      if (neuralResult) {
+        voiceoverWavBuffer = neuralResult.wavBuffer;
+        finalCues = neuralResult.syncedCues;
+        finalScriptText = finalCues.map((c) => c.text).join(' ');
+      }
+    }
+
+    if (!voiceoverWavBuffer) {
+      try {
+        const geminiFallbackRun = await executeWithGeminiKeyPool(async (ai) => {
+          return await synthesizeGeminiProVoiceWavBuffer(
+            ai,
+            finalScriptText,
+            voiceDef.geminiVoice,
+            jobId,
+            safeDuration,
+            true
+          );
+        });
+        if (geminiFallbackRun?.result) {
+          voiceoverWavBuffer = geminiFallbackRun.result.wavBuffer;
+          finalCues = alignCuesProportionallyToAudioDuration(
+            finalCues,
+            geminiFallbackRun.result.durationMs
+          );
+        }
+      } catch {}
+    }
+
+    if (!voiceoverWavBuffer) {
+      voiceoverWavBuffer = synthesizeCadenceWavBuffer(finalCues, safeDuration, voiceGender);
+    }
+
+    finalCues = splitCuesIntoShortPhrases(finalCues, 54);
+    finalScriptText = finalCues.map((c) => c.text).join(' ');
+
+    const voiceoverWavPath = path.join(JOBS_TEMP_DIR, `${jobId}_voiceover.wav`);
+    fs.writeFileSync(voiceoverWavPath, voiceoverWavBuffer);
+    const audioBase64 =
+      voiceoverWavBuffer.length <= 2_500_000
+        ? voiceoverWavBuffer.toString('base64')
+        : undefined;
+
+    onProgress(88, 'အသံနှင့် ဗီဒီယို ပေါင်းစပ်နေသည်...');
+    let voiceoverMp3Url: string | undefined = undefined;
+    const mp3Filename = `${jobId}_voiceover.mp3`;
+    const voiceoverMp3Path = path.join(JOBS_TEMP_DIR, mp3Filename);
+    if (await convertWavToMp3(voiceoverWavPath, voiceoverMp3Path)) {
+      voiceoverMp3Url = `/api/recap/audio/${mp3Filename}`;
+    }
+
+    // 4. Mux fast preview MP4 (<2s async -c:v copy) so Cloudflare/Nginx never time out
+    let dubbedVideoUrl: string | undefined = undefined;
+    let previewVideoUrl: string | undefined = undefined;
+    const outFilename = `${jobId}_recap.mp4`;
+    const outputVideoPath = path.join(JOBS_TEMP_DIR, outFilename);
+    const previewFilename = `${jobId}_preview.mp4`;
+    const previewVideoPath = path.join(JOBS_TEMP_DIR, previewFilename);
+
+    const isCaptionsOnly = mode === 'translate' && translateAudio === 'captions-only';
+    const initialSignature = computeRenderExportSignature({
+      jobId,
+      mode,
+      translateAudio,
+      aspectRatio,
+      mirrorFlip: effectiveServerEffects.mirror,
+      effects: effectiveServerEffects,
+      blurEnabled,
+      blurRegions,
+      subtitleConfig,
+      editConfig: effectiveServerEditConfig,
+      cues: finalCues
+    });
+
+    if (inputVideoPath && fs.existsSync(inputVideoPath)) {
+      const previewOk = await muxVideoWithMixedAudio(
+        inputVideoPath,
+        voiceoverWavPath,
+        previewVideoPath,
+        false,
+        false,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        'mux_prev',
+        'original',
+        undefined,
+        isCaptionsOnly
+      );
+      if (previewOk) {
+        previewVideoUrl = `/api/recap/video/${previewFilename}`;
+        dubbedVideoUrl = previewVideoUrl;
+      } else {
+        const muxSuccess = await muxVideoWithMixedAudio(
           inputVideoPath,
           voiceoverWavPath,
-          previewVideoPath,
+          outputVideoPath,
+          Boolean(effectiveServerEffects.mirror),
           false,
-          false,
-          undefined,
-          undefined,
-          false,
-          undefined,
-          'mux_prev',
-          'original',
-          undefined,
-          isCaptionsOnly
+          finalCues,
+          subtitleConfig,
+          Boolean(blurEnabled),
+          blurRegions,
+          jobId,
+          aspectRatio,
+          effectiveServerEditConfig,
+          isCaptionsOnly,
+          effectiveServerEffects
         );
-        if (previewOk) {
-          previewVideoUrl = `/api/recap/video/${previewFilename}`;
-        }
-
-        if (safeDuration > 150 && previewVideoUrl) {
-          // For long videos (>2.5 mins, e.g. 8 mins), return fast stream-copied preview immediately so Cloud Run never times out,
-          // and pre-burn outputVideoPath asynchronously in background (Download button also burns via /api/recap/render-export)
-          dubbedVideoUrl = previewVideoUrl;
-          const bgInput = inputVideoPath;
-          const bgWav = voiceoverWavPath;
-          const bgOut = outputVideoPath;
-          const bgCues = [...finalCues];
-          const bgSubCfg = subtitleConfig;
-          const bgBlurEn = Boolean(blurEnabled);
-          const bgBlurRegs = blurRegions;
-          const bgMirror = Boolean(effectiveServerEffects.mirror);
-          const bgAspect = aspectRatio;
-          const bgEdit = effectiveServerEditConfig;
-          const bgEffects = { ...effectiveServerEffects };
-          setImmediate(() => {
-            try {
-              const okBg = muxVideoWithMixedAudio(
-                bgInput,
-                bgWav,
-                bgOut,
-                bgMirror,
-                false,
-                bgCues,
-                bgSubCfg,
-                bgBlurEn,
-                bgBlurRegs,
-                jobId,
-                bgAspect,
-                bgEdit,
-                isCaptionsOnly,
-                bgEffects
-              );
-              if (okBg) {
-                renderedJobExportCache.set(jobId, {
-                  signature: initialSignature,
-                  outFilename,
-                  outputVideoPath: bgOut
-                });
-              }
-            } catch {}
+        if (muxSuccess) {
+          dubbedVideoUrl = `/api/recap/video/${outFilename}`;
+          renderedJobExportCache.set(jobId, {
+            signature: initialSignature,
+            outFilename,
+            outputVideoPath
           });
-        } else {
-          // Generate downloadable MP4 with burned-in Blurred Aspect Backdrop + Edit Overlays + Subtitles + Blur regions + Mirror flip + Anti-Copyright Effects
-          const muxSuccess = muxVideoWithMixedAudio(
-            inputVideoPath,
-            voiceoverWavPath,
-            outputVideoPath,
-            Boolean(effectiveServerEffects.mirror),
-            false,
-            finalCues,
-            subtitleConfig,
-            Boolean(blurEnabled),
-            blurRegions,
-            jobId,
-            aspectRatio,
-            effectiveServerEditConfig,
-            isCaptionsOnly,
-            effectiveServerEffects
-          );
-          if (muxSuccess) {
-            dubbedVideoUrl = `/api/recap/video/${outFilename}`;
-            renderedJobExportCache.set(jobId, {
-              signature: initialSignature,
-              outFilename,
-              outputVideoPath
-            });
-          } else if (previewVideoUrl) {
-            dubbedVideoUrl = previewVideoUrl;
-          }
         }
+      }
+    } else {
+      const previewOk = await generateStandaloneRecapMp4(
+        voiceoverWavPath,
+        previewVideoPath,
+        safeDuration
+      );
+      if (previewOk) {
+        previewVideoUrl = `/api/recap/video/${previewFilename}`;
+      }
+
+      if (safeDuration > 120 && previewVideoUrl) {
+        dubbedVideoUrl = previewVideoUrl;
       } else {
-        // Standalone MP4 when using a URL or demo video without a local file upload
-        const previewOk = generateStandaloneRecapMp4(
+        const standaloneOk = await generateStandaloneRecapMp4(
           voiceoverWavPath,
-          previewVideoPath,
-          safeDuration
+          outputVideoPath,
+          safeDuration,
+          finalCues,
+          subtitleConfig,
+          Boolean(blurEnabled),
+          blurRegions,
+          Boolean(effectiveServerEffects.mirror),
+          jobId,
+          aspectRatio,
+          effectiveServerEditConfig,
+          effectiveServerEffects
         );
-        if (previewOk) {
-          previewVideoUrl = `/api/recap/video/${previewFilename}`;
-        }
-
-        if (safeDuration > 150 && previewVideoUrl) {
+        if (standaloneOk) {
+          dubbedVideoUrl = `/api/recap/video/${outFilename}`;
+          renderedJobExportCache.set(jobId, {
+            signature: initialSignature,
+            outFilename,
+            outputVideoPath
+          });
+        } else if (previewVideoUrl) {
           dubbedVideoUrl = previewVideoUrl;
-        } else {
-          const standaloneOk = generateStandaloneRecapMp4(
-            voiceoverWavPath,
-            outputVideoPath,
-            safeDuration,
-            finalCues,
-            subtitleConfig,
-            Boolean(blurEnabled),
-            blurRegions,
-            Boolean(effectiveServerEffects.mirror),
-            jobId,
-            aspectRatio,
-            effectiveServerEditConfig,
-            effectiveServerEffects
-          );
-          if (standaloneOk) {
-            dubbedVideoUrl = `/api/recap/video/${outFilename}`;
-            renderedJobExportCache.set(jobId, {
-              signature: initialSignature,
-              outFilename,
-              outputVideoPath
-            });
-          } else if (previewVideoUrl) {
-            dubbedVideoUrl = previewVideoUrl;
-          }
         }
       }
+    }
 
-      // 5. Optional Cloudflare R2 Output Mirror (Credit Mode Only when R2 Direct is configured)
-      let r2OutputUrl: string | undefined = undefined;
-      if (effectiveServerR2Config && dubbedVideoUrl && fs.existsSync(outputVideoPath)) {
-        try {
-          const outKey = buildR2ObjectKey(`${jobId}_recap.mp4`, 'outputs');
-          const uploadedOut = await uploadLocalFileToR2(effectiveServerR2Config, outputVideoPath, outKey, 'video/mp4');
-          r2OutputUrl = uploadedOut.publicUrl || uploadedOut.signedGetUrl;
-        } catch (r2UpErr) {
-          console.warn('[R2 Direct] Output mirror upload skipped:', r2UpErr);
-        }
+    onProgress(97, 'နောက်ဆုံးအဆင့် ပြင်ဆင်ပြီးစီးနေသည်...');
+    let r2OutputUrl: string | undefined = undefined;
+    if (effectiveServerR2Config && dubbedVideoUrl && fs.existsSync(outputVideoPath)) {
+      try {
+        const outKey = buildR2ObjectKey(`${jobId}_recap.mp4`, 'outputs');
+        const uploadedOut = await uploadLocalFileToR2(effectiveServerR2Config, outputVideoPath, outKey, 'video/mp4');
+        r2OutputUrl = uploadedOut.publicUrl || uploadedOut.signedGetUrl;
+      } catch (r2UpErr) {
+        console.warn('[R2 Direct] Output mirror upload skipped:', r2UpErr);
       }
+    }
 
-      res.json({
+    return {
+      ok: true,
+      payload: {
         ok: true,
         job_id: jobId,
         title: finalTitle,
@@ -3716,7 +3895,87 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
         voice_engine: voiceDef.ttsEngineId,
         used_live_gemini: usedLiveGemini,
         elapsed_ms: Date.now() - startTime
+      }
+    };
+  }
+
+  // TTAK MOVIE RECAP Free Recap & Studio Auto-Flow Asset Generator + Audio/Video Mixer
+  // Supports `asyncMode: true` + `/api/recap/job-status/:jobId` polling so long 3+ min videos never hit Cloudflare's 100s timeout!
+  app.post('/api/recap/free/generate-assets', async (req, res) => {
+    pruneOldRecapJobs();
+    const startTime = Date.now();
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const asyncMode = Boolean(req.body?.asyncMode);
+
+    if (asyncMode) {
+      const initialJob: RecapGenerationJobState = {
+        jobId,
+        status: 'processing',
+        progress: 38,
+        stageMessage: 'ဗီဒီယိုဖိုင် ပြင်ဆင်ပြီး အသံခွဲထုတ်နေသည်...',
+        createdAt: Date.now()
+      };
+      recapGenerationJobs.set(jobId, initialJob);
+
+      void (async () => {
+        try {
+          const outcome = await runRecapAssetGenerationPipeline(
+            jobId,
+            startTime,
+            req.body,
+            (pct, msg) => {
+              const cur = recapGenerationJobs.get(jobId);
+              if (cur && cur.status === 'processing') {
+                cur.progress = pct;
+                cur.stageMessage = msg;
+              }
+            }
+          );
+          const cur = recapGenerationJobs.get(jobId);
+          if (!cur) return;
+          if (outcome.ok) {
+            cur.status = 'done';
+            cur.progress = 100;
+            cur.stageMessage = 'ပြီးစီးပါပြီ!';
+            cur.result = outcome.payload;
+          } else {
+            cur.status = 'error';
+            cur.error = outcome.error;
+            cur.errorEn = outcome.errorEn;
+            cur.errorCode = outcome.errorCode;
+          }
+        } catch (err) {
+          const cur = recapGenerationJobs.get(jobId);
+          if (cur) {
+            cur.status = 'error';
+            cur.error = err instanceof Error ? err.message : 'Failed to generate recap assets';
+          }
+        }
+      })();
+
+      res.json({
+        ok: true,
+        async: true,
+        job_id: jobId,
+        status: 'processing',
+        progress: 38,
+        stage_message: initialJob.stageMessage
       });
+      return;
+    }
+
+    try {
+      const outcome = await runRecapAssetGenerationPipeline(jobId, startTime, req.body, () => {});
+      if (!outcome.ok) {
+        res.status(outcome.statusCode).json({
+          ok: false,
+          error: outcome.error,
+          error_en: outcome.errorEn,
+          error_code: outcome.errorCode
+        });
+        return;
+      }
+      res.json(outcome.payload);
     } catch (error) {
       console.error('Error in /api/recap/free/generate-assets:', error);
       res.status(500).json({
@@ -3724,6 +3983,28 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
         error: error instanceof Error ? error.message : 'Failed to generate recap assets'
       });
     }
+  });
+
+  app.get('/api/recap/job-status/:jobId', (req, res) => {
+    const safeId = (req.params.jobId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const job = recapGenerationJobs.get(safeId);
+    if (!job) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).json({ ok: false, error: 'Recap job not found' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: job.status !== 'error',
+      job_id: job.jobId,
+      status: job.status,
+      progress: job.progress,
+      stage_message: job.stageMessage,
+      result: job.status === 'done' ? job.result : undefined,
+      error: job.error,
+      error_en: job.errorEn,
+      error_code: job.errorCode
+    });
   });
 
   // Standalone TTS endpoint for Voice Preview before generating video + regenerating cues
@@ -5054,7 +5335,37 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
         if (data.startsWith('approve_')) {
           const id = data.replace('approve_', '');
           const records = loadPayments();
-          const target = records.find((r) => r.id === id);
+          let target = records.find((r) => r.id === id);
+
+          if (!target) {
+            const msgText = String(
+              update.callback_query.message?.caption || update.callback_query.message?.text || ''
+            );
+            const uidMatch = msgText.match(/Website User ID:\s*([^\n\r]+)/i);
+            const planMatch = msgText.match(/Credit Plan:\s*([^\n\r(]+)\s*\(\+(\d+)\s*Credits\)/i);
+            const amountMatch = msgText.match(/ငွေလွှဲပမာဏ:\s*([^\n\r]+)/i);
+            const txnMatch = msgText.match(/\(Txn ID\):\s*([^\n\r]+)/i);
+            if (uidMatch && planMatch) {
+              const reconstructed: PaymentRecord = {
+                id,
+                userId: uidMatch[1].trim(),
+                planName: planMatch[1].trim(),
+                credits: parseInt(planMatch[2], 10) || 100,
+                amountMmk: amountMatch ? amountMatch[1].trim() : '15,000 MMK',
+                walletType: 'Wave Pay',
+                walletAccountName: 'KAUNG HTET',
+                walletPhone: '09772350006',
+                senderPhone: '',
+                txnId: txnMatch ? txnMatch[1].trim() : '000000',
+                slipBase64: null,
+                status: 'pending',
+                createdAt: Date.now(),
+                telegramDelivered: true
+              };
+              records.unshift(reconstructed);
+              target = reconstructed;
+            }
+          }
 
           if (!target) {
             await answerTelegramCallbackQuery(queryId, '❌ ပြေစာ မတွေ့ရှိပါ', true);
@@ -5178,6 +5489,10 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
 
   function startTelegramBotPolling() {
     if (isTelegramPollingStarted) return;
+    if (process.env.DISABLE_TELEGRAM_POLLING === 'true') {
+      console.log('🤖 Telegram Bot polling disabled on AI Studio preview (active on VPS).');
+      return;
+    }
     isTelegramPollingStarted = true;
 
     console.log(`🤖 Telegram Bot polling started for @ttakrecap_bot...`);
@@ -6241,6 +6556,12 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
       res.status(500).json({ ok: false, error: String(error) });
     }
   });
+  // Ensure unknown /api/* routes (including missing video/audio assets) always return JSON 404, never SPA index.html
+  app.all('/api/*', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(404).json({ ok: false, error: 'API endpoint or media file not found' });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

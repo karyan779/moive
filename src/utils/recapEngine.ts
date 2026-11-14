@@ -1316,7 +1316,7 @@ export function findActiveCue(cues: SubtitleCue[], currentTimeMs: number): Subti
  * Calculates caption scale percentage matching TTAK MOVIE RECAP's formula: Math.round((fontSize / 44) * 100)
  */
 export function calculateSubtitleScalePercent(fontSize: number): number {
-  const clamped = Math.max(28, Math.min(68, fontSize));
+  const clamped = Math.max(12, Math.min(68, fontSize));
   return Math.round((clamped / 44) * 100);
 }
 
@@ -1424,13 +1424,13 @@ export function computeAssSubtitleFontSize(
   vidW: number,
   vidH: number
 ): number {
-  const safeSlider = Math.max(24, Math.min(72, Number(sliderFontSize) || 40));
+  const safeSlider = Math.max(12, Math.min(72, Number(sliderFontSize) || 40));
   const safeW = Math.max(240, vidW || 720);
   const safeH = Math.max(240, vidH || 1280);
   // Portrait videos use width directly; landscape scales proportionally from height so 16:9 text isn't oversized
   const baseDim = safeW <= safeH ? safeW : Math.round(safeH * 1.15);
   const scaleFactor = baseDim / 540;
-  return Math.max(24, Math.round(safeSlider * 0.88 * scaleFactor));
+  return Math.max(12, Math.round(safeSlider * 0.88 * scaleFactor));
 }
 
 /**
@@ -2659,6 +2659,227 @@ export function resolveStudioWorkflowStep(
   }
   return { activeStep: 2, completedSteps: [1] };
 }
+
+/**
+ * Resolves Content-Disposition header for media serving:
+ * - Default is `inline` so HTML5 <video> and <audio> tags can play and seek cleanly on mobile & desktop browsers.
+ * - Switches to `attachment` only when `?dl=1` or `?name=...` download query params are requested.
+ */
+export function resolveMediaContentDisposition(
+  rawFilename: string,
+  requestedName?: string,
+  forceDownload?: string | boolean,
+  defaultExtension = '.mp4'
+): {
+  mode: 'inline' | 'attachment';
+  safeFilename: string;
+  headerValue: string;
+} {
+  const cleanedExt = defaultExtension.startsWith('.') ? defaultExtension : `.${defaultExtension}`;
+  const rawBase = (requestedName || '').trim() || rawFilename.trim() || `media${cleanedExt}`;
+  const sanitized = rawBase.replace(/[^a-zA-Z0-9._\-\s]/g, '_').replace(/\s+/g, ' ').trim() || `media${cleanedExt}`;
+  const safeFilename = sanitized.toLowerCase().endsWith(cleanedExt.toLowerCase())
+    ? sanitized
+    : `${sanitized}${cleanedExt}`;
+
+  const wantsDownload =
+    forceDownload === true ||
+    forceDownload === '1' ||
+    forceDownload === 'true' ||
+    (typeof requestedName === 'string' && requestedName.trim().length > 0);
+
+  const mode = wantsDownload ? 'attachment' : 'inline';
+  return {
+    mode,
+    safeFilename,
+    headerValue: `${mode}; filename="${safeFilename}"`
+  };
+}
+
+/**
+ * Verifies HTTP response status and MIME headers before triggering a browser MP4/MP3 download
+ * so Cloudflare HTML timeouts or 404 SPA fallbacks never get saved as `.mp4.html`.
+ */
+export function isValidPlayableMediaResponse(
+  status: number,
+  ok: boolean,
+  contentType: string | null | undefined,
+  expectedPrefix: 'video/' | 'audio/' = 'video/'
+): boolean {
+  if (!ok || status < 200 || status >= 300) return false;
+  const ct = String(contentType || '').toLowerCase();
+  if (!ct) return false;
+  if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain')) {
+    return false;
+  }
+  return ct.includes(expectedPrefix) || ct.includes('application/octet-stream');
+}
+
+/**
+ * Guards against silently replacing a real user-uploaded video with the hardcoded 70s wedding drama
+ * ("သိန်း 30") template whenever live Gemini script generation fails or has no API key.
+ */
+export function shouldFailInsteadOfWeddingFallback(opts: {
+  isWeddingDemoClip: boolean;
+  usedLiveGemini: boolean;
+  hasUploadedSource: boolean;
+}): boolean {
+  if (opts.usedLiveGemini || opts.isWeddingDemoClip) {
+    return false;
+  }
+  return opts.hasUploadedSource;
+}
+
+/**
+ * Produces a clear, actionable Burmese & English message explaining why Gemini script generation failed.
+ */
+export function detectGeminiFailureMessage(
+  rawReason: string | undefined | null,
+  hasPoolKeys: boolean,
+  isFreeMode: boolean
+): { code: 'no_key' | 'quota' | 'invalid_key' | 'error'; messageMy: string; messageEn: string } {
+  const msg = String(rawReason || '').trim();
+  const lower = msg.toLowerCase();
+
+  if (!hasPoolKeys || lower.includes('no gemini') || lower.includes('missing api key')) {
+    return {
+      code: 'no_key',
+      messageMy: isFreeMode
+        ? 'Free Mode တွင် AI Script ထုတ်ရန် Settings ထဲ၌ သင့် Gemini API Key ထည့်သွင်းပေးပါ။'
+        : 'Server တွင် Gemini API Key မရှိသေးပါ (Telegram Bot မှ /addgemini သို့မဟုတ် Admin Panel မှ ထည့်သွင်းပါ)။',
+      messageEn: isFreeMode
+        ? 'Please add your Gemini API Key in Settings to generate AI scripts in Free Mode.'
+        : 'No active Gemini API Key on server (add one via Telegram Bot /addgemini or Admin Panel).'
+    };
+  }
+
+  if (
+    lower.includes('429') ||
+    lower.includes('quota') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit')
+  ) {
+    return {
+      code: 'quota',
+      messageMy: isFreeMode
+        ? 'သင့် Gemini API Key Quota ပြည့်သွားပါပြီ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ သို့မဟုတ် Key အသစ်ထည့်ပါ။'
+        : 'Server ရှိ Gemini API Key Quota ပြည့်သွားပါပြီ (/addgemini ဖြင့် Key အသစ်ထည့်ပါ)။',
+      messageEn: 'Gemini API quota exceeded. Please add another key or retry shortly.'
+    };
+  }
+
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('400') ||
+    lower.includes('401') ||
+    lower.includes('403')
+  ) {
+    return {
+      code: 'invalid_key',
+      messageMy: 'Gemini API Key မမှန်ကန်ပါ သို့မဟုတ် ခွင့်ပြုချက်မရှိပါ။ Key ကို ပြန်စစ်ဆေးပါ။',
+      messageEn: 'Gemini API key is invalid or unauthorized. Please check your key.'
+    };
+  }
+
+  return {
+    code: 'error',
+    messageMy: `AI Script ထုတ်လုပ်မှု မအောင်မြင်ပါ (${msg ? msg.slice(0, 90) : 'Timeout / Connection error'})။ ပြန်လည်ကြိုးစားကြည့်ပါ။`,
+    messageEn: `AI Script generation failed (${msg ? msg.slice(0, 90) : 'Timeout / Connection error'}). Please try again.`
+  };
+}
+
+/**
+ * Default anti-copyright / edit toggles:
+ * - Credit Mode (!isFreeTier): ONLY FHD 1080p (outputHD) is enabled by default; all optional edit switches start OFF until user enables them.
+ * - Free Mode (isFreeTier): all switches including outputHD start OFF.
+ */
+export function getDefaultAntiCopyrightEffects(isFreeTier: boolean): AntiCopyrightEffects {
+  return {
+    outputHD: !isFreeTier,
+    zoom: false,
+    mirror: false,
+    colorShift: false,
+    crop: false,
+    grain: false,
+    pitchShift: false
+  };
+}
+
+export interface PaymentNoticeIdentity {
+  id: string;
+  status: 'pending' | 'approved' | 'rejected';
+  approvedAt?: number;
+}
+
+export function buildPaymentNoticeKey(payment: PaymentNoticeIdentity): string {
+  return `${payment.id}:${payment.status}:${payment.approvedAt || 0}`;
+}
+
+/**
+ * Ensures Admin Credit Approval / Rejection notification appears strictly once when newly approved/rejected
+ * and NEVER re-appears on subsequent page reloads. Pending receipts remain visible while waiting.
+ */
+export function shouldShowPaymentNotificationBanner(
+  payment: PaymentNoticeIdentity | null | undefined,
+  dismissedSessionIds: Record<string, boolean>,
+  sessionShownKeys: Record<string, boolean>,
+  persistedSeenKeys: Record<string, boolean>
+): boolean {
+  if (!payment || !payment.id) return false;
+  if (dismissedSessionIds[payment.id]) return false;
+  if (payment.status === 'pending') return true;
+  const key = buildPaymentNoticeKey(payment);
+  if (sessionShownKeys[key]) return true;
+  if (persistedSeenKeys[key]) return false;
+  return true;
+}
+
+/**
+ * Validates the first bytes of a downloaded video payload to guarantee it is not HTML or JSON
+ * (which Android/Chrome would otherwise save as `...mp4.html`) and contains valid MP4 `ftyp` or binary payload.
+ */
+export function isValidMp4BufferHeader(headBytes: Uint8Array, totalBytes = headBytes.length): boolean {
+  if (!headBytes || headBytes.length < 12 || totalBytes < 512) return false;
+  let prefix = '';
+  const limit = Math.min(32, headBytes.length);
+  for (let i = 0; i < limit; i++) {
+    prefix += String.fromCharCode(headBytes[i]);
+  }
+  const trimmed = prefix.trimStart().toLowerCase();
+  if (
+    trimmed.startsWith('<!doctype') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<head') ||
+    trimmed.startsWith('<body') ||
+    trimmed.startsWith('<script') ||
+    trimmed.startsWith('<?xml') ||
+    trimmed.startsWith('{')
+  ) {
+    return false;
+  }
+  // ISO BMFF / MP4 box header has `ftyp` at bytes 4..7 (or moov/mdat/free/wide boxes)
+  const boxType =
+    String.fromCharCode(headBytes[4]) +
+    String.fromCharCode(headBytes[5]) +
+    String.fromCharCode(headBytes[6]) +
+    String.fromCharCode(headBytes[7]);
+  if (boxType === 'ftyp' || boxType === 'moov' || boxType === 'mdat' || boxType === 'free' || boxType === 'wide') {
+    return true;
+  }
+  return false;
+}
+
+export function sanitizeMp4DownloadName(rawTitle: string | undefined | null, fallback = 'ttak_recap'): string {
+  const base = String(rawTitle || '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return `${base || fallback}.mp4`;
+}
+
+
 
 
 

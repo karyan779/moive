@@ -18,7 +18,16 @@ import {
   FREE_MAX_DURATION_SEC,
   VOICE_OPTIONS,
   isVoiceAllowedInMode,
-  CREDIT_PLANS
+  CREDIT_PLANS,
+  resolveMediaContentDisposition,
+  isValidPlayableMediaResponse,
+  shouldFailInsteadOfWeddingFallback,
+  detectGeminiFailureMessage,
+  getDefaultAntiCopyrightEffects,
+  buildPaymentNoticeKey,
+  shouldShowPaymentNotificationBanner,
+  isValidMp4BufferHeader,
+  sanitizeMp4DownloadName
 } from './recapEngine.ts';
 
 test('formatDuration formats seconds into M:SS and H:MM:SS', () => {
@@ -483,4 +492,130 @@ test('resolveStudioWorkflowStep maps studio states to beginner 3-step indicator'
     completedSteps: [1, 2, 3]
   });
 });
+
+test('resolveMediaContentDisposition uses inline for playback and attachment only for explicit downloads', () => {
+  const inlineRes = resolveMediaContentDisposition('job_123_preview.mp4');
+  assert.equal(inlineRes.mode, 'inline');
+  assert.equal(inlineRes.headerValue, 'inline; filename="job_123_preview.mp4"');
+
+  const dlFlag = resolveMediaContentDisposition('job_123_preview.mp4', undefined, '1');
+  assert.equal(dlFlag.mode, 'attachment');
+  assert.equal(dlFlag.headerValue, 'attachment; filename="job_123_preview.mp4"');
+
+  const dlNamed = resolveMediaContentDisposition('job_123_export.mp4', 'my_movie (1).mp4');
+  assert.equal(dlNamed.mode, 'attachment');
+  assert.equal(dlNamed.safeFilename, 'my_movie _1_.mp4');
+  assert.equal(dlNamed.headerValue, 'attachment; filename="my_movie _1_.mp4"');
+
+  const mp3Inline = resolveMediaContentDisposition('job_123_voiceover.mp3', undefined, undefined, '.mp3');
+  assert.equal(mp3Inline.mode, 'inline');
+  assert.equal(mp3Inline.headerValue, 'inline; filename="job_123_voiceover.mp3"');
+});
+
+test('isValidPlayableMediaResponse blocks HTML error/524 pages from downloading as .mp4.html', () => {
+  assert.equal(isValidPlayableMediaResponse(200, true, 'video/mp4', 'video/'), true);
+  assert.equal(isValidPlayableMediaResponse(206, true, 'video/mp4', 'video/'), true);
+  assert.equal(isValidPlayableMediaResponse(200, true, 'text/html; charset=utf-8', 'video/'), false);
+  assert.equal(isValidPlayableMediaResponse(524, false, 'text/html', 'video/'), false);
+  assert.equal(isValidPlayableMediaResponse(200, true, 'application/json', 'video/'), false);
+  assert.equal(isValidPlayableMediaResponse(404, false, 'application/json', 'video/'), false);
+});
+
+test('shouldFailInsteadOfWeddingFallback prevents fake wedding drama captions on failed 3-min videos', () => {
+  // Real 3-minute uploaded movie where Gemini failed MUST fail clearly instead of showing "သိန်း 30" fallback
+  assert.equal(
+    shouldFailInsteadOfWeddingFallback({
+      isWeddingDemoClip: false,
+      usedLiveGemini: false,
+      hasUploadedSource: true
+    }),
+    true
+  );
+  // Real movie where Gemini succeeded -> OK
+  assert.equal(
+    shouldFailInsteadOfWeddingFallback({
+      isWeddingDemoClip: false,
+      usedLiveGemini: true,
+      hasUploadedSource: true
+    }),
+    false
+  );
+  // Built-in 70.7s SaveTik wedding demo clip -> allowed
+  assert.equal(
+    shouldFailInsteadOfWeddingFallback({
+      isWeddingDemoClip: true,
+      usedLiveGemini: false,
+      hasUploadedSource: true
+    }),
+    false
+  );
+
+  const noKeyErr = detectGeminiFailureMessage('', false, false);
+  assert.equal(noKeyErr.code, 'no_key');
+  assert.ok(noKeyErr.messageMy.includes('/addgemini'));
+
+  const quotaErr = detectGeminiFailureMessage('429 RESOURCE_EXHAUSTED quota exceeded', true, true);
+  assert.equal(quotaErr.code, 'quota');
+});
+
+test('subtitle scale supports smaller sizes down to 12px (27%) for preview and ASS export', () => {
+  assert.equal(calculateSubtitleScalePercent(12), 27);
+  assert.equal(calculateSubtitleScalePercent(20), 45);
+  assert.ok(computeAssSubtitleFontSize(12, 540, 960) < computeAssSubtitleFontSize(28, 540, 960));
+});
+
+test('getDefaultAntiCopyrightEffects enables ONLY FHD 1080p in Credit Mode and keeps all optional edits OFF', () => {
+  assert.deepEqual(getDefaultAntiCopyrightEffects(false), {
+    outputHD: true,
+    zoom: false,
+    mirror: false,
+    colorShift: false,
+    crop: false,
+    grain: false,
+    pitchShift: false
+  });
+  assert.deepEqual(getDefaultAntiCopyrightEffects(true), {
+    outputHD: false,
+    zoom: false,
+    mirror: false,
+    colorShift: false,
+    crop: false,
+    grain: false,
+    pitchShift: false
+  });
+});
+
+test('shouldShowPaymentNotificationBanner shows approval once and stays hidden across reloads', () => {
+  const approved = { id: 'pay-100', status: 'approved' as const, approvedAt: 1700000000000 };
+  const key = buildPaymentNoticeKey(approved);
+
+  // Pending always shows unless dismissed in session
+  assert.equal(
+    shouldShowPaymentNotificationBanner({ id: 'pay-99', status: 'pending' }, {}, {}, {}),
+    true
+  );
+  // First time seeing approved notification -> shows
+  assert.equal(shouldShowPaymentNotificationBanner(approved, {}, {}, {}), true);
+  // During the SAME page visit (sessionShownKeys populated) -> stays visible until dismissed
+  assert.equal(shouldShowPaymentNotificationBanner(approved, {}, { [key]: true }, { [key]: true }), true);
+  // After page reload (sessionShownKeys empty, persistedSeenKeys populated) -> NEVER reappears
+  assert.equal(shouldShowPaymentNotificationBanner(approved, {}, {}, { [key]: true }), false);
+});
+
+test('isValidMp4BufferHeader accepts real MP4 ftyp bytes and rejects HTML/JSON error pages', () => {
+  const realMp4Head = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]);
+  assert.equal(isValidMp4BufferHeader(realMp4Head, 4096), true);
+
+  const htmlBytes = new TextEncoder().encode('<!DOCTYPE html><html><body>524</body></html>');
+  assert.equal(isValidMp4BufferHeader(htmlBytes, 4096), false);
+
+  const jsonBytes = new TextEncoder().encode('{"ok":false,"error":"Not found"}');
+  assert.equal(isValidMp4BufferHeader(jsonBytes, 4096), false);
+
+  assert.equal(sanitizeMp4DownloadName('မြန်မာကား.mp4', 'recap_free'), 'recap_free.mp4');
+  assert.equal(sanitizeMp4DownloadName('action_movie (2026).mp4'), 'action_movie_2026.mp4');
+});
+
+
+
 

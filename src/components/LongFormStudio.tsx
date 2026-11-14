@@ -15,6 +15,9 @@ import {
   LONG_FORM_STYLE_PROMPTS,
   VOICE_OPTIONS,
   exportCuesToSrt,
+  isValidPlayableMediaResponse,
+  isValidMp4BufferHeader,
+  sanitizeMp4DownloadName,
   type LongFormStyleId,
   type VoiceGender,
   type SubtitleCue
@@ -498,14 +501,49 @@ export const LongFormStudio: React.FC<{ uiLang: 'my' | 'en' }> = ({ uiLang }) =>
                 </span>
                 <div className="flex items-center gap-2">
                   {outputVideoUrl && (
-                    <a
-                      href={outputVideoUrl}
-                      download={`${movieTitle.slice(0, 24)}_recap.mp4`}
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        playUiSound('tap');
+                        const safeName = sanitizeMp4DownloadName(`${movieTitle.slice(0, 24)}_recap`, 'longform_recap');
+                        const sep = outputVideoUrl.includes('?') ? '&' : '?';
+                        const dlUrl = outputVideoUrl.startsWith('/api/recap/video/')
+                          ? `${outputVideoUrl}${sep}dl=1&name=${encodeURIComponent(safeName)}`
+                          : outputVideoUrl;
+                        try {
+                          const resp = await fetch(dlUrl, { method: 'GET', cache: 'no-store' });
+                          if (!isValidPlayableMediaResponse(resp.status, resp.ok, resp.headers.get('content-type'), 'video/')) {
+                            playUiSound('error');
+                            return;
+                          }
+                          const rawBlob = await resp.blob();
+                          const head = new Uint8Array(await rawBlob.slice(0, 32).arrayBuffer());
+                          if (!isValidMp4BufferHeader(head, rawBlob.size)) {
+                            playUiSound('error');
+                            return;
+                          }
+                          const mp4Blob = new Blob([rawBlob], { type: 'video/mp4' });
+                          const objUrl = URL.createObjectURL(mp4Blob);
+                          const a = document.createElement('a');
+                          a.href = objUrl;
+                          a.download = safeName;
+                          document.body.appendChild(a);
+                          a.click();
+                          document.body.removeChild(a);
+                          setTimeout(() => {
+                            try {
+                              URL.revokeObjectURL(objUrl);
+                            } catch {}
+                          }, 60000);
+                        } catch {
+                          playUiSound('error');
+                        }
+                      }}
                       className="inline-flex items-center gap-1 rounded-lg bg-amber-500 hover:bg-amber-400 px-2.5 py-1 text-[11px] font-bold text-slate-950 cursor-pointer"
                     >
                       <Download className="size-3" />
                       <span>Download .MP4</span>
-                    </a>
+                    </button>
                   )}
                   <button
                     type="button"

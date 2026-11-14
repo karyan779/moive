@@ -2203,12 +2203,9 @@ export const LandingView: React.FC<{
 };
 
 /* ============================================================================
- * 5. ONE-TAP GOOGLE (GMAIL) & TELEGRAM AUTH MODAL (Exact StreamWaveAI Flow)
+ * 5. ONE-TAP GOOGLE (GMAIL) AUTH MODAL
  *    - "Continue with Google": Real Firebase GoogleAuthProvider popup chooser
- *    - "Continue with Telegram": Real @ttakrecap_bot 6-digit OTP verification
  * ========================================================================== */
-type LoginStep = 'choose' | 'tg-chatid' | 'tg-code';
-
 export interface AuthenticatedUserPayload {
   userId: string;
   name: string;
@@ -2225,30 +2222,19 @@ export const SignInModal: React.FC<{
   canDismiss?: boolean;
   onSignInSuccess: (user: AuthenticatedUserPayload) => void;
 }> = ({ isOpen, onClose, initialMode = 'signin', canDismiss = true, onSignInSuccess }) => {
-  const [step, setStep] = useState<LoginStep>('choose');
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
 
-  // Telegram Bot OTP state (`tg-chatid` -> `tg-code`)
-  const [tgChatId, setTgChatId] = useState<string>('');
-  const [tgCode, setTgCode] = useState<string>('');
-  const [tgInfoMsg, setTgInfoMsg] = useState<string>('');
-
   useEffect(() => {
     if (isOpen) {
-      setStep('choose');
       setError('');
-      setTgInfoMsg('');
     }
   }, [isOpen, initialMode]);
 
   if (!isOpen) return null;
 
   const resetAll = () => {
-    setStep('choose');
     setError('');
-    setTgCode('');
-    setTgInfoMsg('');
   };
 
   const handleGoogleSignIn = async () => {
@@ -2297,73 +2283,6 @@ export const SignInModal: React.FC<{
     }
   };
 
-  const handleSendTelegramCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!tgChatId.trim() || loading) return;
-    setLoading(true);
-    setError('');
-    setTgInfoMsg('');
-    try {
-      const res = await fetch('/api/auth/telegram/send-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: tgChatId.trim() })
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        playUiSound('blocked');
-        setError(data.error || 'Telegram OTP ပို့၍မရပါ');
-        return;
-      }
-      playUiSound('success');
-      setTgInfoMsg(data.message || 'Telegram Bot ထံ OTP ကုဒ် ပို့ပြီးပါပြီ');
-      setStep('tg-code');
-    } catch {
-      playUiSound('blocked');
-      setError('Telegram OTP ပို့ဆောင်မှု မအောင်မြင်ပါ');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleVerifyTelegramCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!tgCode.trim() || loading) return;
-    setLoading(true);
-    setError('');
-    try {
-      const res = await fetch('/api/auth/telegram/verify-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chatId: tgChatId.trim(),
-          code: tgCode.trim()
-        })
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok || !data.token || !data.user) {
-        playUiSound('blocked');
-        setError(data.error || 'OTP ကုဒ် မှားယွင်းနေပါသည်');
-        return;
-      }
-      playUiSound('success');
-      onSignInSuccess({
-        userId: data.user.userId,
-        name: data.user.name,
-        email: data.user.email,
-        provider: 'telegram',
-        token: data.token
-      });
-      resetAll();
-      onClose();
-    } catch {
-      playUiSound('blocked');
-      setError('စစ်ဆေးမှု မအောင်မြင်ပါ');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div
       data-testid="auth-modal-backdrop"
@@ -2393,189 +2312,66 @@ export const SignInModal: React.FC<{
           </button>
         )}
 
-        {step === 'choose' && (
-          <>
-            <div className="mb-6 text-center">
-              <div className="mx-auto mb-3.5 flex size-12 items-center justify-center rounded-xl bg-amber-500 text-slate-950 font-black">
-                <Video className="size-5" />
-              </div>
-              <h2 className="text-xl font-bold tracking-tight text-stone-900 dark:text-white">
-                {initialMode === 'signup' ? 'Get started' : 'Welcome back'}
-              </h2>
-              <p className="mt-1.5 text-xs text-stone-500 dark:text-slate-400 leading-relaxed">
-                Password ရိုက်စရာမလိုဘဲ Gmail သို့မဟုတ် Telegram ဖြင့် တစ်ချက်တည်း Sign Up / Sign In ဝင်ရောက်ပါ
-              </p>
-            </div>
-
-            {error && (
-              <p
-                data-testid="auth-error-msg"
-                className="mb-4 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-center text-xs font-medium text-red-500"
-              >
-                {error}
-              </p>
-            )}
-
-            <div className="flex flex-col gap-3">
-              {/* Primary One-Tap Google / Gmail Login */}
-              <button
-                id="login-google-btn"
-                data-testid="login-google-btn"
-                type="button"
-                disabled={loading}
-                onClick={handleGoogleSignIn}
-                className="flex h-11.5 w-full cursor-pointer items-center justify-center gap-3 rounded-xl border border-stone-200 bg-white px-5 text-sm font-semibold text-stone-900 transition-colors hover:bg-stone-50 active:scale-99 disabled:opacity-55 dark:border-slate-700 dark:bg-white dark:text-slate-950 dark:hover:bg-stone-100"
-              >
-                {loading ? (
-                  <Loader2 className="size-4 animate-spin text-stone-600" />
-                ) : (
-                  <svg className="size-4 shrink-0" viewBox="0 0 24 24">
-                    <path
-                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
-                      fill="#4285F4"
-                    />
-                    <path
-                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                      fill="#34A853"
-                    />
-                    <path
-                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                      fill="#FBBC05"
-                    />
-                    <path
-                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                      fill="#EA4335"
-                    />
-                  </svg>
-                )}
-                <span>{loading ? 'Connecting to Google…' : 'Continue with Google'}</span>
-              </button>
-
-              {/* Secondary Telegram OTP Login (@ttakrecap_bot) */}
-              <button
-                id="login-telegram-btn"
-                data-testid="login-telegram-btn"
-                type="button"
-                disabled={loading}
-                onClick={() => {
-                  playUiSound('tap');
-                  setError('');
-                  setStep('tg-chatid');
-                }}
-                className="flex h-11.5 w-full cursor-pointer items-center justify-center gap-2.5 rounded-xl bg-[#229ED9] hover:bg-[#1d8ec4] px-5 text-sm font-semibold text-white transition-colors disabled:opacity-55"
-              >
-                <svg className="size-4 fill-current shrink-0" viewBox="0 0 24 24">
-                  <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.479.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" />
-                </svg>
-                <span>Continue with Telegram</span>
-              </button>
-            </div>
-
-            <p className="mt-5 text-center text-[11px] text-stone-400 dark:text-slate-500">
-              Free Mode တွင် တစ်ရက် ၃ ပုဒ် အခမဲ့ အသုံးပြုနိုင်ပါသည်။
-            </p>
-          </>
-        )}
-
-        {/* TELEGRAM OTP STEP 1: ENTER CHAT ID */}
-        {step === 'tg-chatid' && (
-          <div>
-            <div className="mb-4 text-center">
-              <h2 className="text-lg font-bold tracking-tight text-stone-900 dark:text-white">
-                Telegram OTP Login
-              </h2>
-              <p className="mt-1 text-xs text-stone-500 dark:text-slate-400 leading-relaxed">
-                Telegram တွင် <span className="font-mono font-semibold text-teal-600 dark:text-teal-400">@ttakrecap_bot</span> သို့{' '}
-                <span className="font-mono font-semibold">/id</span> ဟု ပို့ပြီး ရရှိလာသော Chat ID ကို ထည့်ပါ။
-              </p>
-            </div>
-
-            {error && (
-              <p className="mb-3 rounded-xl bg-red-500/10 px-3 py-2 text-center text-xs text-red-500">
-                {error}
-              </p>
-            )}
-
-            <form onSubmit={handleSendTelegramCode} className="flex flex-col gap-3">
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="Telegram Chat ID (ဥပမာ - 1981253384)"
-                value={tgChatId}
-                onChange={(e) => setTgChatId(e.target.value)}
-                autoFocus
-                className="h-11 w-full rounded-xl border border-stone-200 bg-[#FAF8F4] dark:bg-[#151C26] px-3.5 text-sm text-stone-900 outline-none placeholder:text-stone-400 focus:border-amber-500 dark:border-slate-700 dark:text-white"
-              />
-              <button
-                type="submit"
-                disabled={loading || !tgChatId.trim()}
-                className="h-11 w-full cursor-pointer rounded-xl bg-amber-500 hover:bg-amber-400 text-xs font-bold text-slate-950 transition-colors disabled:opacity-50"
-              >
-                {loading ? 'Sending OTP…' : 'Telegram မှ OTP ကုဒ်ပို့မည်'}
-              </button>
-            </form>
-
-            <button
-              type="button"
-              onClick={resetAll}
-              className="mt-3 w-full cursor-pointer text-center text-xs text-stone-400 transition-colors hover:text-stone-600 dark:text-slate-400 dark:hover:text-slate-200"
-            >
-              ← Back to Sign In Options
-            </button>
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-3.5 flex size-12 items-center justify-center rounded-xl bg-amber-500 text-slate-950 font-black">
+            <Video className="size-5" />
           </div>
+          <h2 className="text-xl font-bold tracking-tight text-stone-900 dark:text-white">
+            {initialMode === 'signup' ? 'Get started' : 'Welcome back'}
+          </h2>
+          <p className="mt-1.5 text-xs text-stone-500 dark:text-slate-400 leading-relaxed">
+            Password ရိုက်စရာမလိုဘဲ Gmail (Google) ဖြင့် တစ်ချက်တည်း Sign Up / Sign In ဝင်ရောက်ပါ
+          </p>
+        </div>
+
+        {error && (
+          <p
+            data-testid="auth-error-msg"
+            className="mb-4 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-center text-xs font-medium text-red-500"
+          >
+            {error}
+          </p>
         )}
 
-        {/* TELEGRAM OTP STEP 2: VERIFY 6-DIGIT CODE */}
-        {step === 'tg-code' && (
-          <div>
-            <div className="mb-4 text-center">
-              <h2 className="text-lg font-bold tracking-tight text-stone-900 dark:text-white">
-                Enter Verification Code
-              </h2>
-              <p className="mt-1 text-xs text-stone-500 dark:text-slate-400">
-                {tgInfoMsg || '@ttakrecap_bot မှ ပို့လိုက်သော ဂဏန်း ၆ လုံး ကုဒ်ကို ထည့်ပါ'}
-              </p>
-            </div>
-
-            {error && (
-              <p className="mb-3 rounded-xl bg-red-500/10 px-3 py-2 text-center text-xs text-red-500">
-                {error}
-              </p>
+        <div className="flex flex-col gap-3">
+          {/* Primary One-Tap Google / Gmail Login */}
+          <button
+            id="login-google-btn"
+            data-testid="login-google-btn"
+            type="button"
+            disabled={loading}
+            onClick={handleGoogleSignIn}
+            className="flex h-11.5 w-full cursor-pointer items-center justify-center gap-3 rounded-xl border border-stone-200 bg-white px-5 text-sm font-semibold text-stone-900 transition-colors hover:bg-stone-50 active:scale-99 disabled:opacity-55 dark:border-slate-700 dark:bg-white dark:text-slate-950 dark:hover:bg-stone-100"
+          >
+            {loading ? (
+              <Loader2 className="size-4 animate-spin text-stone-600" />
+            ) : (
+              <svg className="size-4 shrink-0" viewBox="0 0 24 24">
+                <path
+                  d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
+                  fill="#4285F4"
+                />
+                <path
+                  d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                  fill="#34A853"
+                />
+                <path
+                  d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                  fill="#FBBC05"
+                />
+                <path
+                  d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                  fill="#EA4335"
+                />
+              </svg>
             )}
+            <span>{loading ? 'Connecting to Google…' : 'Continue with Google'}</span>
+          </button>
+        </div>
 
-            <form onSubmit={handleVerifyTelegramCode} className="flex flex-col gap-3">
-              <input
-                type="text"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                placeholder="123456"
-                value={tgCode}
-                onChange={(e) => setTgCode(e.target.value)}
-                autoFocus
-                className="h-11 w-full rounded-xl border border-stone-200 bg-[#FAF8F4] dark:bg-[#151C26] px-3.5 text-center font-mono text-lg tracking-widest text-stone-900 outline-none placeholder:text-stone-400 focus:border-amber-500 dark:border-slate-700 dark:text-white"
-              />
-              <button
-                type="submit"
-                disabled={loading || !tgCode.trim()}
-                className="h-11 w-full cursor-pointer rounded-xl bg-amber-500 hover:bg-amber-400 text-xs font-bold text-slate-950 transition-colors disabled:opacity-50"
-              >
-                {loading ? 'Verifying…' : 'Verify & Continue'}
-              </button>
-            </form>
-
-            <button
-              type="button"
-              onClick={() => {
-                setStep('tg-chatid');
-                setTgCode('');
-                setError('');
-              }}
-              className="mt-3 w-full cursor-pointer text-center text-xs text-stone-400 transition-colors hover:text-stone-600 dark:text-slate-400 dark:hover:text-slate-200"
-            >
-              Change Chat ID
-            </button>
-          </div>
-        )}
+        <p className="mt-5 text-center text-[11px] text-stone-400 dark:text-slate-500">
+          Free Mode တွင် တစ်ရက် ၃ ပုဒ် အခမဲ့ အသုံးပြုနိုင်ပါသည်။
+        </p>
       </div>
     </div>
   );

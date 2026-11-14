@@ -52,6 +52,7 @@ interface CanvasVideoEditorProps {
   cues: SubtitleCue[];
   targetLanguage: TargetLanguageCode;
   audioBase64?: string;
+  voiceoverAudioUrl?: string | null;
   hasMuxedAudio?: boolean;
   isOverlayEditMode: boolean;
   onToggleOverlayEditMode: (editing: boolean) => void;
@@ -167,7 +168,7 @@ export function drawSubtitleOnCanvas(
   ctx.save();
 
   const scaleFactor = width / 540;
-  const pxSize = Math.max(13, Math.round(config.fontSize * 0.35 * scaleFactor));
+  const pxSize = Math.max(7, Math.round(config.fontSize * 0.35 * scaleFactor));
   const fontMeta = resolveBurmeseFontMeta(config.fontStyle);
   ctx.font = `${fontMeta.fontWeight} ${pxSize}px ${fontMeta.cssFontFamily}`;
   ctx.textAlign = 'center';
@@ -243,6 +244,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   cues,
   targetLanguage,
   audioBase64,
+  voiceoverAudioUrl = null,
   hasMuxedAudio = false,
   isOverlayEditMode,
   onToggleOverlayEditMode,
@@ -265,12 +267,23 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isRotatedLandscapeFs, setIsRotatedLandscapeFs] = useState(false);
+  const [videoLoadError, setVideoLoadError] = useState<string | null>(null);
   const [selectedBlurIdx, setSelectedBlurIdx] = useState<number | null>(
     blurRegions.length > 0 ? 0 : null
   );
   const [videoDimensions, setVideoDimensions] = useState<{ width: number; height: number } | null>(
     null
   );
+
+  const companionAudioSrc = hasMuxedAudio
+    ? null
+    : audioBase64
+      ? `data:audio/wav;base64,${audioBase64}`
+      : voiceoverAudioUrl || null;
+
+  useEffect(() => {
+    setVideoLoadError(null);
+  }, [videoFileUrl]);
 
   // Refs for pointer-captured dragging
   const blurMoveRef = useRef<{
@@ -376,7 +389,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
       } else if (subScaleRef.current) {
         const dx = clientX - subScaleRef.current.startClientX;
         const nextFontSize = Math.max(
-          16,
+          12,
           Math.min(68, Math.round(subScaleRef.current.startSize + 0.25 * dx))
         );
         onChangeSubtitleConfigRef.current({
@@ -474,32 +487,31 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
 
   // Automatically unmute AI voiceover and mute original foreign speech when new Recap audio arrives
   useEffect(() => {
-    if (audioBase64 || hasMuxedAudio) {
+    if (companionAudioSrc || hasMuxedAudio) {
       setIsMuted(false);
       setIsPlaying(true);
       if (videoRef.current) {
         videoRef.current.currentTime = 0;
-        videoRef.current.muted = !hasMuxedAudio && Boolean(audioBase64);
+        videoRef.current.muted = !hasMuxedAudio && Boolean(companionAudioSrc);
         videoRef.current.volume = hasMuxedAudio ? 1.0 : 0.0;
         videoRef.current.play().catch(() => {});
       }
     }
-  }, [audioBase64, hasMuxedAudio]);
+  }, [companionAudioSrc, hasMuxedAudio]);
 
-  // Sync synthesized voiceover audio element when audioBase64 updates (used when hasMuxedAudio is false)
+  // Sync synthesized voiceover audio element when audioBase64 or voiceoverAudioUrl updates (used when hasMuxedAudio is false)
   useEffect(() => {
-    if (!audioBase64 || hasMuxedAudio) {
+    if (!companionAudioSrc || hasMuxedAudio) {
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.src = '';
       }
       return;
     }
-    const src = `data:audio/wav;base64,${audioBase64}`;
     if (!audioRef.current) {
-      audioRef.current = new Audio(src);
-    } else {
-      audioRef.current.src = src;
+      audioRef.current = new Audio(companionAudioSrc);
+    } else if (audioRef.current.src !== companionAudioSrc) {
+      audioRef.current.src = companionAudioSrc;
     }
     audioRef.current.loop = true;
     audioRef.current.volume = 1.0;
@@ -509,12 +521,12 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
       audioRef.current.currentTime = videoRef.current?.currentTime || 0;
       audioRef.current.play().catch(() => {});
     }
-  }, [audioBase64, hasMuxedAudio, effects.pitchShift]);
+  }, [companionAudioSrc, hasMuxedAudio, effects.pitchShift]);
 
   // Sync HTML5 video + companion voiceover play/pause and mute state
   useEffect(() => {
     const a = audioRef.current;
-    if (a && audioBase64 && !hasMuxedAudio) {
+    if (a && companionAudioSrc && !hasMuxedAudio) {
       a.muted = isMuted;
       a.volume = 1.0;
       if (isPlaying) {
@@ -528,7 +540,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     const v = videoRef.current;
     if (!v) return;
 
-    if (!hasMuxedAudio && audioBase64) {
+    if (!hasMuxedAudio && companionAudioSrc) {
       // Mute original foreign speech on the video element while companion AI voiceover plays
       v.muted = true;
       v.volume = 0.0;
@@ -549,7 +561,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         bgVideoRef.current.pause();
       }
     }
-  }, [isProceduralDemo, isPlaying, isMuted, audioBase64, hasMuxedAudio, videoFileUrl]);
+  }, [isProceduralDemo, isPlaying, isMuted, companionAudioSrc, hasMuxedAudio, videoFileUrl]);
 
   // Procedural demo scene loop (when a demo preset is active)
   useEffect(() => {
@@ -564,7 +576,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         setCurrentTime((prev) => {
           const next = prev + dt;
           if (next >= (videoDuration || 15)) {
-            if (audioRef.current && audioBase64 && !hasMuxedAudio) {
+            if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
               audioRef.current.currentTime = 0;
             }
             return 0;
@@ -584,7 +596,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [isProceduralDemo, isPlaying, currentTime, demoScene, videoDuration, audioBase64, hasMuxedAudio]);
+  }, [isProceduralDemo, isPlaying, currentTime, demoScene, videoDuration, companionAudioSrc, hasMuxedAudio]);
 
   // Seek helper for timeline bar
   const seekFromPointer = useCallback(
@@ -601,12 +613,12 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
       if (!isProceduralDemo && bgVideoRef.current) {
         bgVideoRef.current.currentTime = targetSec;
       }
-      if (audioRef.current && audioBase64 && !hasMuxedAudio) {
+      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
         audioRef.current.currentTime = targetSec;
       }
       setCurrentTime(targetSec);
     },
-    [isProceduralDemo, videoDuration, audioBase64, hasMuxedAudio]
+    [isProceduralDemo, videoDuration, companionAudioSrc, hasMuxedAudio]
   );
 
   // Add new blur box (matches rd() in submit_form_only.js which also calls eL(true) to enable blur)
@@ -821,7 +833,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                       }
                       if (
                         audioRef.current &&
-                        audioBase64 &&
+                        companionAudioSrc &&
                         !hasMuxedAudio &&
                         Math.abs(audioRef.current.currentTime - t) > 0.35
                       ) {
@@ -832,6 +844,9 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                       if (bgVideoRef.current) {
                         bgVideoRef.current.currentTime = e.currentTarget.currentTime;
                       }
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
+                        audioRef.current.currentTime = e.currentTarget.currentTime;
+                      }
                     }}
                     onPlay={() => {
                       setIsPlaying(true);
@@ -839,7 +854,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                         bgVideoRef.current.muted = true;
                         bgVideoRef.current.play().catch(() => {});
                       }
-                      if (audioRef.current && audioBase64 && !hasMuxedAudio) {
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
                         audioRef.current.play().catch(() => {});
                       }
                     }}
@@ -847,11 +862,15 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                       if (bgVideoRef.current) {
                         bgVideoRef.current.pause();
                       }
-                      if (audioRef.current && audioBase64 && !hasMuxedAudio) {
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
                         audioRef.current.pause();
                       }
                     }}
+                    onError={() => {
+                      setVideoLoadError('Video stream could not be decoded.');
+                    }}
                     onLoadedMetadata={(e) => {
+                      setVideoLoadError(null);
                       const v = e.currentTarget;
                       if (v.videoWidth && v.videoHeight) {
                         setVideoDimensions({ width: v.videoWidth, height: v.videoHeight });
@@ -862,7 +881,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                       if (bgVideoRef.current) {
                         bgVideoRef.current.currentTime = v.currentTime;
                       }
-                      if (!hasMuxedAudio && audioBase64) {
+                      if (!hasMuxedAudio && companionAudioSrc) {
                         v.muted = true;
                         v.volume = 0.0;
                       } else {
@@ -888,10 +907,18 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                           : 'object-contain'
                     }`}
                     playsInline
-                    muted={isMuted || (!hasMuxedAudio && Boolean(audioBase64))}
+                    muted={isMuted || (!hasMuxedAudio && Boolean(companionAudioSrc))}
                     loop
                     autoPlay
                   />
+                  {videoLoadError && (
+                    <div
+                      data-testid="stage-video-error-overlay"
+                      className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 px-6 text-center text-xs text-amber-300"
+                    >
+                      <span>{videoLoadError}</span>
+                    </div>
+                  )}
                 </div>
               </>
             )}
@@ -1284,7 +1311,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                   fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily,
                   fontWeight: resolveBurmeseFontMeta(subtitleConfig.fontStyle).fontWeight,
                   letterSpacing: resolveBurmeseFontMeta(subtitleConfig.fontStyle).letterSpacing,
-                  fontSize: `${Math.max(11, Math.min(18, Math.round(0.31 * subtitleConfig.fontSize)))}px`,
+                  fontSize: `${Math.max(7, Math.min(24, Math.round(0.32 * subtitleConfig.fontSize)))}px`,
                   lineHeight: 1.35,
                   color:
                     activeEdit.captionTextColor ||

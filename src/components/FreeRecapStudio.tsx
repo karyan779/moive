@@ -47,8 +47,13 @@ import {
   calculateSubtitleScalePercent,
   calculateCreditCost,
   exportCuesToSrt,
-  buildSyncedRecapCues,
   resolveStudioWorkflowStep,
+  isValidPlayableMediaResponse,
+  isValidMp4BufferHeader,
+  sanitizeMp4DownloadName,
+  getDefaultAntiCopyrightEffects,
+  buildPaymentNoticeKey,
+  shouldShowPaymentNotificationBanner,
   type RecapMode,
   type TranslateAudioMode,
   type VoiceGender,
@@ -166,18 +171,24 @@ function StreamWaveSwitch({
   checked,
   onCheckedChange,
   disabled = false,
-  locked = false
+  locked = false,
+  testId,
+  ariaLabel
 }: {
   checked: boolean;
   onCheckedChange: (val: boolean) => void;
   disabled?: boolean;
   locked?: boolean;
+  testId?: string;
+  ariaLabel?: string;
 }) {
   return (
     <div className="relative inline-flex items-center">
       <button
         type="button"
         role="switch"
+        data-testid={testId}
+        aria-label={ariaLabel}
         disabled={disabled}
         aria-checked={checked}
         onClick={() => !disabled && onCheckedChange(!checked)}
@@ -308,6 +319,24 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     }[]
   >([]);
   const [dismissedPaymentIds, setDismissedPaymentIds] = useState<Record<string, boolean>>({});
+  const [sessionShownPaymentKeys, setSessionShownPaymentKeys] = useState<Record<string, boolean>>({});
+  const [persistedSeenPaymentKeys, setPersistedSeenPaymentKeys] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(`ttak_seen_payment_notices_${userId || 'anon'}`);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(`ttak_seen_payment_notices_${userId || 'anon'}`);
+      setPersistedSeenPaymentKeys(raw ? JSON.parse(raw) : {});
+    } catch {
+      setPersistedSeenPaymentKeys({});
+    }
+  }, [userId]);
 
   useEffect(() => {
     let active = true;
@@ -330,6 +359,30 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   }, [userId]);
 
   const latestPayment = userPayments[0] || null;
+  const shouldShowLatestPaymentBanner = shouldShowPaymentNotificationBanner(
+    latestPayment,
+    dismissedPaymentIds,
+    sessionShownPaymentKeys,
+    persistedSeenPaymentKeys
+  );
+
+  // Record approved/rejected notices immediately in localStorage once shown in the current session
+  // so they display once and never pop back up on website reload.
+  useEffect(() => {
+    if (!latestPayment || latestPayment.status === 'pending') return;
+    if (!shouldShowLatestPaymentBanner) return;
+    const key = buildPaymentNoticeKey(latestPayment);
+    if (!sessionShownPaymentKeys[key]) {
+      setSessionShownPaymentKeys((prev) => ({ ...prev, [key]: true }));
+    }
+    if (!persistedSeenPaymentKeys[key]) {
+      const nextSeen = { ...persistedSeenPaymentKeys, [key]: true };
+      setPersistedSeenPaymentKeys(nextSeen);
+      try {
+        localStorage.setItem(`ttak_seen_payment_notices_${userId || 'anon'}`, JSON.stringify(nextSeen));
+      } catch {}
+    }
+  }, [latestPayment, shouldShowLatestPaymentBanner, sessionShownPaymentKeys, persistedSeenPaymentKeys, userId]);
 
   // Start clean with no hardcoded pre-loaded video
   const [hasLoadedVideo, setHasLoadedVideo] = useState<boolean>(false);
@@ -372,16 +425,12 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     samplePreviewLight: false
   });
 
-  // Anti-Copyright Effects State (FHD 1080p & Dynamic Zoom locked in Free Mode, unlocked in Credit/Pro Mode)
-  const [effects, setEffects] = useState<AntiCopyrightEffects>({
-    outputHD: !isFreeTier,
-    zoom: false,
-    mirror: true,
-    colorShift: true,
-    crop: true,
-    grain: true,
-    pitchShift: true
-  });
+  // Anti-Copyright / Edit Effects State:
+  // In Credit Mode, ONLY FHD 1080p is ON by default; Dynamic zoom, Mirror flip, Color shift, Slight crop, Film grain, Audio pitch start OFF until user enables them.
+  const [effects, setEffects] = useState<AntiCopyrightEffects>(() =>
+    getDefaultAntiCopyrightEffects(isFreeTier)
+  );
+  const prevFreeTierRef = useRef<boolean>(isFreeTier);
 
   // DeepRecap Studio Framing, Cover Band, Brand Overlay & Caption Color State
   const [editConfig, setEditConfig] = useState<DeepRecapEditConfig>(DEFAULT_DEEPRECAP_EDIT_CONFIG);
@@ -399,13 +448,16 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
   // Sync Free Tier vs Pro Credit Tier effect defaults & Voice restriction when switching routes
   useEffect(() => {
+    const modeChanged = prevFreeTierRef.current !== isFreeTier;
+    prevFreeTierRef.current = isFreeTier;
     if (isFreeTier) {
       setEffects((prev) => ({ ...prev, outputHD: false, zoom: false }));
       if (!isVoiceAllowedInMode(voiceGender, true)) {
         setVoiceGender('male');
       }
-    } else {
-      setEffects((prev) => ({ ...prev, outputHD: true }));
+    } else if (modeChanged) {
+      // Entering Credit Mode: ONLY FHD 1080p is auto-enabled; all optional edit toggles stay OFF
+      setEffects(getDefaultAntiCopyrightEffects(false));
     }
   }, [isFreeTier, voiceGender]);
 
@@ -432,6 +484,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [lastJobId, setLastJobId] = useState<string | null>(null);
   const [voiceoverMp3Url, setVoiceoverMp3Url] = useState<string | null>(null);
   const [isExportingVideo, setIsExportingVideo] = useState<boolean>(false);
+  const [exportProgressPct, setExportProgressPct] = useState<number>(0);
+  const [studioErrorMsg, setStudioErrorMsg] = useState<string | null>(null);
   const [isDownloadingMp3, setIsDownloadingMp3] = useState<boolean>(false);
 
   // AI Voice Preview State (Listen to Thiha / Nilar / Pro Voices before generating video)
@@ -542,6 +596,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setVideoTitle(file.name.replace(/\.[^/.]+$/, ''));
     setHasLoadedVideo(true);
     setIsDone(false);
+    setStudioErrorMsg(null);
     setCues([]);
     setAudioBase64(undefined);
     setHasMuxedAudio(false);
@@ -624,34 +679,20 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     playUiSound('tap');
     setIsGenerating(true);
     setIsDone(false);
+    setStudioErrorMsg(null);
     const logs: AutoFlowLogStep[] = [];
 
     try {
       const safeDur = Math.max(8, videoDuration || 15);
 
       if (isFreeTier) {
-        // FREE MODE (On-Device WebCodecs + Thiha/Nilar Burmese TTS)
         setRenderProgress(10);
         setRenderMessage('Extracting audio on device with mediabunny...');
-        await new Promise((r) => setTimeout(r, 320));
-
-        setRenderProgress(25);
-        setRenderMessage('Extracting speech & transcribing with AI...');
-        await new Promise((r) => setTimeout(r, 360));
+        await new Promise((r) => setTimeout(r, 220));
       } else {
-        // CREDIT / PRO SERVER MODE (10-Stage Cloud GPU Queue)
-        const serverStages = [
-          { pct: 8, msg: 'Waiting in queue…' },
-          { pct: 18, msg: 'Processing upload…' },
-          { pct: 32, msg: 'Transcribing audio…' },
-          { pct: 46, msg: 'Translating…' },
-          { pct: 60, msg: 'Generating voice…' }
-        ];
-        for (const st of serverStages) {
-          setRenderProgress(st.pct);
-          setRenderMessage(st.msg);
-          await new Promise((r) => setTimeout(r, 200));
-        }
+        setRenderProgress(10);
+        setRenderMessage('Preparing video upload...');
+        await new Promise((r) => setTimeout(r, 150));
       }
 
       let r2ObjectKeyPayload: string | undefined;
@@ -682,6 +723,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       const savedEngineCfg = loadSavedApiEngineConfig();
       const freeUserKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
       const requestPayload = {
+        asyncMode: true,
         isFreeMode: isFreeTier,
         userGeminiApiKey: isFreeTier && freeUserKeys.geminiKey ? freeUserKeys.geminiKey : undefined,
         userGroqApiKey: isFreeTier && freeUserKeys.groqKey ? freeUserKeys.groqKey : undefined,
@@ -710,6 +752,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         editConfig: effectiveEditConfig
       };
 
+      setRenderProgress(37);
+      setRenderMessage(uiLang === 'my' ? 'Server တွင် Recap စတင်ဖန်တီးနေသည်...' : 'Starting AI recap job...');
+
       const response = await fetch('/api/recap/free/generate-assets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -724,21 +769,63 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         } catch {}
       }
 
-      if (!data || !data.ok) {
-        // Graceful client-side synced fallback if a proxy/gateway returned HTML or timed out on a very long video
-        const syncedFallback = buildSyncedRecapCues(
-          safeDur,
-          scriptStyle,
-          targetLanguage,
-          videoTitle || originalFilename
+      if (!data) {
+        throw new Error(
+          uiLang === 'my'
+            ? 'Server ချိတ်ဆက်မှု အချိန်ကြာသွားပါသည် (Cloudflare/Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
+            : 'Server returned an invalid/HTML gateway response. Please retry.'
         );
-        data = {
-          ok: true,
-          title: syncedFallback.title,
-          script_text: syncedFallback.scriptText,
-          cues: syncedFallback.cues,
-          highlight_clips: syncedFallback.highlightClips
-        };
+      }
+
+      if (data.ok && data.async && data.job_id) {
+        const pollJobId = String(data.job_id);
+        const pollDeadline = Date.now() + 12 * 60 * 1000;
+        let finalPayload: any = null;
+        while (Date.now() < pollDeadline) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
+            cache: 'no-store'
+          });
+          const stText = await stResp.text();
+          let stData: any = null;
+          if (stText && !stText.trim().startsWith('<')) {
+            try {
+              stData = JSON.parse(stText);
+            } catch {}
+          }
+          if (!stData) continue;
+          if (typeof stData.progress === 'number') {
+            setRenderProgress((prev) => Math.max(prev, Math.min(98, stData.progress)));
+          }
+          if (stData.stage_message) {
+            setRenderMessage(String(stData.stage_message));
+          }
+          if (stData.status === 'done' && stData.result) {
+            finalPayload = stData.result;
+            break;
+          }
+          if (stData.status === 'error' || stData.ok === false) {
+            throw new Error(
+              (uiLang === 'my' ? stData.error : stData.error_en || stData.error) ||
+                stData.error ||
+                'AI script generation failed'
+            );
+          }
+        }
+        if (!finalPayload) {
+          throw new Error(
+            uiLang === 'my'
+              ? 'Recap ထုတ်လုပ်မှု အချိန်ကျော်လွန်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+              : 'Recap processing timed out. Please retry.'
+          );
+        }
+        data = finalPayload;
+      } else if (!data.ok) {
+        throw new Error(
+          (uiLang === 'my' ? data.error : data.error_en || data.error) ||
+            data.error ||
+            'Failed to generate recap assets'
+        );
       }
 
       const generatedCues: SubtitleCue[] = data.cues || [];
@@ -747,31 +834,29 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       setLastJobId(data.job_id || null);
       setVoiceoverMp3Url(data.voiceover_mp3_url || null);
 
-      if (isFreeTier) {
-        setRenderProgress(68);
-        setRenderMessage('Mixing AI voiceover with original audio & rendering...');
-      } else {
-        setRenderProgress(75);
-        setRenderMessage('Mixing audio track…');
-        await new Promise((r) => setTimeout(r, 120));
-        setRenderProgress(86);
-        setRenderMessage('Burning subtitles into video…');
-      }
+      const hasLocalBlobStage = Boolean(
+        uploadedFileRef.current && videoFileUrl && videoFileUrl.startsWith('blob:')
+      );
 
       let finalVideoUrl = videoFileUrl || '';
       if (data.dubbed_video_url) {
         finalVideoUrl = data.dubbed_video_url;
         setDubbedVideoUrl(data.dubbed_video_url);
-        // Use preview_video_url (clean video + muxed Burmese voiceover) on the live canvas stage so interactive Subtitle & Blur overlays can be dragged without duplicate ghosting
-        setVideoFileUrl(data.preview_video_url || data.dubbed_video_url);
-        setHasMuxedAudio(true);
+        if (!hasLocalBlobStage) {
+          // URL / demo jobs switch to server-rendered inline stream
+          setVideoFileUrl(data.preview_video_url || data.dubbed_video_url);
+          setHasMuxedAudio(true);
+        } else {
+          // Keep the instant local blob: video on stage so screen never goes black or freezes; companion MP3/WAV plays in sync!
+          setHasMuxedAudio(false);
+        }
       } else {
         setHasMuxedAudio(false);
       }
 
-      setRenderProgress(95);
+      setRenderProgress(98);
       setRenderMessage(isFreeTier ? 'Finalizing recap video...' : 'Done!');
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 80));
 
       setRenderProgress(100);
       setIsDone(true);
@@ -808,153 +893,177 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       onSaveJob(newJob, creditCost);
     } catch (err) {
       playUiSound('error');
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : uiLang === 'my'
+            ? 'Recap ထုတ်လုပ်မှု မအောင်မြင်ပါ။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'Recap generation failed. Please try again.';
+      setStudioErrorMsg(errMsg);
       console.error('[RecapStudio] Render failed:', err);
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // Debounced background pre-warm for video export whenever user adjusts visual edits after generation
-  useEffect(() => {
-    if (!isDone || !lastJobId || isGenerating || isExportingVideo) return;
-    const timer = window.setTimeout(() => {
-      fetch('/api/recap/render-export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId: lastJobId,
-          durationSec: Math.max(8, videoDuration || 15),
-          mode,
-          translateAudio,
-          cues,
-          subtitleConfig,
-          blurEnabled,
-          blurRegions,
-          mirrorFlip: effects.mirror,
-          effects,
-          aspectRatio,
-          editConfig: effectiveEditConfig,
-          isFreeMode: isFreeTier
-        })
-      })
-        .then((res) => res.text())
-        .then((raw) => {
-          if (raw && !raw.trim().startsWith('<')) {
-            const parsed = JSON.parse(raw);
-            if (parsed?.ok && parsed.dubbed_video_url) {
-              setDubbedVideoUrl(parsed.dubbed_video_url);
-            }
-          }
-        })
-        .catch(() => {});
-    }, 900);
-    return () => window.clearTimeout(timer);
-  }, [
-    isDone,
-    lastJobId,
-    isGenerating,
-    isExportingVideo,
-    videoDuration,
-    mode,
-    translateAudio,
-    cues,
-    subtitleConfig,
-    blurEnabled,
-    blurRegions,
-    effects,
-    aspectRatio,
-    effectiveEditConfig,
-    isFreeTier
-  ]);
-
-  // Download handlers (Burns current Subtitle, Blur & Anti-Copyright edits into crisp FHD 1080p / 720p MP4 and triggers instant native download)
+  // Download handlers (Async non-blocking FFmpeg + polling so Cloudflare 100s timeout never returns .mp4.html)
   const handleDownloadVideo = async () => {
     if (isExportingVideo) return;
     playUiSound('tap');
-    const cleanBaseName = `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_${isFreeTier ? 'free' : 'pro'}_recap`;
+    setStudioErrorMsg(null);
+    const downloadFilename = sanitizeMp4DownloadName(
+      `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_${isFreeTier ? 'free' : 'pro'}_recap`,
+      isFreeTier ? 'ttak_free_recap' : 'ttak_pro_recap'
+    );
 
-    const triggerDirectVideoDownload = (url: string) => {
-      const sep = url.includes('?') ? '&' : '?';
-      const dlUrl = url.startsWith('/api/recap/video/')
-        ? `${url}${sep}name=${encodeURIComponent(`${cleanBaseName}.mp4`)}`
-        : url;
-      const a = document.createElement('a');
-      a.href = dlUrl;
-      a.download = `${cleanBaseName}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+    const verifyAndTriggerVideoDownload = async (rawUrl: string): Promise<boolean> => {
+      try {
+        const isBlobUrl = rawUrl.startsWith('blob:');
+        const sep = rawUrl.includes('?') ? '&' : '?';
+        const dlUrl =
+          !isBlobUrl && rawUrl.startsWith('/api/recap/video/')
+            ? `${rawUrl}${sep}dl=1&name=${encodeURIComponent(downloadFilename)}`
+            : rawUrl;
+
+        // Always fetch inside the active browser session & validate MP4 header bytes
+        // so Android/Mobile DownloadManager + Cloudflare can NEVER save a page as `.mp4.html`!
+        const resp = await fetch(dlUrl, { method: 'GET', cache: 'no-store' });
+        if (!isBlobUrl) {
+          const ct = resp.headers.get('content-type');
+          if (!isValidPlayableMediaResponse(resp.status, resp.ok, ct, 'video/')) {
+            return false;
+          }
+        } else if (!resp.ok) {
+          return false;
+        }
+
+        const rawBlob = await resp.blob();
+        const headBuf = new Uint8Array(await rawBlob.slice(0, 32).arrayBuffer());
+        if (!isValidMp4BufferHeader(headBuf, rawBlob.size)) {
+          return false;
+        }
+
+        const mp4Blob = new Blob([rawBlob], { type: 'video/mp4' });
+        const objectUrl = URL.createObjectURL(mp4Blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = downloadFilename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => {
+          try {
+            URL.revokeObjectURL(objectUrl);
+          } catch {}
+        }, 60000);
+        return true;
+      } catch {
+        return false;
+      }
     };
 
     setIsExportingVideo(true);
+    setExportProgressPct(10);
     try {
-      // 1. Re-burn MP4 on server (or return instant cached pre-warmed MP4) with user's latest Subtitle, Blur, and Anti-Copyright Effects
+      // 1. Re-burn MP4 asynchronously on server with polling (or return cached <5ms MP4)
       if (lastJobId) {
-        try {
-          const exportRes = await fetch('/api/recap/render-export', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jobId: lastJobId,
-              durationSec: Math.max(8, videoDuration || 15),
-              mode,
-              translateAudio,
-              cues,
-              subtitleConfig,
-              blurEnabled,
-              blurRegions,
-              mirrorFlip: effects.mirror,
-              effects,
-              aspectRatio,
-              editConfig: effectiveEditConfig,
-              isFreeMode: isFreeTier
-            })
-          });
-          const exportRaw = await exportRes.text();
-          const exportData =
-            exportRaw && !exportRaw.trim().startsWith('<') ? JSON.parse(exportRaw) : null;
-          if (exportData?.ok && exportData.dubbed_video_url) {
-            setDubbedVideoUrl(exportData.dubbed_video_url);
-            triggerDirectVideoDownload(exportData.dubbed_video_url);
-            return;
+        const exportRes = await fetch('/api/recap/render-export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            asyncMode: true,
+            jobId: lastJobId,
+            durationSec: Math.max(8, videoDuration || 15),
+            mode,
+            translateAudio,
+            cues,
+            subtitleConfig,
+            blurEnabled,
+            blurRegions,
+            mirrorFlip: effects.mirror,
+            effects,
+            aspectRatio,
+            editConfig: effectiveEditConfig,
+            isFreeMode: isFreeTier
+          })
+        });
+        const exportRaw = await exportRes.text();
+        let exportData: any = null;
+        if (exportRaw && !exportRaw.trim().startsWith('<')) {
+          try {
+            exportData = JSON.parse(exportRaw);
+          } catch {}
+        }
+
+        let resolvedExportUrl: string | null = null;
+        if (exportData?.ok && exportData.dubbed_video_url) {
+          resolvedExportUrl = exportData.dubbed_video_url;
+        } else if (exportData?.ok && exportData.pending && exportData.exportId) {
+          const exportDeadline = Date.now() + 12 * 60 * 1000;
+          const exportId = String(exportData.exportId);
+          setExportProgressPct(Number(exportData.progress) || 20);
+          while (Date.now() < exportDeadline) {
+            await new Promise((r) => setTimeout(r, 1200));
+            const stResp = await fetch(`/api/recap/render-status/${encodeURIComponent(exportId)}`, {
+              cache: 'no-store'
+            });
+            const stRaw = await stResp.text();
+            let stData: any = null;
+            if (stRaw && !stRaw.trim().startsWith('<')) {
+              try {
+                stData = JSON.parse(stRaw);
+              } catch {}
+            }
+            if (!stData) continue;
+            if (typeof stData.progress === 'number') {
+              setExportProgressPct(stData.progress);
+            }
+            if (stData.status === 'done' && stData.dubbed_video_url) {
+              resolvedExportUrl = stData.dubbed_video_url;
+              break;
+            }
+            if (stData.status === 'error' || stData.ok === false) {
+              throw new Error(stData.error || 'Export render failed');
+            }
           }
-        } catch (expErr) {
-          console.warn('Render-export fallback to initial burned video:', expErr);
+        }
+
+        if (resolvedExportUrl) {
+          setExportProgressPct(100);
+          setDubbedVideoUrl(resolvedExportUrl);
+          const valid = await verifyAndTriggerVideoDownload(resolvedExportUrl);
+          if (valid) return;
         }
       }
 
       if (dubbedBlobUrl) {
-        triggerDirectVideoDownload(dubbedBlobUrl);
+        await verifyAndTriggerVideoDownload(dubbedBlobUrl);
         return;
       }
 
       if (dubbedVideoUrl) {
-        triggerDirectVideoDownload(dubbedVideoUrl);
-        return;
+        const valid = await verifyAndTriggerVideoDownload(dubbedVideoUrl);
+        if (valid) return;
       }
 
-      if (videoFileUrl) {
-        const a = document.createElement('a');
-        a.href = videoFileUrl;
-        a.download = `${cleanBaseName}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        return;
-      }
-
-      if (audioBase64) {
-        const a = document.createElement('a');
-        a.href = `data:audio/wav;base64,${audioBase64}`;
-        a.download = `${cleanBaseName}_voiceover.wav`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }
+      throw new Error(
+        uiLang === 'my'
+          ? 'MP4 ဖိုင် Download ပြုလုပ်၍မရပါ (Server restart ဖြစ်သွားခြင်း သို့မဟုတ် Render မအောင်မြင်ခြင်း ဖြစ်နိုင်ပါသည်)။ Recap ကို ထပ်မံ Generate လုပ်ပြီး Download ပြန်ဆွဲပေးပါ။'
+          : 'Could not download a valid MP4 file. Please re-generate the recap and try exporting again.'
+      );
     } catch (dlErr) {
+      playUiSound('error');
+      setStudioErrorMsg(
+        dlErr instanceof Error
+          ? dlErr.message
+          : uiLang === 'my'
+            ? 'MP4 Export မအောင်မြင်ပါ။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'MP4 Export failed. Please try again.'
+      );
       console.error('Download failed:', dlErr);
     } finally {
       setIsExportingVideo(false);
+      setExportProgressPct(0);
     }
   };
 
@@ -1667,56 +1776,70 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     data-testid="aspect-framing-card"
                     className="flex flex-col gap-2.5 rounded-xl border border-stone-200/80 bg-[#FAF8F4] p-3 dark:border-slate-800 dark:bg-[#0D1117]"
                   >
+                    {/* Always-accessible Fit Mode ON/OFF toggle switch */}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex flex-col">
+                        <span className="text-[11px] font-semibold text-stone-700 dark:text-slate-200">
+                          {uiLang === 'my' ? 'ဘောင်အနေအထား (Fit Mode)' : 'Fit Mode'}
+                        </span>
+                        <span className="text-[10px] text-stone-400 dark:text-slate-500">
+                          {editConfig.fitMode === 'pad'
+                            ? uiLang === 'my'
+                              ? 'ON · ဗီဒီယိုအပြည့် (Blur နောက်ခံ)'
+                              : 'ON · Full Frame (Blur BG)'
+                            : uiLang === 'my'
+                              ? 'OFF · ဘောင်အပြည့် (Crop ဖြည့်)'
+                              : 'OFF · Fill Frame (Crop)'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {(editConfig.padSize !== 1.0 ||
+                          editConfig.padX !== 0 ||
+                          editConfig.padY !== 0 ||
+                          editConfig.frameZoom !== 100) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              playUiSound('tap');
+                              setEditConfig((prev) => ({
+                                ...prev,
+                                padSize: 1.0,
+                                padX: 0,
+                                padY: 0,
+                                frameZoom: 100
+                              }));
+                            }}
+                            className="cursor-pointer text-[10px] font-semibold text-amber-600 dark:text-amber-400 hover:underline"
+                          >
+                            Reset
+                          </button>
+                        )}
+                        <span
+                          className={`rounded-md px-1.5 py-0.5 font-mono text-[10px] font-bold ${
+                            editConfig.fitMode === 'pad'
+                              ? 'bg-teal-500/15 text-teal-600 dark:text-teal-400'
+                              : 'bg-stone-200/80 text-stone-500 dark:bg-slate-800 dark:text-slate-400'
+                          }`}
+                        >
+                          {editConfig.fitMode === 'pad' ? 'ON' : 'OFF'}
+                        </span>
+                        <StreamWaveSwitch
+                          testId="fit-mode-switch"
+                          ariaLabel={uiLang === 'my' ? 'ဘောင်အနေအထား (Fit Mode)' : 'Fit Mode'}
+                          checked={editConfig.fitMode === 'pad'}
+                          onCheckedChange={(checked) => {
+                            setEditConfig((prev) => ({
+                              ...prev,
+                              fitMode: checked ? 'pad' : 'crop'
+                            }));
+                          }}
+                        />
+                      </div>
+                    </div>
+
                     {aspectRatio !== 'original' && (
                       <>
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-semibold text-stone-600 dark:text-slate-300">
-                            {uiLang === 'my' ? 'ဘောင်အနေအထား (Fit Mode)' : 'Frame Fit Mode'}
-                          </span>
-                          {(editConfig.padSize !== 1.0 ||
-                            editConfig.padX !== 0 ||
-                            editConfig.padY !== 0 ||
-                            editConfig.frameZoom !== 100) && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                playUiSound('tap');
-                                setEditConfig((prev) => ({
-                                  ...prev,
-                                  padSize: 1.0,
-                                  padX: 0,
-                                  padY: 0,
-                                  frameZoom: 100
-                                }));
-                              }}
-                              className="cursor-pointer text-[10px] font-semibold text-amber-600 dark:text-amber-400 hover:underline"
-                            >
-                              Reset
-                            </button>
-                          )}
-                        </div>
-
-                      <SlidingPillToggle
-                        options={[
-                          {
-                            value: 'pad',
-                            label: uiLang === 'my' ? 'Blur နောက်ခံ' : 'Pad (Blur BG)',
-                            testId: 'fit-mode-pad'
-                          },
-                          {
-                            value: 'crop',
-                            label: uiLang === 'my' ? 'Crop ဖြည့်' : 'Crop (Fill)',
-                            testId: 'fit-mode-crop'
-                          }
-                        ]}
-                        value={editConfig.fitMode}
-                        onChange={(val) => {
-                          playUiSound('select');
-                          setEditConfig((prev) => ({ ...prev, fitMode: val }));
-                        }}
-                      />
-
-                      {editConfig.fitMode === 'pad' ? (
+                        {editConfig.fitMode === 'pad' ? (
                         <div className="flex flex-col gap-2 pt-0.5">
                           <div className="flex flex-col gap-1">
                             <div className="flex items-center justify-between text-[11px]">
@@ -2018,7 +2141,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                         fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily,
                         fontWeight: resolveBurmeseFontMeta(subtitleConfig.fontStyle).fontWeight,
                         letterSpacing: resolveBurmeseFontMeta(subtitleConfig.fontStyle).letterSpacing,
-                        fontSize: `${Math.round(0.45 * subtitleConfig.fontSize)}px`,
+                        fontSize: `${Math.max(7, Math.round(0.4 * subtitleConfig.fontSize))}px`,
                         color:
                           editConfig.captionTextColor ||
                           (subtitleConfig.style === 'box_black'
@@ -2115,7 +2238,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     </div>
                     <input
                       type="range"
-                      min={28}
+                      data-testid="subtitle-scale-slider"
+                      min={12}
                       max={68}
                       step={2}
                       value={subtitleConfig.fontSize}
@@ -2915,8 +3039,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             })}
           </div>
 
-          {/* User Live Payment Status Tracker on Home Screen */}
-          {latestPayment && !dismissedPaymentIds[latestPayment.id] && (
+          {/* User Live Payment Status Tracker on Home Screen (approved/rejected fires strictly once, never repeats after reload) */}
+          {latestPayment && shouldShowLatestPaymentBanner && (
             <div
               className={`relative overflow-hidden rounded-2xl border p-4 shadow-sm transition-all ${
                 latestPayment.status === 'pending'
@@ -3020,6 +3144,26 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             </div>
           )}
 
+          {studioErrorMsg && (
+            <div
+              data-testid="studio-error-banner"
+              className="flex items-start justify-between gap-3 rounded-2xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-xs text-red-700 dark:text-red-300 shadow-xs"
+            >
+              <div className="flex items-start gap-2.5 min-w-0">
+                <AlertTriangle className="size-4 shrink-0 text-red-500 mt-0.5" />
+                <span className="leading-relaxed font-medium break-words">{studioErrorMsg}</span>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss error"
+                onClick={() => setStudioErrorMsg(null)}
+                className="shrink-0 cursor-pointer rounded-lg p-1 text-red-500/80 hover:bg-red-500/15"
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          )}
+
           {hasLoadedVideo ? (
             <CanvasVideoEditor
               videoFileUrl={videoFileUrl}
@@ -3042,8 +3186,22 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               editConfig={effectiveEditConfig}
               cues={cues}
               targetLanguage={targetLanguage}
-              audioBase64={audioBase64}
-              hasMuxedAudio={hasMuxedAudio}
+              audioBase64={
+                mode === 'translate' && translateAudio === 'captions-only' ? undefined : audioBase64
+              }
+              voiceoverAudioUrl={
+                mode === 'translate' && translateAudio === 'captions-only'
+                  ? null
+                  : voiceoverMp3Url
+              }
+              hasMuxedAudio={
+                hasMuxedAudio ||
+                Boolean(
+                  uploadedFileRef.current &&
+                    mode === 'translate' &&
+                    translateAudio === 'captions-only'
+                )
+              }
               isOverlayEditMode={isOverlayEditMode}
               onToggleOverlayEditMode={setIsOverlayEditMode}
               onRemoveVideo={() => {
@@ -3235,8 +3393,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     <span>
                       {isExportingVideo
                         ? uiLang === 'my'
-                          ? 'Export လုပ်နေသည်…'
-                          : 'Exporting…'
+                          ? `Export လုပ်နေသည် ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
+                          : `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
                         : t.downloadBtn}
                     </span>
                   </button>
@@ -3387,8 +3545,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     <span className="truncate">
                       {isExportingVideo
                         ? uiLang === 'my'
-                          ? 'Export လုပ်နေသည်…'
-                          : 'Exporting…'
+                          ? `Export လုပ်နေသည် ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
+                          : `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
                         : t.downloadBtn}
                     </span>
                   </button>
