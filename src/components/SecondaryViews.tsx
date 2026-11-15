@@ -1116,7 +1116,7 @@ export const WalletView: React.FC<{
                 1. Free Mode (အခမဲ့ စနစ် — 0 Credits)
               </p>
               <ul className="space-y-1 text-stone-600 dark:text-slate-300">
-                <li>• တစ်ရက်လျှင် ဗီဒီယို <strong>3 ပုဒ်</strong> အခမဲ့ ထုတ်ယူနိုင်သည် (3 Videos / Day)</li>
+                <li>• တစ်ရက်လျှင် ဗီဒီယို <strong>5 ပုဒ်</strong> အခမဲ့ ထုတ်ယူနိုင်သည် (5 Videos / Day)</li>
                 <li>• ဗီဒီယို ၁ ပုဒ်လျှင် အများဆုံး <strong>2:30 မိနစ် (150 စက္ကန့်)</strong> အထိ ရသည်</li>
                 <li>• AI Voice TTS: <strong>Thiha (Male)</strong> နှင့် <strong>Nilar (Female)</strong> ၂ မျိုး သုံးနိုင်သည်</li>
                 <li>• On-device WebCodecs 720p HD Export</li>
@@ -2334,7 +2334,7 @@ export const LandingView: React.FC<{
             className="inline-flex items-center gap-2 rounded-xl bg-amber-500 hover:bg-amber-400 px-6 py-3.5 text-sm font-bold text-slate-950 transition-colors cursor-pointer"
           >
             <Sparkles className="size-4" />
-            <span>Sign in with Google (3 Free/Day)</span>
+            <span>Sign in with Google (5 Free/Day)</span>
           </button>
 
           <button
@@ -2561,7 +2561,7 @@ export const SignInModal: React.FC<{
         </div>
 
         <p className="mt-5 text-center text-[11px] text-stone-400 dark:text-slate-500">
-          Free Mode တွင် တစ်ရက် ၃ ပုဒ် အခမဲ့ အသုံးပြုနိုင်ပါသည်။
+          Free Mode တွင် တစ်ရက် ၅ ပုဒ် အခမဲ့ အသုံးပြုနိုင်ပါသည်။
         </p>
       </div>
     </div>

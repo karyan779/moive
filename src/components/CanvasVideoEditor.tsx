@@ -18,6 +18,7 @@ import {
   clampBlurRegion,
   computeAspectCanvasLayout,
   resolveBurmeseFontMeta,
+  resolveSubtitleFontMeta,
   shouldSyncCompanionAudioTime,
   DEFAULT_DEEPRECAP_EDIT_CONFIG,
   TARGET_LANGUAGES,
@@ -170,7 +171,7 @@ export function drawSubtitleOnCanvas(
 
   const scaleFactor = width / 540;
   const pxSize = Math.max(7, Math.round(config.fontSize * 0.35 * scaleFactor));
-  const fontMeta = resolveBurmeseFontMeta(config.fontStyle);
+  const fontMeta = resolveSubtitleFontMeta(config.fontStyle, config.subtitleLanguage, text);
   ctx.font = `${fontMeta.fontWeight} ${pxSize}px ${fontMeta.cssFontFamily}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -766,8 +767,9 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
 
   // Active subtitle cue at current playback time, or fallback sample
   const activeCue = findActiveCue(cues, currentTime * 1000);
+  const activeSubLang = subtitleConfig.subtitleLanguage || targetLanguage;
   const langSample =
-    TARGET_LANGUAGES.find((l) => l.code === targetLanguage)?.sampleCaption ||
+    TARGET_LANGUAGES.find((l) => l.code === activeSubLang)?.sampleCaption ||
     'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်';
   const displayedSubtitleText = isOverlayEditMode
     ? activeCue?.text || cues[0]?.text || langSample
@@ -1415,9 +1417,21 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
             >
               <span
                 style={{
-                  fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily,
-                  fontWeight: resolveBurmeseFontMeta(subtitleConfig.fontStyle).fontWeight,
-                  letterSpacing: resolveBurmeseFontMeta(subtitleConfig.fontStyle).letterSpacing,
+                  fontFamily: resolveSubtitleFontMeta(
+                    subtitleConfig.fontStyle,
+                    subtitleConfig.subtitleLanguage,
+                    displayedSubtitleText
+                  ).cssFontFamily,
+                  fontWeight: resolveSubtitleFontMeta(
+                    subtitleConfig.fontStyle,
+                    subtitleConfig.subtitleLanguage,
+                    displayedSubtitleText
+                  ).fontWeight,
+                  letterSpacing: resolveSubtitleFontMeta(
+                    subtitleConfig.fontStyle,
+                    subtitleConfig.subtitleLanguage,
+                    displayedSubtitleText
+                  ).letterSpacing,
                   fontSize: `${Math.max(7, Math.min(24, Math.round(0.32 * subtitleConfig.fontSize)))}px`,
                   lineHeight: 1.35,
                   color:

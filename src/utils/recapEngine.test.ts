@@ -114,7 +114,7 @@ test('clampBlurRegion prevents out-of-bounds watermark boxes', () => {
 });
 
 test('calculateCreditCost computes flat 1 credit per 60 seconds across all AI voices, and 0 for free recap', () => {
-  assert.equal(FREE_DAILY_VIDEO_LIMIT, 3);
+  assert.equal(FREE_DAILY_VIDEO_LIMIT, 5);
   assert.equal(FREE_MAX_DURATION_SEC, 150);
 
   assert.equal(calculateCreditCost(45, true), 0);
@@ -177,7 +177,9 @@ test('splitCuesIntoShortPhrases and buildSyncedRecapCues generate crisp 1-line n
       assert.ok(result.cues[i].start_ms >= result.cues[i - 1].end_ms);
     }
   }
-  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('SHORT 1-LINE PHRASES'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('SHORT, PUNCHY 1-LINE PHRASES'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('STRICT THIRD-PERSON RECAP NARRATION ONLY'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('ZERO REPETITION'));
 
   // Verify 70-second SaveTik wedding drama cues start with exact StreamWave 1-line phrase
   const weddingResult = buildSyncedRecapCues(
@@ -200,7 +202,7 @@ test('splitCuesIntoShortPhrases and buildSyncedRecapCues generate crisp 1-line n
   assert.ok(!maleSample.includes('TTAK'));
   assert.ok(!koreSample.includes('TTAK'));
 
-  // Verify 3-Method Audio & Video Sync (Timestamp-anchored + 80-120ms Breath Pause + Bidirectional Dynamic Tempo Fit + Max Gap Clamp)
+  // Verify 3-Method Audio & Video Sync (Timestamp-anchored + 80-120ms Breath Pause + Dynamic Tempo Fit >= 1.0x + Max Gap Clamp)
   const testCues = [
     { id: 'c1', start_ms: 100, end_ms: 1800, text: 'ပထမ စာကြောင်း' },
     { id: 'c2', start_ms: 2000, end_ms: 3800, text: 'ဒုတိယ စာကြောင်း' }
@@ -212,17 +214,18 @@ test('splitCuesIntoShortPhrases and buildSyncedRecapCues generate crisp 1-line n
   // Second cue starts at least 100ms (breathPauseMs) after first cue ends
   assert.ok(syncedSchedule[1].cue.start_ms >= syncedSchedule[0].cue.end_ms + 100);
 
-  // Verify mid-video gap clamping & gentle bidirectional tempo relaxation when cues are sparse
+  // Verify mid-video gap clamping & that sparse cues NEVER slow down below 1.0x (which makes Burmese TTS sound sluggish/heavy)
   const sparseCues = [
     { id: 's1', start_ms: 100, end_ms: 3000, text: 'အဖွင့် စာကြောင်း' },
     { id: 's2', start_ms: 7500, end_ms: 11500, text: 'အလယ် စာကြောင်း' },
     { id: 's3', start_ms: 15000, end_ms: 18000, text: 'အပိတ် စာကြောင်း' }
   ];
-  const continuousSchedule = alignCuesWithAudioSync(sparseCues, [2200, 2400, 2100], 100, true, 18000, 360);
+  const continuousSchedule = alignCuesWithAudioSync(sparseCues, [2200, 2400, 2100], 100, true, 18000, 220);
   assert.equal(continuousSchedule.length, 3);
-  assert.ok(continuousSchedule[0].tempoFactor >= 0.86 && continuousSchedule[0].tempoFactor < 1.0);
-  assert.ok(continuousSchedule[1].cue.start_ms - continuousSchedule[0].cue.end_ms <= 360);
-  assert.ok(continuousSchedule[2].cue.start_ms - continuousSchedule[1].cue.end_ms <= 360);
+  assert.equal(continuousSchedule[0].tempoFactor, 1.0);
+  assert.equal(continuousSchedule[1].tempoFactor, 1.0);
+  assert.ok(continuousSchedule[1].cue.start_ms - continuousSchedule[0].cue.end_ms <= 220);
+  assert.ok(continuousSchedule[2].cue.start_ms - continuousSchedule[1].cue.end_ms <= 220);
 
   // Verify 1-cue preview does not slow down artificially even when totalDurationMs is larger
   const previewSchedule = alignCuesWithAudioSync(
@@ -922,4 +925,126 @@ test('Translate & STT dialogue helpers preserve silent gaps, parse Whisper lines
   );
 });
 
+test('alignCuesWithAudioSync keeps 123.67s 44-cue movie recap locked to video scene timestamps without snowballing 28s early', () => {
+  const totalDurationMs = 123_670;
+  const rawCues = Array.from({ length: 44 }, (_, idx) => {
+    const startMs = Math.round((idx / 44) * 102_000); // Even if Gemini cues ended around 102s
+    return {
+      id: `cue-${idx + 1}`,
+      start_ms: startMs,
+      end_ms: startMs + 2200,
+      text: `ဇာတ်ဝင်ခန်း အမှတ် ${idx + 1} မှာ ကောင်လေးက အိတ်ကြီးကို ဆွဲတင်လိုက်ပါတယ်`
+    };
+  });
+
+  const normalized = normalizeRecapTimelineCues(rawCues, 123.67);
+  assert.equal(normalized.length, 44);
+  assert.ok(
+    normalized[normalized.length - 1].end_ms >= 120_000,
+    `Expected normalized cues to reach near 123.67s, got ${normalized[normalized.length - 1].end_ms}`
+  );
+
+  // Spoken TTS durations average ~1950ms per cue (85.8s total speech across 123.67s video)
+  const spokenDurations = normalized.map(() => 1950);
+  const synced = alignCuesWithAudioSync(normalized, spokenDurations, 100, true, totalDurationMs, 220);
+  assert.equal(synced.length, 44);
+
+  // Mid-video and late-video cues must stay locked near their scene timestamps (not pulled 15s-28s early)
+  const cue13 = synced[13].cue; // ~36.5s scene
+  assert.ok(cue13.start_ms >= 34_500 && cue13.start_ms <= 38_500, `Cue 13 drifted to ${cue13.start_ms}ms`);
+
+  const cue31 = synced[31].cue; // ~87.1s scene
+  assert.ok(cue31.start_ms >= 84_000 && cue31.start_ms <= 90_000, `Cue 31 drifted to ${cue31.start_ms}ms`);
+
+  const lastCue = synced[synced.length - 1].cue;
+  assert.ok(
+    lastCue.end_ms >= 120_500 && lastCue.end_ms <= totalDurationMs,
+    `Expected last cue to finish near 123.67s (not 95s early!), got ${lastCue.end_ms}ms`
+  );
+
+  // Verify splitCuesIntoShortPhrases splits 63-char sentence into balanced halves without 1-word orphan "သိလိုက်ပါတယ်"
+  const orphanTest = splitCuesIntoShortPhrases(
+    [
+      {
+        id: 'o-1',
+        start_ms: 15000,
+        end_ms: 17400,
+        text: 'ကောင်လေးဟာ တစ်ခုခုတော့ မှားနေပြီဆိုတာကို ချက်ချင်းပဲ သိလိုက်ပါတယ်'
+      }
+    ],
+    54
+  );
+  for (const part of orphanTest) {
+    assert.ok(part.text.length >= 18, `Expected balanced phrase >= 18 chars, got orphan: "${part.text}"`);
+  }
+});
+
+import {
+  resolveSubtitleFontMeta,
+  buildChronologicalSceneLockGuide,
+  decodeSignedTokenPayload,
+  parsePersistedAuthUser,
+  encodeAuthUserCacheHeader,
+  shouldAutoRedirectAuthenticatedRoot
+} from './recapEngine.ts';
+
+test('resolveSubtitleFontMeta selects native fonts for Burmese, Korean, English, Thai, and Chinese subtitles', () => {
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'my').assFontName, 'Padauk');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'ko').assFontName, 'Noto Sans KR');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'en', 'Subtitles here').assFontName, 'DejaVu Sans');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'th').assFontName, 'Noto Sans Thai');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'zh').assFontName, 'Unifont');
+});
+
+test('buildChronologicalSceneLockGuide and Documentary preset enforce 1:1 scene-timestamp lock across 146.89s video', () => {
+  assert.ok(SCRIPT_STYLE_PROMPTS.none.systemPrompt.includes('STRICT 1:1 SCENE-TIMESTAMP LOCK'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.none.systemPrompt.includes('KEEP SIGNATURE DOCUMENTARY TONE'));
+
+  const sampleTimedTranscript = [
+    '[00:00 - 00:18] Principal Li wakes up early in a panic',
+    '[00:25 - 00:35] Principal Li promises higher exam scores on the phone',
+    '[00:40 - 01:28] Principal Li scolds teachers at the meeting and takes photos',
+    '[01:49 - 02:10] His wife sees strange cursed words appearing on his back',
+    '[02:11 - 02:27] The doctor at the hospital finds nothing medically wrong'
+  ].join('\n');
+
+  const guide = buildChronologicalSceneLockGuide(sampleTimedTranscript, 146.89);
+  assert.ok(guide.includes('MANDATORY 1:1 SCENE-TIMESTAMP WINDOWS'));
+  assert.ok(guide.includes('[00:00 - 00:20] (start_ms: 0ms .. 20000ms)'));
+  assert.ok(guide.includes('[02:00 - 02:27] (start_ms: 120000ms .. 147000ms)'));
+  assert.ok(guide.includes('The doctor at the hospital finds nothing medically wrong'));
+});
+
+test('parsePersistedAuthUser, decodeSignedTokenPayload, and shouldAutoRedirectAuthenticatedRoot preserve login across page reloads on custom domains', () => {
+  const samplePayload = {
+    userId: 'UID-77889',
+    name: 'Aung Kyaw',
+    email: 'aungkyawbk96@gmail.com',
+    provider: 'google',
+    exp: Date.now() + 365 * 24 * 3600 * 1000
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(samplePayload), 'utf-8').toString('base64url');
+  const fakeSignedToken = `ttak1.${payloadB64}.fakesig`;
+
+  const decoded = decodeSignedTokenPayload(fakeSignedToken);
+  assert.ok(decoded);
+  assert.equal(decoded?.userId, 'UID-77889');
+  assert.equal(decoded?.email, 'aungkyawbk96@gmail.com');
+
+  // Even if localStorage cache is empty, cookie + signed token hydrates the user immediately
+  const fromCookie = parsePersistedAuthUser({
+    cachedUserJson: null,
+    storedToken: null,
+    cookieString: `theme=dark; ttak_auth_token=${encodeURIComponent(fakeSignedToken)}`
+  });
+  assert.equal(fromCookie.user?.userId, 'UID-77889');
+  assert.equal(fromCookie.token, fakeSignedToken);
+
+  const encodedHeader = encodeAuthUserCacheHeader(fromCookie.user);
+  assert.ok(encodedHeader.length > 10);
+
+  assert.equal(shouldAutoRedirectAuthenticatedRoot('/', true), true);
+  assert.equal(shouldAutoRedirectAuthenticatedRoot('/', false), false);
+  assert.equal(shouldAutoRedirectAuthenticatedRoot('/wallet', true), false);
+});
 

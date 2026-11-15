@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import https from 'https';
 import crypto from 'crypto';
 import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
@@ -38,6 +39,7 @@ import {
   computeAssSubtitleFontSize,
   buildAssRoundedBoxPath,
   resolveBurmeseFontMeta,
+  resolveSubtitleFontMeta,
   maskApiKeyString,
   parseBulkApiKeysInput,
   isApiKeyQuotaOrLimitError,
@@ -51,6 +53,7 @@ import {
   parseWorkersAiWhisperTimedResult,
   formatTimedSttSegments,
   normalizeRecapTimelineCues,
+  buildChronologicalSceneLockGuide,
   normalizeDialogueSubtitleCues,
   parseTimedSttTranscriptToCues,
   buildCinematicTranslateSystemPrompt,
@@ -350,47 +353,47 @@ interface VoiceCharacterProfile {
 }
 
 const VOICE_CHARACTER_PROFILES: Record<VoiceGender, VoiceCharacterProfile> = {
-  male: { pitch: '+0Hz', rate: '+4%' },
-  female: { pitch: '+0Hz', rate: '+4%' },
+  male: { pitch: '+0Hz', rate: '+7%' },
+  female: { pitch: '+0Hz', rate: '+7%' },
   kore: {
-    pitch: '-5Hz',
-    rate: '+2%',
-    ffmpegFilter: 'asetrate=24000*0.975,aresample=24000,atempo=1.0256,equalizer=f=220:t=q:w=1.2:g=2,equalizer=f=3200:t=q:w=1.5:g=2.5'
+    pitch: '-4Hz',
+    rate: '+7%',
+    ffmpegFilter: 'asetrate=24000*0.98,aresample=24000,atempo=1.0204,equalizer=f=220:t=q:w=1.2:g=2,equalizer=f=3200:t=q:w=1.5:g=2.5'
   },
   aoede: {
-    pitch: '+8Hz',
-    rate: '+7%',
-    ffmpegFilter: 'asetrate=24000*1.04,aresample=24000,atempo=0.9615,treble=g=2.5'
+    pitch: '+6Hz',
+    rate: '+8%',
+    ffmpegFilter: 'asetrate=24000*1.03,aresample=24000,atempo=0.9709,treble=g=2.5'
   },
   charon: {
-    pitch: '-16Hz',
-    rate: '-5%',
-    ffmpegFilter: 'asetrate=24000*0.89,aresample=24000,atempo=1.1236,bass=g=4:f=140'
+    pitch: '-12Hz',
+    rate: '+6%',
+    ffmpegFilter: 'asetrate=24000*0.92,aresample=24000,atempo=1.0870,bass=g=3.5:f=140'
   },
   leda: {
-    pitch: '+14Hz',
+    pitch: '+10Hz',
     rate: '+8%',
-    ffmpegFilter: 'asetrate=24000*1.08,aresample=24000,atempo=0.9259,equalizer=f=2800:t=q:w=1.4:g=2'
+    ffmpegFilter: 'asetrate=24000*1.05,aresample=24000,atempo=0.9524,equalizer=f=2800:t=q:w=1.4:g=2'
   },
   fenrir: {
-    pitch: '-8Hz',
-    rate: '+11%',
-    ffmpegFilter: 'asetrate=24000*0.95,aresample=24000,atempo=1.0526,equalizer=f=180:t=q:w=1.2:g=3,equalizer=f=2600:t=q:w=1.4:g=3'
+    pitch: '-6Hz',
+    rate: '+9%',
+    ffmpegFilter: 'asetrate=24000*0.96,aresample=24000,atempo=1.0417,equalizer=f=180:t=q:w=1.2:g=3,equalizer=f=2600:t=q:w=1.4:g=3'
   },
   puck: {
-    pitch: '+16Hz',
-    rate: '+12%',
-    ffmpegFilter: 'asetrate=24000*1.09,aresample=24000,atempo=0.9174,treble=g=2'
+    pitch: '+12Hz',
+    rate: '+9%',
+    ffmpegFilter: 'asetrate=24000*1.06,aresample=24000,atempo=0.9434,treble=g=2'
   },
   orus: {
-    pitch: '-11Hz',
-    rate: '-3%',
-    ffmpegFilter: 'asetrate=24000*0.92,aresample=24000,atempo=1.0870,bass=g=3:f=160'
+    pitch: '-9Hz',
+    rate: '+6%',
+    ffmpegFilter: 'asetrate=24000*0.94,aresample=24000,atempo=1.0638,bass=g=3:f=160'
   },
   zephyr: {
-    pitch: '-6Hz',
-    rate: '-4%',
-    ffmpegFilter: 'asetrate=24000*0.96,aresample=24000,atempo=1.0417,equalizer=f=320:t=q:w=1.3:g=2'
+    pitch: '-4Hz',
+    rate: '+7%',
+    ffmpegFilter: 'asetrate=24000*0.97,aresample=24000,atempo=1.0309,equalizer=f=320:t=q:w=1.3:g=2'
   }
 };
 
@@ -401,7 +404,7 @@ const VOICE_CHARACTER_PROFILES: Record<VoiceGender, VoiceCharacterProfile> = {
 async function synthesizeEdgeNeuralMp3Once(
   text: string,
   edgeVoiceName: string,
-  rateStr = '+4%',
+  rateStr = '+7%',
   pitchStr = '+0Hz'
 ): Promise<Buffer | null> {
   try {
@@ -510,7 +513,7 @@ async function synthesizeEdgeNeuralMp3Once(
 async function synthesizeEdgeNeuralMp3(
   text: string,
   edgeVoiceName: string,
-  rateStr = '+4%',
+  rateStr = '+7%',
   pitchStr = '+0Hz'
 ): Promise<Buffer | null> {
   const maxAttempts = 3;
@@ -841,8 +844,8 @@ async function synthesizeGeminiProVoiceCuesWavBuffer(
     const audio = blockAudio[i]!;
     let pcm = audio.pcm;
 
-    if (item.tempoFactor > 1.02 || item.tempoFactor < 0.94) {
-      const clampedTempo = Math.max(0.88, Math.min(1.26, item.tempoFactor));
+    if (item.tempoFactor > 1.02) {
+      const clampedTempo = Math.max(1.0, Math.min(1.26, item.tempoFactor));
       const inRaw = path.join(JOBS_TEMP_DIR, `${jobId}_gblk_in_${i}.pcm`);
       const outStretch = path.join(JOBS_TEMP_DIR, `${jobId}_gblk_out_${i}.pcm`);
       try {
@@ -1068,7 +1071,7 @@ async function synthesizeNeuralSpokenWavBuffer(
       breathPauseMs,
       dynamicTempoFit,
       totalDurationSec ? Math.round(totalDurationSec * 1000) : undefined,
-      360
+      220
     );
 
     const syncedCues: SubtitleCue[] = [];
@@ -1080,9 +1083,9 @@ async function synthesizeNeuralSpokenWavBuffer(
       const item = syncSchedule[i];
       let pcm = rawPcmSegments[i];
 
-      // Method 3 (Bidirectional Dynamic Tempo Fit): smoothly compress (>1.02x) or gently relax (<0.96x) via FFmpeg `atempo`
-      if (pcm && pcm.length > 4 && (item.tempoFactor > 1.02 || item.tempoFactor < 0.96)) {
-        const clampedTempo = Math.max(0.85, Math.min(1.26, item.tempoFactor));
+      // Method 3 (Dynamic Tempo Fit): smoothly compress (>1.02x) via FFmpeg `atempo` when a phrase exceeds its slot (never slow down <1.0x)
+      if (pcm && pcm.length > 4 && item.tempoFactor > 1.02) {
+        const clampedTempo = Math.max(1.0, Math.min(1.26, item.tempoFactor));
         const inRaw = path.join(JOBS_TEMP_DIR, `${jobId}_stretch_in_${i}.pcm`);
         const outStretch = path.join(JOBS_TEMP_DIR, `${jobId}_stretch_out_${i}.pcm`);
         try {
@@ -1468,7 +1471,11 @@ function writeAssSubtitleFile(
     samplePreviewLight: false
   };
 
-  const fontMeta = resolveBurmeseFontMeta(cfg.fontStyle);
+  const fontMeta = resolveSubtitleFontMeta(
+    cfg.fontStyle,
+    cfg.subtitleLanguage,
+    cues?.[0]?.text || ''
+  );
   const scaleFactor = vidW / 540;
   const fontSizePx = computeAssSubtitleFontSize(cfg.fontSize || 40, vidW, vidH);
   const marginSide = Math.max(24, Math.round(vidW * 0.06));
@@ -3290,6 +3297,127 @@ async function startServer() {
       .digest('hex');
   }
 
+  async function fetchGtxJsonIpv4(url: string, timeoutMs = 6000): Promise<any> {
+    try {
+      const sec = Math.max(2, Math.ceil(timeoutMs / 1000));
+      const { stdout } = await execFileAsync('curl', ['-4', '-s', '-m', String(sec), url], {
+        maxBuffer: 2 * 1024 * 1024
+      });
+      if (stdout && stdout.trim().startsWith('[')) {
+        return JSON.parse(stdout);
+      }
+    } catch {}
+    return null;
+  }
+
+  async function translateSubtitleCuesToLanguage(
+    cues: SubtitleCue[],
+    targetSubtitleLang?: TargetLanguageCode
+  ): Promise<SubtitleCue[]> {
+    if (!Array.isArray(cues) || cues.length === 0) return [];
+    const withBurmeseSaved = cues.map((c) => ({
+      ...c,
+      burmeseText: c.burmeseText || c.text
+    }));
+    const lang = targetSubtitleLang || 'my';
+    if (lang === 'my') {
+      return withBurmeseSaved.map((c) => ({
+        ...c,
+        text: c.burmeseText || c.text
+      }));
+    }
+
+    const tlMap: Record<TargetLanguageCode, string> = {
+      my: 'my',
+      en: 'en',
+      ko: 'ko',
+      th: 'th',
+      zh: 'zh-CN',
+      ja: 'ja'
+    };
+    const tl = tlMap[lang] || 'en';
+    const translatedCues: SubtitleCue[] = [...withBurmeseSaved];
+    const batchSize = 20;
+
+    for (let i = 0; i < withBurmeseSaved.length; i += batchSize) {
+      const slice = withBurmeseSaved.slice(i, i + batchSize);
+      const sourceLines = slice.map((c) =>
+        String(c.burmeseText || c.text || '')
+          .replace(/\r?\n/g, ' ')
+          .trim()
+      );
+      const joined = sourceLines.join('\n');
+      if (!joined.trim()) continue;
+
+      try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=my&tl=${encodeURIComponent(
+          tl
+        )}&dt=t&q=${encodeURIComponent(joined)}`;
+        const data = await fetchGtxJsonIpv4(url, 6500);
+        if (Array.isArray(data?.[0])) {
+          const fullTranslated = data[0].map((seg: any) => String(seg?.[0] || '')).join('');
+          const outLines = fullTranslated
+            .split(/\r?\n/)
+            .map((s: string) => s.trim())
+            .filter((s: string) => s.length > 0);
+          if (outLines.length === slice.length) {
+            for (let j = 0; j < slice.length; j++) {
+              translatedCues[i + j] = {
+                ...slice[j],
+                text: outLines[j] || slice[j].text
+              };
+            }
+            continue;
+          }
+        }
+      } catch {}
+
+      // Fallback per-cue translation if batch line count differed
+      await Promise.all(
+        slice.map(async (cueItem, j) => {
+          const src = sourceLines[j];
+          if (!src) return;
+          try {
+            const singleUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=my&tl=${encodeURIComponent(
+              tl
+            )}&dt=t&q=${encodeURIComponent(src)}`;
+            const d = await fetchGtxJsonIpv4(singleUrl, 5000);
+            if (Array.isArray(d?.[0])) {
+              const txt = d[0]
+                .map((seg: any) => String(seg?.[0] || ''))
+                .join('')
+                .replace(/\r?\n/g, ' ')
+                .trim();
+              if (txt) {
+                translatedCues[i + j] = { ...cueItem, text: txt };
+              }
+            }
+          } catch {}
+        })
+      );
+    }
+
+    return translatedCues;
+  }
+
+  // Live endpoint to switch subtitle display language (e.g. Burmese -> English / Korean / Thai / Chinese / Japanese)
+  // while keeping the spoken Voice Script in Burmese!
+  app.post('/api/recap/translate-subtitles', async (req, res) => {
+    try {
+      const { cues = [], subtitleLanguage = 'my' } = (req.body || {}) as {
+        cues?: SubtitleCue[];
+        subtitleLanguage?: TargetLanguageCode;
+      };
+      const translated = await translateSubtitleCuesToLanguage(cues, subtitleLanguage);
+      res.json({ ok: true, subtitleLanguage, cues: translated });
+    } catch (err: any) {
+      res.status(500).json({
+        ok: false,
+        error: err?.message ? String(err.message) : 'Failed to translate subtitles'
+      });
+    }
+  });
+
   // Re-burn / Export MP4 with latest user-edited Subtitle position/scale/style, Blur regions, and Anti-Copyright Effects
   // Supports non-blocking `asyncMode: true` with `/api/recap/render-status/:exportId` polling to prevent Cloudflare 100s 524 timeouts!
   app.post('/api/recap/render-export', async (req, res) => {
@@ -4039,16 +4167,26 @@ async function startServer() {
                     : 'English';
 
         const effectiveContext = effectiveTranscriptText || groqTranscript;
-        const isLongTimeline = safeDuration > 120;
-        const targetSecPerCue = safeDuration > 240 ? 4.0 : isLongTimeline ? 3.5 : 2.8;
-        const cueCount = Math.max(5, Math.min(110, Math.round(safeDuration / targetSecPerCue)));
+        const isLongTimeline = safeDuration > 110;
+        const isDocumentaryOrDrama = scriptStyle === 'none' || scriptStyle === 'drama';
+        const targetSecPerCue = isDocumentaryOrDrama
+          ? safeDuration > 240
+            ? 3.4
+            : 3.2
+          : safeDuration > 240
+            ? 3.0
+            : 2.8;
+        const cueCount = Math.max(6, Math.min(120, Math.round(safeDuration / targetSecPerCue)));
         const phraseLengthRule =
-          'Each cue.text MUST be one clear spoken phrase of 5 to 10 words (26 to 52 Burmese characters, ~2.2s–3.2s when spoken cleanly in one breath). Never cut sentences awkwardly in half or write giant multi-sentence paragraphs.';
+          'Each cue.text MUST be one complete, natural spoken phrase of 5 to 9 words (26 to 48 Burmese characters, ~2.0s–2.8s when spoken cleanly in one breath). Never cut sentences awkwardly in half or write giant multi-sentence paragraphs.';
         const q1Sec = Math.round(safeDuration * 0.25);
         const q2Sec = Math.round(safeDuration * 0.55);
         const q3Sec = Math.round(safeDuration * 0.82);
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
+          : '';
+        const chronologicalSceneLockGuide = !isTranslateMode
+          ? buildChronologicalSceneLockGuide(effectiveContext, safeDuration)
           : '';
         const textPrompt = isTranslateMode
           ? `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
@@ -4069,13 +4207,16 @@ CRITICAL DIALOGUE & TIMING RULES:
 - ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 4 to 12 words, 20 to 54 characters).' : phraseLengthRule}`
           : `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
 STT Engine: ${sttModel}.
-Mode: Movie Recap (${styleDef.labelEn}).
+Mode: Movie Recap (${styleDef.labelEn}) — STRICT THIRD-PERSON MOVIE STORYTELLER (NOT DIALOGUE TRANSLATION).
 Target Language: ${langLabel}.
 Video Title / Filename: ${title || 'Dramatic Movie Clip'}.
-${effectiveContext ? `Timestamped Source Transcript / Dialogue:\n${effectiveContext}` : 'Listen carefully to the attached audio (if present) and align each cue start_ms and end_ms with what happens in the video from start to finish.'}
+${effectiveContext ? `Timestamped Source Transcript / Scene Timeline (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] scene timestamps — convert dialogue into 3rd-person narration!):\n${effectiveContext}${chronologicalSceneLockGuide}` : 'Listen carefully to the attached audio (if present) and narrate what happens in the video in third-person movie recap style from start to finish.'}
 
-CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
-- Generate approximately ${cueCount} non-overlapping spoken cues in ${langLabel} spanning the ENTIRE video continuously from ~100ms up to ${Math.floor(safeDuration * 1000 - 120)}ms!
+CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
+- STRICT THIRD-PERSON RECAP NARRATION ONLY: You are a movie recap narrator telling the story to viewers in third person ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက"). NEVER write first-person or second-person character dialogue ("ငါ", "မင်း", "နင်", "ခဏနေပါဦး မင်း...", "ငါ သတ်ထားတာမှ မဟုတ်တာ...") as if dubbing the actors! Always convert character dialogue into reported third-person Burmese recap narration (e.g. "...လို့ ပြောလိုက်ပါတယ်", "...ဆိုပြီး အံ့ဩသွားပါတယ်", "...လို့ ပြန်ဖြေလိုက်ပါတယ်").
+- STRICT 1:1 SCENE-TIMESTAMP LOCK (NEVER FRONT-LOAD THE PLOT): A cue at start_ms: T MUST ONLY narrate the visual/audio scene happening at timestamp T in the video/transcript! NEVER finish narrating the video's plot in the first half (e.g. at 60s–80s) and NEVER pad the second half with invented reflections, resignations, apologies, or unfilmed events!
+- ZERO REPETITION: Never write two consecutive cues with the same meaning. Every cue must advance the current scene's action, discovery, or reaction at that exact timestamp.
+- Generate approximately ${cueCount} non-overlapping spoken recap cues in ${langLabel} spanning the ENTIRE video continuously from ~100ms up to ${Math.floor(safeDuration * 1000 - 120)}ms!
 - CONTINUOUS TIMELINE COVERAGE (85%–95% SPEECH): Every cue's start_ms and end_ms must align chronologically with what happens on screen at that timestamp, all the way to ${Math.round((safeDuration / 60) * 10) / 10} minutes without drifting or bunched gaps!${timelineAnchorNote}
 - All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (e.g. 2500 for 2.5s) and strictly increasing.
 - ${phraseLengthRule}`;
@@ -4230,9 +4371,13 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
               })
               .filter((c: SubtitleCue) => c.text.length > 0);
             if (rawParsedCues.length > 0) {
+              const preSplitCues = splitCuesIntoShortPhrases(
+                rawParsedCues,
+                isTranslateMode ? 54 : 64
+              );
               finalCues = isTranslateMode
-                ? normalizeDialogueSubtitleCues(rawParsedCues, safeDuration)
-                : normalizeRecapTimelineCues(rawParsedCues, safeDuration);
+                ? normalizeDialogueSubtitleCues(preSplitCues, safeDuration)
+                : normalizeRecapTimelineCues(preSplitCues, safeDuration);
               finalScriptText = finalCues.map((c) => c.text).join(' ');
               if (Array.isArray(parsed.highlight_clips) && parsed.highlight_clips.length > 0) {
                 finalHighlights = parsed.highlight_clips;
@@ -4381,8 +4526,17 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
 
     finalCues = isTranslateMode
       ? normalizeDialogueSubtitleCues(splitCuesIntoShortPhrases(finalCues, 54), safeDuration)
-      : splitCuesIntoShortPhrases(finalCues, 54);
-    finalScriptText = finalCues.map((c) => c.text).join(' ');
+      : splitCuesIntoShortPhrases(finalCues, 64);
+    finalCues = finalCues.map((c) => ({ ...c, burmeseText: c.burmeseText || c.text }));
+    finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
+
+    if (
+      subtitleConfig?.subtitleLanguage &&
+      subtitleConfig.subtitleLanguage !== targetLanguage
+    ) {
+      onProgress(84, `Translating subtitles to ${subtitleConfig.subtitleLanguage.toUpperCase()}...`);
+      finalCues = await translateSubtitleCuesToLanguage(finalCues, subtitleConfig.subtitleLanguage);
+    }
 
     let voiceoverWavPath: string | null = null;
     let audioBase64: string | undefined = undefined;
@@ -4841,7 +4995,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
   const USERS_FILE = path.join(JOBS_TEMP_DIR, 'users.json');
   const SESSIONS_FILE = path.join(JOBS_TEMP_DIR, 'user_sessions.json');
   const USER_USAGE_FILE = path.join(JOBS_TEMP_DIR, 'user_daily_usage.json');
-  const FREE_DAILY_VIDEO_LIMIT_SERVER = 3;
+  const FREE_DAILY_VIDEO_LIMIT_SERVER = 5;
 
   function getMyanmarDateKey(): string {
     try {
@@ -5828,7 +5982,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
                 `• /resetkey <#> - Key နံပါတ်တစ်ခုချင်း ပြန်ဖွင့်ရန်`,
                 `• /delkey <#> - Key ဖယ်ရှားရန်`,
                 `• /users - Sign Up Users အားလုံးနှင့် Daily Free Usage`,
-                `• /free - ယနေ့ Free Mode သုံးနေသူများ (X/3 ပုဒ်)`,
+                `• /free - ယနေ့ Free Mode သုံးနေသူများ (X/5 ပုဒ်)`,
                 `• /paid - Paid Users စာရင်း`,
                 `• /user <UID သို့မဟုတ် Gmail> - User တစ်ဦးချင်းစီ အသေးစိတ်စစ်ရန်`,
                 `• /approve <Txn ID> - ငွေလွှဲ အတည်ပြုရန်`
@@ -6901,6 +7055,52 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
     return token;
   }
 
+  function setAuthSessionCookies(res: express.Response, token: string, user: StoredUserAccount) {
+    try {
+      const maxAge = 365 * 24 * 3600;
+      const userJson = encodeURIComponent(
+        JSON.stringify({
+          userId: user.userId,
+          name: user.name,
+          email: user.email,
+          provider: user.provider,
+          photoUrl: user.photoUrl
+        })
+      );
+      res.setHeader('Set-Cookie', [
+        `ttak_auth_token=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; SameSite=Lax`,
+        `ttak_auth_user=${userJson}; Path=/; Max-Age=${maxAge}; SameSite=Lax`
+      ]);
+    } catch {}
+  }
+
+  function clearAuthSessionCookies(res: express.Response) {
+    try {
+      res.setHeader('Set-Cookie', [
+        'ttak_auth_token=; Path=/; Max-Age=0; SameSite=Lax',
+        'ttak_auth_user=; Path=/; Max-Age=0; SameSite=Lax'
+      ]);
+    } catch {}
+  }
+
+  function readCookieValueFromReq(req: express.Request, name: string): string {
+    const raw = req.headers.cookie;
+    if (!raw || typeof raw !== 'string') return '';
+    for (const part of raw.split(';')) {
+      const idx = part.indexOf('=');
+      if (idx === -1) continue;
+      const k = part.slice(0, idx).trim();
+      if (k === name) {
+        try {
+          return decodeURIComponent(part.slice(idx + 1).trim());
+        } catch {
+          return part.slice(idx + 1).trim();
+        }
+      }
+    }
+    return '';
+  }
+
   const pendingTelegramOtps = new Map<string, { code: string; chatId: string; expiresAt: number }>();
 
   // One-Click Google / Gmail Sign-In & Auto Sign-Up (via verified Firebase Auth ID Token)
@@ -6977,6 +7177,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
       }
 
       const token = createSessionForUser(user);
+      setAuthSessionCookies(res, token, user);
       res.json({
         ok: true,
         token,
@@ -7044,6 +7245,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
       notifyNewUserSignup(newUser).catch(() => {});
 
       const token = createSessionForUser(newUser);
+      setAuthSessionCookies(res, token, newUser);
       res.json({
         ok: true,
         token,
@@ -7087,6 +7289,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
       }
 
       const token = createSessionForUser(user);
+      setAuthSessionCookies(res, token, user);
       res.json({
         ok: true,
         token,
@@ -7182,6 +7385,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
       }
 
       const token = createSessionForUser(user);
+      setAuthSessionCookies(res, token, user);
       res.json({
         ok: true,
         token,
@@ -7199,16 +7403,31 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
 
   app.get('/api/auth/me', (req, res) => {
     try {
+      res.setHeader('Cache-Control', 'no-store');
       const authHeader = req.headers.authorization || '';
+      const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+      const cookieToken = readCookieValueFromReq(req, 'ttak_auth_token');
       const token = authHeader.startsWith('Bearer ')
         ? authHeader.slice(7).trim()
-        : String(req.headers['x-auth-token'] || '').trim();
-      if (!token) {
+        : String(req.headers['x-auth-token'] || queryToken || cookieToken || '').trim();
+
+      const rawUserCacheHeader = String(req.headers['x-auth-user-cache'] || '').trim();
+      const cookieUserJson = readCookieValueFromReq(req, 'ttak_auth_user');
+
+      if (!token && !rawUserCacheHeader && !cookieUserJson) {
         return res.status(401).json({ ok: false, error: 'Not authenticated' });
       }
 
+      // Check if token was explicitly revoked via Sign Out
+      if (token) {
+        const h = crypto.createHash('sha256').update(token).digest('hex');
+        if (loadRevokedTokenHashes().includes(h)) {
+          return res.status(401).json({ ok: false, error: 'Session signed out' });
+        }
+      }
+
       // 1) Fast path: verify durable HMAC-signed session token (works even after container restarts!)
-      const signedPayload = verifySignedSessionToken(token);
+      const signedPayload = token ? verifySignedSessionToken(token) : null;
       if (signedPayload) {
         const users = loadUsers();
         let user =
@@ -7232,8 +7451,10 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
             saveUserBalances(balances);
           }
         }
+        setAuthSessionCookies(res, token, user);
         return res.json({
           ok: true,
+          token,
           user: {
             userId: user.userId,
             name: user.name,
@@ -7246,27 +7467,87 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
 
       // 2) Legacy random hex session lookup
       const sessions = loadSessions();
-      const session = sessions[token];
-      if (!session || session.expiresAt < Date.now()) {
-        return res.status(401).json({ ok: false, error: 'Session expired' });
-      }
-
-      const users = loadUsers();
-      const user = users.find((u) => u.userId === session.userId);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'User not found' });
-      }
-
-      res.json({
-        ok: true,
-        user: {
-          userId: user.userId,
-          name: user.name,
-          email: user.email,
-          provider: user.provider,
-          photoUrl: user.photoUrl
+      const session = token ? sessions[token] : undefined;
+      if (session && session.expiresAt >= Date.now()) {
+        const users = loadUsers();
+        const user = users.find((u) => u.userId === session.userId);
+        if (user) {
+          const upgradedToken = createSessionForUser(user);
+          setAuthSessionCookies(res, upgradedToken, user);
+          return res.json({
+            ok: true,
+            token: upgradedToken,
+            user: {
+              userId: user.userId,
+              name: user.name,
+              email: user.email,
+              provider: user.provider,
+              photoUrl: user.photoUrl
+            }
+          });
         }
-      });
+      }
+
+      // 3) Seamless restoration from client's persisted user cache (`x-auth-user-cache` or `ttak_auth_user` cookie)
+      // when a Cloud Run instance cold-started or a legacy hex token was used before `ttak1.` tokens.
+      let cachedProfile: any = null;
+      if (rawUserCacheHeader) {
+        try {
+          cachedProfile = JSON.parse(Buffer.from(rawUserCacheHeader, 'base64').toString('utf-8'));
+        } catch {}
+      }
+      if (!cachedProfile && cookieUserJson) {
+        try {
+          cachedProfile = JSON.parse(cookieUserJson);
+        } catch {}
+      }
+      if (cachedProfile && typeof cachedProfile.userId === 'string' && typeof cachedProfile.email === 'string') {
+        const cleanUserId = cachedProfile.userId.trim();
+        const cleanEmail = cachedProfile.email.trim().toLowerCase();
+        if (cleanUserId && cleanEmail) {
+          const users = loadUsers();
+          let user =
+            users.find((u) => u.userId === cleanUserId) ||
+            users.find((u) => u.email === cleanEmail);
+          if (!user) {
+            user = {
+              userId: cleanUserId,
+              name: String(cachedProfile.name || cleanEmail.split('@')[0] || 'Creator').trim(),
+              email: cleanEmail,
+              provider:
+                cachedProfile.provider === 'google' ||
+                cachedProfile.provider === 'email' ||
+                cachedProfile.provider === 'telegram'
+                  ? cachedProfile.provider
+                  : 'google',
+              photoUrl: typeof cachedProfile.photoUrl === 'string' ? cachedProfile.photoUrl : undefined,
+              createdAt: Date.now()
+            };
+            users.push(user);
+            saveUsers(users);
+            const balances = loadUserBalances();
+            if (!balances[user.userId]) {
+              balances[user.userId] = { credits: 0, activePlanId: 'free', lastUpdated: Date.now() };
+              saveUserBalances(balances);
+            }
+          }
+          const freshToken = createSessionForUser(user);
+          setAuthSessionCookies(res, freshToken, user);
+          return res.json({
+            ok: true,
+            token: freshToken,
+            user: {
+              userId: user.userId,
+              name: user.name,
+              email: user.email,
+              provider: user.provider,
+              photoUrl: user.photoUrl
+            }
+          });
+        }
+      }
+
+      return res.status(401).json({ ok: false, error: 'Session expired' });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error) });
     }
@@ -7275,9 +7556,10 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
   app.post('/api/auth/logout', (req, res) => {
     try {
       const authHeader = req.headers.authorization || '';
+      const cookieToken = readCookieValueFromReq(req, 'ttak_auth_token');
       const token = authHeader.startsWith('Bearer ')
         ? authHeader.slice(7).trim()
-        : String(req.headers['x-auth-token'] || '').trim();
+        : String(req.headers['x-auth-token'] || cookieToken || '').trim();
       if (token) {
         revokeSessionToken(token);
         const sessions = loadSessions();
@@ -7286,6 +7568,7 @@ CRITICAL CONTINUOUS VOICEOVER & TIMESTAMP SYNC RULES:
           saveSessions(sessions);
         }
       }
+      clearAuthSessionCookies(res);
       res.json({ ok: true });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error) });

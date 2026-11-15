@@ -1,11 +1,13 @@
 import { initializeApp, getApps, getApp, type FirebaseApp } from 'firebase/app';
 import {
   getAuth,
+  initializeAuth,
   GoogleAuthProvider,
   signInWithPopup,
   signOut,
-  setPersistence,
+  indexedDBLocalPersistence,
   browserLocalPersistence,
+  onAuthStateChanged,
   type Auth,
   type User
 } from 'firebase/auth';
@@ -17,6 +19,16 @@ const envCustomAuthDomain =
     ? extractCustomDomainHostname(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN)
     : null;
 
+function createOrGetPersistentAuth(app: FirebaseApp): Auth {
+  try {
+    return initializeAuth(app, {
+      persistence: [indexedDBLocalPersistence, browserLocalPersistence]
+    });
+  } catch {
+    return getAuth(app);
+  }
+}
+
 const defaultApp: FirebaseApp = getApps().length
   ? getApps()[0]
   : initializeApp({
@@ -24,8 +36,7 @@ const defaultApp: FirebaseApp = getApps().length
       authDomain: envCustomAuthDomain || firebaseConfig.authDomain
     });
 
-export const firebaseAuth: Auth = getAuth(defaultApp);
-setPersistence(firebaseAuth, browserLocalPersistence).catch(() => {});
+export const firebaseAuth: Auth = createOrGetPersistentAuth(defaultApp);
 
 let activeFirebaseAuth: Auth = firebaseAuth;
 
@@ -47,16 +58,14 @@ function getOrCreateCustomDomainAuth(customDomain: string): Auth {
       appName
     );
   }
-  const customAuth = getAuth(customApp);
-  setPersistence(customAuth, browserLocalPersistence).catch(() => {});
-  return customAuth;
+  return createOrGetPersistentAuth(customApp);
 }
 
 /**
- * Checks with the backend whether the current custom domain (e.g. `ttakb.site`) has
+ * Checks with the backend whether the current custom domain (e.g. `ttakb.site` / `ttak.site`) has
  * `https://<domain>/__/auth/handler` registered in Google Cloud Console's Authorized redirect URIs.
  * As soon as it is registered, switches `activeFirebaseAuth` to use `authDomain: <domain>` so
- * Google Sign-In displays "to continue to ttakb.site" instead of "brilliant-turbine-fdzcr.firebaseapp.com".
+ * Google Sign-In displays "to continue to ttak.site" instead of "brilliant-turbine-fdzcr.firebaseapp.com".
  */
 export async function syncCustomAuthDomainStatus(): Promise<void> {
   if (typeof window === 'undefined') return;
@@ -92,8 +101,9 @@ export async function syncCustomAuthDomainStatus(): Promise<void> {
   }
 }
 
+let domainSyncPromise: Promise<void> | null = null;
 if (typeof window !== 'undefined') {
-  syncCustomAuthDomainStatus().catch(() => {});
+  domainSyncPromise = syncCustomAuthDomainStatus().catch(() => {});
 }
 
 export const googleProvider = new GoogleAuthProvider();
@@ -136,24 +146,67 @@ export async function signInWithGooglePopup(): Promise<GooglePopupAuthResult> {
   };
 }
 
+function getAllCandidateAuthInstances(): Auth[] {
+  const instances = new Set<Auth>([activeFirebaseAuth, firebaseAuth]);
+  if (typeof window !== 'undefined') {
+    const hostCustom = extractCustomDomainHostname(window.location.hostname);
+    if (hostCustom && hostCustom !== firebaseConfig.authDomain) {
+      try {
+        instances.add(getOrCreateCustomDomainAuth(hostCustom));
+      } catch {}
+    }
+  }
+  return Array.from(instances);
+}
+
 export async function waitForCurrentFirebaseUser(): Promise<User | null> {
   try {
-    await activeFirebaseAuth.authStateReady();
-    if (activeFirebaseAuth.currentUser) return activeFirebaseAuth.currentUser;
-    await firebaseAuth.authStateReady();
-    return firebaseAuth.currentUser;
+    if (domainSyncPromise) {
+      await Promise.race([
+        domainSyncPromise,
+        new Promise<void>((r) => setTimeout(r, 1200))
+      ]);
+    }
+    const candidates = getAllCandidateAuthInstances();
+    for (const authInst of candidates) {
+      try {
+        await authInst.authStateReady();
+        if (authInst.currentUser) {
+          return authInst.currentUser;
+        }
+      } catch {}
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
+export function subscribeFirebaseAuthState(onUser: (user: User | null) => void): () => void {
+  const candidates = getAllCandidateAuthInstances();
+  const unsubs = candidates.map((authInst) =>
+    onAuthStateChanged(
+      authInst,
+      (u) => {
+        if (u) onUser(u);
+      },
+      () => {}
+    )
+  );
+  return () => {
+    unsubs.forEach((u) => {
+      try {
+        u();
+      } catch {}
+    });
+  };
+}
+
 export async function firebaseSignOut(): Promise<void> {
-  try {
-    await signOut(activeFirebaseAuth);
-  } catch {}
-  if (activeFirebaseAuth !== firebaseAuth) {
+  const candidates = getAllCandidateAuthInstances();
+  for (const authInst of candidates) {
     try {
-      await signOut(firebaseAuth);
+      await signOut(authInst);
     } catch {}
   }
 }

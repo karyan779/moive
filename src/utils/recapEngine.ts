@@ -33,7 +33,7 @@ export type BurmeseFontStyle =
   | 'A15_Innwa'
   | 'Z06-Walone';
 
-export const FREE_DAILY_VIDEO_LIMIT = 3; // 3 free videos per day
+export const FREE_DAILY_VIDEO_LIMIT = 5; // 5 free videos per day
 export const FREE_MAX_DURATION_SEC = 150; // 2:30 minutes (150s) max per free video
 
 export interface BlurRegion {
@@ -49,6 +49,7 @@ export interface SubtitleOverlayConfig {
   enabled: boolean;
   style: SubtitleStyleMode;
   fontStyle: BurmeseFontStyle;
+  subtitleLanguage?: TargetLanguageCode;
   x: number; // 0..100 center x
   y: number; // 0..100 center y
   fontSize: number; // 16..68 (default 44 -> 100%)
@@ -152,6 +153,7 @@ export interface SubtitleCue {
   end_ms: number;
   text: string;
   originalText?: string;
+  burmeseText?: string;
 }
 
 export interface HighlightClip {
@@ -223,93 +225,106 @@ export const SCRIPT_STYLE_PROMPTS: Record<ScriptStyleId, ScriptStylePromptDefini
     labelEn: 'Fast Recap',
     labelMy: 'အမြန်ပြန်ပြောပြမယ် (Fast Recap)',
     badge: 'DEFAULT · HOOK-DRIVEN',
-    descriptionEn: 'Punchy third-person movie narrator with a strong 3-second hook and tight 1-line phrase captions.',
-    descriptionMy: 'ကြည့်ရှုသူကို ၃ စက္ကန့်အတွင်း ဆွဲဆောင်နိုင်မယ့် သွက်လက်တိကျသော ၁ ကြောင်းစာ စာတန်းထိုးနှင့် ပြောဟန်။',
-    pacingWpm: 150,
-    systemPrompt: `You are TTAK MOVIE RECAP's Senior Burmese Movie Recap Narrator ("Fast Recap / narrator" preset).
-TASK: Transform the input video's timestamped dialogue and visual/audio events into a high-retention, scene-locked movie recap script with SHORT 1-LINE PHRASES synced accurately from the opening second to the final scene.
-CRITICAL PACING, SYNC & CAPTION RULES:
-1. SHORT 1-LINE PHRASES ONLY: Every cue.text MUST be a natural spoken Burmese phrase of 5 to 10 words (26 to 52 Burmese characters, ~2.2s–3.2s when spoken). Never write long multi-sentence paragraphs inside a single cue.
-2. STRICT TIMELINE LOCK (NO DRIFT): Match cue timestamps (start_ms, end_ms) directly to the scenes and dialogue happening at that exact time in the video across the ENTIRE duration (opening hook, early setup, midpoint conflict, climax, and ending) with only 100ms–260ms natural breath pauses between cues.
-3. HOOK FIRST (0.0s - 3.5s): Open immediately with the main conflict or gripping question on screen.
-4. NATURAL SPOKEN BURMESE: Write clear, expressive spoken Burmese storytelling (using conversational connectors like "အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "နောက်ဆုံးမှာတော့") tailored for Burmese TTS voiceover. Avoid trailing "။" inside subtitle text.
-5. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+    descriptionEn: 'Natural spoken Myanmar rewrite. Enhanced context comprehension. Punchy 3rd-person movie narrator with tight 1-line phrase captions.',
+    descriptionMy: 'ကြည့်ရှုသူကို ၃ စက္ကန့်အတွင်း ဆွဲဆောင်နိုင်မယ့် သဘာဝကျကျ မြန်မာစကားပြောဟန် ၁ ကြောင်းစာ စာတန်းထိုးနှင့် အမြန်ပြန်ပြောပြမယ့်ဟန်။',
+    pacingWpm: 155,
+    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Senior Burmese Movie Recap Narrator ("Fast Recap / narrator" preset — Natural spoken Myanmar rewrite with enhanced context comprehension).
+TASK: Transform the input video's timestamped dialogue and visual/audio events into a high-retention, THIRD-PERSON Burmese Movie Recap script with SHORT 1-LINE PHRASES synced accurately from the opening second to the final scene.
+CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
+1. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT DIALOGUE TRANSLATION):
+   - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
+   - NEVER output raw first-person or second-person character dialogue ("ငါ", "မင်း", "နင်", "ခဏနေပါဦး မင်း ခုနက စကားပြောလိုက်တာလား", "ငါ သတ်ထားတာမှ မဟုတ်တာ") as if dubbing the actors!
+   - Convert every spoken line in the transcript into natural spoken Myanmar third-person recap storytelling (e.g., instead of "ခဏနေပါဦး မင်း စကားပြောလိုက်တာလား", write "မြွေက လူလို စကားထပြောလိုက်တော့ ကောင်လေးလည်း အရမ်းလန့်သွားပါတယ်"; instead of "ငါ အကြောက်ဆုံးက မင်း ငါ့ကို ကိုက်မှာပဲ", write "အလောင်းထက်စာရင် ဒီမြွေ သူ့ကိုထကိုက်မှာကိုပဲ ပိုကြောက်နေရှာပါတယ်").
+2. ZERO REPETITION / NO DUPLICATE MEANING:
+   - NEVER write two consecutive cues that repeat the same point in different words (e.g., never follow "သူက မြွေစကား နားလည်နေတယ်" with "ဒါဟာ သူက မြွေစကား နားလည်နေတာပဲ ဖြစ်မှာပါ"). Every cue must advance the plot with new action, cause-and-effect, or twist.
+3. SHORT, PUNCHY 1-LINE PHRASES:
+   - Every cue.text MUST be one crisp spoken Burmese recap phrase of 5 to 10 words (26 to 50 Burmese characters, ~2.0s–2.8s when spoken). Never write multi-sentence paragraphs in one cue.
+4. HOOK FIRST & CONTINUOUS SCENE SYNC:
+   - Open immediately (0.0s–3.0s) with a gripping hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
+5. NATURAL SPOKEN BURMESE FLOW:
+   - Use lively spoken Burmese recap connectors and endings ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "နောက်ဆုံးမှာတော့", "...လိုက်ပါတယ်", "...နေတုန်းမှာပဲ", "...သွားခဲ့ပါတယ်"). Avoid trailing "။" inside subtitle text.
+6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   drama: {
     id: 'drama',
     labelEn: 'Storytelling',
     labelMy: 'ပုံပြင်ပြောပြမယ် (Storytelling)',
-    badge: 'EMOTIONAL · CINEMATIC',
-    descriptionEn: 'Suspenseful, emotional storytelling with short phrase-synced 1-line captions.',
-    descriptionMy: 'ဇာတ်ကောင်တွေရဲ့ စိတ်ခံစားချက်နဲ့ လှည့်ကွက်တွေကို ၁ ကြောင်းစာ စာတန်းထိုးဖြင့် ပြောပြမယ့်ဟန်။',
-    pacingWpm: 140,
-    systemPrompt: `You are TTAK MOVIE RECAP's Cinematic Storytelling Recap Writer ("Storytelling / drama" preset).
-TASK: Craft an emotionally gripping, continuous movie recap script using SHORT 1-LINE PHRASES (26–52 Burmese characters per cue, 2.3s–3.3s each) synchronized tightly to every scene from start to finale.
-RULES:
-1. CONTINUOUS SCENE-LOCKED NARRATION: Keep narration flowing smoothly across the beginning, middle turning points, climax, and ending with 120ms–260ms natural pauses and zero multi-second silent gaps or timing drift.
-2. EMOTIONAL DEPTH: Highlight character motives, betrayals, tension, and plot twists in vivid spoken Burmese synced to when they occur on screen.
-3. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+    badge: 'INTENSE · CINEMATIC',
+    descriptionEn: 'Cinematic intensity, short punchy sentences (Tone: Intense & Cinematic) with natural spoken Myanmar rewrite.',
+    descriptionMy: 'ဇာတ်ကောင်တွေရဲ့ စိတ်ခံစားချက်နဲ့ လှည့်ကွက်တွေကို ရုပ်ရှင်ဆန်ဆန် ဝါကျတိုများဖြင့် ဆွဲဆောင်မှုရှိရှိ ပြောပြမယ့်ဟန်။',
+    pacingWpm: 148,
+    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Cinematic Storytelling Recap Writer ("Storytelling / drama" preset — Cinematic intensity, short punchy sentences · Tone: Intense & Cinematic).
+TASK: Craft an emotionally gripping, continuous THIRD-PERSON Burmese movie recap script using SHORT 1-LINE PHRASES (26–50 Burmese characters per cue, 2.1s–2.9s each) synchronized tightly to every scene from start to finale.
+CRITICAL RULES:
+1. STRICT THIRD-PERSON STORYTELLING ONLY (NATURAL SPOKEN MYANMAR REWRITE): Narrate the story from the outside ("သူက", "ကောင်လေးက", "သူမက"). NEVER output literal first/second-person character dialogue ("ငါ", "မင်း")—always turn character speech into emotional third-person recap narration with cinematic intensity and short punchy sentences.
+2. ZERO REPETITION: Never repeat the same idea across consecutive cues; each cue must reveal a new emotional beat, motive, or plot turn.
+3. CONTINUOUS SCENE-LOCKED NARRATION: Keep narration flowing smoothly across beginning, middle, climax, and ending with 100ms–220ms pauses.
+4. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   casual: {
     id: 'casual',
     labelEn: 'Gen Z',
     labelMy: 'လူငယ်ဆန်ဆန် (Gen Z)',
-    badge: 'VIRAL · TIKTOK / REELS',
-    descriptionEn: 'Witty, energetic Gen-Z commentary with rapid 1-line TikTok highlight captions.',
-    descriptionMy: 'TikTok နဲ့ Reels အတွက် အထူးသင့်တော်တဲ့ လူငယ်ဆန်ဆန် ၁ ကြောင်းစာ စာတန်းထိုး ပြောဟန်။',
-    pacingWpm: 158,
-    systemPrompt: `You are TTAK MOVIE RECAP's Viral Gen-Z Short-Form Creator ("Gen Z / casual" preset).
-TASK: Write a punchy, energetic, continuous movie recap script for TikTok/Reels with SHORT 1-LINE PHRASES (26–50 Burmese characters per cue, 2.0s–2.9s each).
-RULES:
-1. ZERO DEAD AIR & SCENE-SYNCED: Maintain lively commentary synchronized to every visual beat from 0ms to end with tight 100ms–220ms pauses between cues.
-2. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+    badge: 'FAST · ENGAGING',
+    descriptionEn: 'Fast & engaging viral commentary with natural spoken Myanmar rewrite and rapid 1-line TikTok highlight captions.',
+    descriptionMy: 'TikTok နဲ့ Reels အတွက် အထူးသင့်တော်တဲ့ လူငယ်ဆန်ဆန် သွက်လက်တက်ကြွသော ၁ ကြောင်းစာ စာတန်းထိုး ပြောဟန်။',
+    pacingWpm: 160,
+    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Viral Gen-Z Short-Form Recap Creator ("Gen Z / casual" preset — Tone: Fast & Engaging · Natural spoken Myanmar rewrite).
+TASK: Write a punchy, energetic THIRD-PERSON Burmese movie recap script for TikTok/Reels with SHORT 1-LINE PHRASES (26–48 Burmese characters per cue, 1.9s–2.7s each).
+CRITICAL RULES:
+1. THIRD-PERSON VIRAL COMMENTARY ONLY: Narrate what the characters are doing in lively third-person Burmese recap style ("ဘဲကြီးက", "သူက", "ဒီကောင်လေးက"). NEVER translate raw first-person dialogue ("ငါ", "မင်း") directly!
+2. ZERO REPETITION & ZERO DEAD AIR: Never repeat the same point twice; keep commentary moving briskly with 100ms–200ms pauses from 0ms to the end.
+3. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   news: {
     id: 'news',
     labelEn: 'News',
     labelMy: 'သတင်းကြေညာသူ (News)',
-    badge: 'AUTHORITATIVE · CLEAR',
-    descriptionEn: 'Crisp, objective broadcast anchor delivery with short 1-line synced captions.',
-    descriptionMy: 'သတင်းကြေညာသူတစ်ဦးလို တိကျရှင်းလင်းသော ၁ ကြောင်းစာ စာတန်းထိုး တင်ဆက်ဟန်။',
-    pacingWpm: 145,
-    systemPrompt: `You are TTAK MOVIE RECAP's Broadcast News & Fact Recap Anchor ("News / news" preset).
-TASK: Summarize the video's events in a clear, continuous broadcast narration with SHORT 1-LINE PHRASES (28–52 Burmese characters per cue, 2.2s–3.1s each) synced accurately to the timeline from start to finish with 120ms–250ms pauses.
+    badge: 'MEASURED · FACTS-FIRST',
+    descriptionEn: 'Authoritative, facts-first storytelling (Tone: Measured & Surprising) with crisp 1-line synced captions.',
+    descriptionMy: 'သတင်းကြေညာသူတစ်ဦးလို အချက်အလက်ဦးစားပေးပြီး တိကျရှင်းလင်းသော ၁ ကြောင်းစာ စာတန်းထိုး တင်ဆက်ဟန်။',
+    pacingWpm: 150,
+    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Broadcast News & Fact Recap Anchor ("News / news" preset — Authoritative, facts-first storytelling · Tone: Measured & Surprising).
+TASK: Summarize the video's events in a crisp, objective THIRD-PERSON broadcast narration with SHORT 1-LINE PHRASES (28–50 Burmese characters per cue, 2.1s–2.9s each) synced accurately from start to finish. Never output first-person dialogue ("ငါ", "မင်း") or repeat the same fact across consecutive cues.
 OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   none: {
     id: 'none',
     labelEn: 'Documentary',
     labelMy: 'မှတ်တမ်းရုပ်ရှင် (Documentary)',
-    badge: 'DEEP · OBSERVATIONAL',
-    descriptionEn: 'Calm, insightful documentary narration with short 1-line phrase captions.',
-    descriptionMy: 'မှတ်တမ်းရုပ်ရှင်တစ်ခုလို လေးနက်တည်ငြိမ်သော ၁ ကြောင်းစာ စာတန်းထိုး ရှင်းပြဟန်။',
-    pacingWpm: 135,
-    systemPrompt: `You are TTAK MOVIE RECAP's Documentary Narrator ("Documentary / none" preset).
-TASK: Write an insightful, continuous documentary narration with SHORT 1-LINE PHRASES (28–52 Burmese characters per cue, 2.3s–3.2s each) locked to every scene from start to finish without multi-second silent gaps.
-OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+    badge: 'REFLECTIVE · DEEP',
+    descriptionEn: 'Journalistic, context → story → insight (Tone: Reflective & Deep) with 1:1 scene-synced 1-line captions.',
+    descriptionMy: 'မှတ်တမ်းရုပ်ရှင်တစ်ခုလို အကြောင်းအရာ၊ ဇာတ်လမ်းနှင့် သုံးသပ်ချက်များကို လေးနက်တည်ငြိမ်စွာ ၁ ကြောင်းစာ စာတန်းထိုးဖြင့် ရှင်းပြဟန်။',
+    pacingWpm: 145,
+    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Documentary Narrator ("Documentary / none" preset — Journalistic, context → story → insight · Tone: Reflective & Deep).
+TASK: Write an insightful, continuous THIRD-PERSON documentary recap with SHORT 1-LINE PHRASES (28–50 Burmese characters per cue, 2.2s–3.1s each) locked 1-to-1 to the exact video scene timestamps from start to finish.
+CRITICAL DOCUMENTARY SYNC RULES:
+1. KEEP SIGNATURE DOCUMENTARY TONE (CONTEXT → STORY → INSIGHT): Use calm, journalistic, observational third-person Burmese documentary sentences ("...ဖြစ်ပါတယ်", "...တွေ့ရပါတယ်", "...လုပ်ဆောင်ပါတယ်"). Never output literal first-person character dialogue ("ငါ", "မင်း") or repeat consecutive sentences.
+2. STRICT 1:1 SCENE-TIMESTAMP LOCK (NEVER FRONT-LOAD THE PLOT): A cue at start_ms: T MUST ONLY narrate the visual/audio scene occurring at timestamp T in the video/transcript! NEVER finish narrating the video's plot in the first half and NEVER pad the second half with invented reflections, resignations, or unfilmed events.
+3. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   }
 };
 
 export const LONG_FORM_STYLE_PROMPTS: Record<LongFormStyleId, { label: string; prompt: string }> = {
   educational: {
-    label: 'Educational',
-    prompt: 'Break down the movie plot and underlying themes with clear cause-and-effect explanations, character psychology insights, and structured chapter transitions.'
+    label: 'Educational (Measured & Surprising)',
+    prompt: 'Authoritative, facts-first storytelling (Tone: Measured & Surprising). Break down the movie plot and underlying themes with clear cause-and-effect explanations, character psychology insights, and structured chapter transitions.'
   },
   dramatic: {
-    label: 'Dramatic',
-    prompt: 'Maximize suspense, cliffhangers, and emotional stakes across every act of the film while syncing narration tightly to key visual turning points.'
+    label: 'Dramatic (Intense & Cinematic)',
+    prompt: 'Cinematic intensity, short punchy sentences (Tone: Intense & Cinematic). Maximize suspense, cliffhangers, and emotional stakes across every act of the film while syncing narration tightly to key visual turning points.'
   },
   listicle: {
-    label: 'Listicle',
-    prompt: 'Structure the movie recap into numbered high-impact moments and hidden details that viewers missed.'
+    label: 'Listicle (Fast & Engaging)',
+    prompt: 'Countdown format, numbered key highlights (Tone: Fast & Engaging). Structure the movie recap into numbered high-impact moments and hidden details that viewers missed.'
   },
   documentary: {
-    label: 'Documentary',
-    prompt: 'Deliver an investigative, archival-style narration analyzing the film world, timeline, and character decisions.'
+    label: 'Documentary (Reflective & Deep)',
+    prompt: 'Journalistic, context → story → insight (Tone: Reflective & Deep). Deliver an investigative, archival-style narration analyzing the film world, timeline, and character decisions.'
   },
   morris: {
-    label: 'Morris (Signature Burmese Movie Recap)',
-    prompt: 'Use the classic high-retention Burmese Movie Recap storytelling cadence: iconic character nicknames, brisk scene-by-scene narration, suspenseful transitions, and a memorable moral takeaway at the finale.'
+    label: 'Morris (Intimate & Clinical · Signature Burmese Movie Recap)',
+    prompt: 'Empirical, pharmacological precision tone (Tone: Intimate & Clinical) blended with classic high-retention Burmese Movie Recap storytelling cadence: iconic character nicknames, brisk scene-by-scene narration, suspenseful transitions, and a memorable takeaway at the finale.'
   }
 };
 
@@ -528,9 +543,9 @@ export const DEFAULT_API_ENGINE_CONFIG: ApiEngineSettingsConfig = {
 export const SCRIPT_AI_MODELS: { id: ScriptAiModelId; label: string; badge: string; desc: string }[] = [
   {
     id: 'gemini-3-flash-preview',
-    label: 'Gemini 3 Flash Preview (Default · Fast Recap & Short Cues)',
+    label: 'Gemini 3.1 Flash Lite / 3 Flash (Default · Natural Spoken Myanmar Rewrite)',
     badge: 'DEFAULT · FAST',
-    desc: 'Low-latency Burmese movie recap script & short 1-line subtitle phrase generator'
+    desc: 'Natural spoken Myanmar rewrite. Enhanced context comprehension. Default.'
   },
   {
     id: 'gemini-3.1-pro-preview',
@@ -540,9 +555,9 @@ export const SCRIPT_AI_MODELS: { id: ScriptAiModelId; label: string; badge: stri
   },
   {
     id: 'gemini-2.5-flash',
-    label: 'Gemini 2.5 Flash (Balanced Translation & Dubbing)',
+    label: 'Gemini 2.5 Flash (Flagship Translation & Creative Nuance)',
     badge: 'BALANCED',
-    desc: 'Stable multimodal scene translation and timestamp alignment'
+    desc: 'Flagship translation model for creative nuance and timestamp alignment.'
   }
 ];
 
@@ -564,9 +579,9 @@ export const TTS_ENGINE_OPTIONS: { id: TtsEngineId; label: string; badge: string
 export const STT_ENGINE_OPTIONS: { id: SttEngineId; label: string; badge: string; desc: string }[] = [
   {
     id: 'whisper-large-v3-turbo',
-    label: 'Whisper Large-v3-Turbo (Default · High-Speed Timestamp STT)',
+    label: 'Whisper Large V3 Turbo (Default · Ultra-Fast Groq STT)',
     badge: 'DEFAULT · TURBO',
-    desc: 'Extracts exact start_ms & end_ms speech timestamps at 16kHz'
+    desc: 'Ultra-fast acoustic recognition via Groq. Best noise penetration.'
   },
   {
     id: 'whisper-large-v3',
@@ -576,9 +591,9 @@ export const STT_ENGINE_OPTIONS: { id: SttEngineId; label: string; badge: string
   },
   {
     id: 'gemini-audio-stt',
-    label: 'Gemini Multimodal Audio-to-Script (Direct Scene Understanding)',
+    label: 'Gemini 3.1 Flash Lite Multimodal Audio-to-Script',
     badge: 'MULTIMODAL',
-    desc: 'Direct audio stream understanding with scene emotion detection'
+    desc: 'Next-gen Flash Lite model. Best accuracy, high speed. Direct scene emotion detection.'
   }
 ];
 
@@ -777,36 +792,82 @@ export function alignCuesWithAudioSync(
 ): SyncedCueScheduleItem[] {
   const safePause = Math.max(80, Math.min(120, Math.round(breathPauseMs || 100)));
   const isLongTimeline = Boolean(totalDurationMs && totalDurationMs > 120_000);
-  const totalRawSpokenMs = cues.reduce(
-    (sum, c, idx) =>
-      sum + Math.max(320, Math.round(spokenDurationsMs[idx] || c.end_ms - c.start_ms || 1500)),
-    0
-  );
-  const dynamicNeededGap =
-    isLongTimeline &&
+  const safeMaxGap = Math.max(safePause, Math.min(480, Math.round(maxGapMs || 240)));
+  const hasFullTimelineAnchors = Boolean(cues.length >= 4 && totalDurationMs && totalDurationMs > 4000);
+
+  // If multi-cue narration covers a known video duration, ensure scene timestamps span the full timeline
+  const rawMaxCueEnd = cues.length > 0 ? Math.max(...cues.map((c) => Math.max(c.end_ms || 0, c.start_ms || 0))) : 0;
+  const sceneScale =
+    hasFullTimelineAnchors &&
     totalDurationMs &&
-    cues.length > 1 &&
-    totalDurationMs > totalRawSpokenMs
-      ? Math.round(((totalDurationMs - totalRawSpokenMs) / cues.length) * 1.15)
-      : 0;
-  // On 3+ min timelines, cap gap inflation so we never inject 4s-8s dead-air holes or push cues off their scene
-  const cappedDynamicGap = isLongTimeline ? Math.min(680, dynamicNeededGap) : dynamicNeededGap;
-  const safeMaxGap = Math.max(safePause, Math.round(maxGapMs || 360), cappedDynamicGap);
+    rawMaxCueEnd > 0 &&
+    (rawMaxCueEnd < totalDurationMs * 0.94 || rawMaxCueEnd > totalDurationMs * 1.04)
+      ? (totalDurationMs - 140) / rawMaxCueEnd
+      : 1;
+
+  const normalizedStarts = cues.map((c, idx) =>
+    idx === 0
+      ? Math.max(60, Math.min(240, Math.round((c.start_ms || 60) * sceneScale)))
+      : Math.max(60, Math.round((c.start_ms || 0) * sceneScale))
+  );
+  const normalizedEnds = cues.map((c, idx) =>
+    Math.max(normalizedStarts[idx] + 400, Math.round((c.end_ms || c.start_ms + 1500) * sceneScale))
+  );
+
   const schedule: SyncedCueScheduleItem[] = [];
   let audioCursorMs = 60;
 
   for (let i = 0; i < cues.length; i++) {
     const cue = cues[i];
-    const rawSpokenMs = Math.max(320, Math.round(spokenDurationsMs[i] || cue.end_ms - cue.start_ms || 1500));
+    const targetSceneStartMs = normalizedStarts[i];
+    const targetSceneEndMs = normalizedEnds[i];
+    const rawSpokenMs = Math.max(
+      320,
+      Math.round(spokenDurationsMs[i] || targetSceneEndMs - targetSceneStartMs || 1500)
+    );
 
-    // Method 1: Anchor to scene timestamp, while clamping any excessively long dead-air pause to <= safeMaxGap
-    let alignedStartMs = cues.length === 1 ? 60 : Math.max(audioCursorMs, cue.start_ms);
+    // Method 1: Anchor to the scene's actual video timestamp so voice & video stay locked in sync
+    let alignedStartMs = cues.length === 1 ? 60 : Math.max(audioCursorMs, targetSceneStartMs);
+
     if (cues.length > 1 && i > 0) {
       const prevEndMs = audioCursorMs - safePause;
-      if (alignedStartMs - prevEndMs > safeMaxGap) {
+      if (hasFullTimelineAnchors && totalDurationMs) {
+        // Compute remaining spoken time vs. remaining video timeline so we never snowball early drift
+        let remainingSpokenMs = 0;
+        for (let k = i; k < cues.length; k++) {
+          remainingSpokenMs += Math.max(
+            320,
+            Math.round(spokenDurationsMs[k] || normalizedEnds[k] - normalizedStarts[k] || 1500)
+          );
+        }
+        const remainingGaps = Math.max(1, cues.length - i);
+        const minRemainingPausesMs = Math.max(0, remainingGaps - 1) * safePause;
+        // Only pull a scene cue earlier than targetSceneStartMs if starting at targetSceneStartMs
+        // would cause remaining speech to overflow totalDurationMs, or if the gap exceeds 2600ms.
+        const latestSafeSceneStartMs = Math.max(
+          audioCursorMs,
+          totalDurationMs - 100 - Math.round(remainingSpokenMs / 1.16) - minRemainingPausesMs
+        );
+        if (alignedStartMs > latestSafeSceneStartMs) {
+          alignedStartMs = latestSafeSceneStartMs;
+        }
+        const remainingTimelineMs = Math.max(0, totalDurationMs - 120 - prevEndMs);
+        const neededAvgGapMs = Math.max(
+          safePause,
+          Math.round((remainingTimelineMs - remainingSpokenMs) / remainingGaps)
+        );
+        const allowedSceneGapMs = Math.max(
+          safeMaxGap,
+          Math.min(2600, Math.max(1400, Math.round(neededAvgGapMs * 2.1)))
+        );
+        if (alignedStartMs - prevEndMs > allowedSceneGapMs) {
+          alignedStartMs = prevEndMs + allowedSceneGapMs;
+        }
+      } else if (alignedStartMs - prevEndMs > safeMaxGap) {
         alignedStartMs = prevEndMs + safeMaxGap;
       }
     }
+
     if (totalDurationMs && totalDurationMs > 1200) {
       const minReserveMs = Math.max(350, (cues.length - 1 - i) * 380);
       const maxAllowedStartMs = Math.max(60, totalDurationMs - 100 - minReserveMs);
@@ -818,10 +879,10 @@ export function alignCuesWithAudioSync(
     // Method 3: Compute available scene slot before next cue or video end (preventing domino drift past totalDurationMs)
     const hasNext = i + 1 < cues.length;
     const rawNextTargetMs = hasNext
-      ? cues[i + 1].start_ms
+      ? normalizedStarts[i + 1]
       : totalDurationMs && totalDurationMs > alignedStartMs + 500
         ? totalDurationMs - 100
-        : Math.max(alignedStartMs + rawSpokenMs, cue.end_ms);
+        : Math.max(alignedStartMs + rawSpokenMs, targetSceneEndMs);
 
     const nextSceneBoundaryMs = hasNext
       ? Math.max(alignedStartMs + 480, rawNextTargetMs - safePause)
@@ -841,20 +902,11 @@ export function alignCuesWithAudioSync(
     let tempoFactor = 1.0;
     let effectiveSpokenMs = rawSpokenMs;
 
-    if (dynamicTempoFit) {
-      if (rawSpokenMs > availableSlotMs) {
-        tempoFactor = Number(Math.min(1.24, Math.max(1.0, rawSpokenMs / availableSlotMs)).toFixed(3));
-        effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
-      } else if (cues.length > 1 && totalDurationMs && availableSlotMs - rawSpokenMs > safeMaxGap) {
-        // Gently relax cadence so the narrator fills the scene window smoothly instead of leaving dead air
-        const minRelax = isLongTimeline ? 0.90 : 0.86;
-        const targetFillMs = Math.max(rawSpokenMs, availableSlotMs - Math.min(safeMaxGap, 240));
-        const relaxedFactor = Math.max(minRelax, Math.min(1.0, rawSpokenMs / targetFillMs));
-        if (relaxedFactor < 0.97) {
-          tempoFactor = Number(relaxedFactor.toFixed(3));
-          effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
-        }
-      }
+    // NEVER slow down speech below 1.0x (which makes Burmese TTS sound sluggish/heavy);
+    // only compress (> 1.0x up to 1.24x) when spoken audio exceeds the scene slot.
+    if (dynamicTempoFit && rawSpokenMs > availableSlotMs) {
+      tempoFactor = Number(Math.min(1.24, Math.max(1.0, rawSpokenMs / availableSlotMs)).toFixed(3));
+      effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
     }
 
     const alignedEndMs = alignedStartMs + effectiveSpokenMs;
@@ -875,6 +927,63 @@ export function alignCuesWithAudioSync(
   }
 
   return schedule;
+}
+
+/**
+ * Builds an explicit chronological scene-window map from `[MM:SS - MM:SS]` Whisper STT lines
+ * so Gemini locks every cue's `start_ms` and `end_ms` directly to the real events occurring
+ * in that exact time slice of the video (never front-loading the plot or inventing filler).
+ */
+export function buildChronologicalSceneLockGuide(
+  timedTranscript: string | undefined | null,
+  totalDurationSec: number
+): string {
+  const safeDur = Math.max(10, Math.round(Number(totalDurationSec) || 60));
+  if (!timedTranscript || typeof timedTranscript !== 'string' || !timedTranscript.trim()) {
+    return '';
+  }
+  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+  const toSec = (a: string, b: string, c?: string) =>
+    c !== undefined ? Number(a) * 3600 + Number(b) * 60 + Number(c) : Number(a) * 60 + Number(b);
+
+  const parsedLines: Array<{ startSec: number; endSec: number; text: string }> = [];
+  for (const rawLine of timedTranscript.split(/\r?\n/)) {
+    const m = rawLine.trim().match(lineRegex);
+    if (!m) continue;
+    const startSec = toSec(m[1], m[2], m[3]);
+    const endSec = Math.max(startSec + 1, toSec(m[4], m[5], m[6]));
+    const text = m[7].trim();
+    if (text) parsedLines.push({ startSec, endSec, text });
+  }
+  if (parsedLines.length === 0) return '';
+
+  const windowSec = safeDur > 180 ? 25 : safeDur > 90 ? 20 : 12;
+  const windowCount = Math.max(2, Math.ceil(safeDur / windowSec));
+  const windows: string[] = [];
+
+  for (let w = 0; w < windowCount; w++) {
+    const wStartSec = w * windowSec;
+    if (wStartSec >= safeDur) break;
+    const rawNextEnd = Math.min(safeDur, (w + 1) * windowSec);
+    const isLastMerged = w === windowCount - 1 || safeDur - rawNextEnd < 10;
+    const wEndSec = isLastMerged ? safeDur : rawNextEnd;
+    const matching = parsedLines.filter(
+      (l) => l.startSec < wEndSec && l.endSec > wStartSec
+    );
+    const snippet =
+      matching.length > 0
+        ? matching
+            .map((l) => l.text)
+            .join(' / ')
+            .slice(0, 260)
+        : '(Visual transition / continuing action from this scene)';
+    windows.push(
+      `  • [${formatSecBadge(wStartSec)} - ${formatSecBadge(wEndSec)}] (start_ms: ${wStartSec * 1000}ms .. ${wEndSec * 1000}ms) => ONLY narrate this window's scene: ${snippet}`
+    );
+    if (isLastMerged) break;
+  }
+
+  return `\nMANDATORY 1:1 SCENE-TIMESTAMP WINDOWS (LOCK EVERY CUE TO ITS EXACT WINDOW — NEVER NARRATE LATER WINDOWS EARLY!):\n${windows.join('\n')}`;
 }
 
 /**
@@ -901,7 +1010,7 @@ export function normalizeRecapTimelineCues(
 
   const maxCueEnd = Math.max(...clean.map((c) => c.end_ms));
   const needsRescale =
-    clean.length >= 4 && (maxCueEnd > totalMs * 1.12 || maxCueEnd < totalMs * 0.65);
+    clean.length >= 4 && (maxCueEnd > totalMs * 1.03 || maxCueEnd < totalMs * 0.94);
 
   const scale = needsRescale && maxCueEnd > 0 ? (totalMs - 140) / maxCueEnd : 1;
   let cursorMs = 80;
@@ -1170,7 +1279,7 @@ export const UI_TRANSLATIONS: Record<'my' | 'en', Record<string, string>> = {
     scaleLabel: 'Scale',
     effectsLabel: 'Effects',
     searchByTitle: 'Search by title',
-    freeLeftToday: 'အခမဲ့ 3 / 3 ခု',
+    freeLeftToday: 'အခမဲ့ 5 / 5 ခု',
     editOnVideo: 'Edit',
     doneEditing: 'Done',
     addBlur: 'Add blur',
@@ -1217,7 +1326,7 @@ export const UI_TRANSLATIONS: Record<'my' | 'en', Record<string, string>> = {
     scaleLabel: 'Scale',
     effectsLabel: 'Effects',
     searchByTitle: 'Search by title',
-    freeLeftToday: 'Free 3 / 3 left',
+    freeLeftToday: 'Free 5 / 5 left',
     editOnVideo: 'Edit',
     doneEditing: 'Done',
     addBlur: 'Add blur',
@@ -1489,12 +1598,15 @@ export function splitCuesIntoShortPhrases(
       .map((s) => s.trim())
       .filter(Boolean);
 
+    const targetChunks = Math.max(2, Math.ceil(cleaned.length / maxCharsPerCue));
+    const balancedMax = Math.min(maxCharsPerCue, Math.ceil(cleaned.length / targetChunks) + 8);
+
     const phrases: string[] = [];
     let current = '';
 
     for (const tok of tokens) {
       const candidate = current ? `${current} ${tok}` : tok;
-      if (candidate.length > maxCharsPerCue && current.length >= 10) {
+      if (candidate.length > balancedMax && current.length >= 12) {
         phrases.push(current.replace(/^[၊,\s]+|[၊,\s]+$/g, ''));
         current = tok;
       } else {
@@ -1503,6 +1615,26 @@ export function splitCuesIntoShortPhrases(
     }
     if (current.trim()) {
       phrases.push(current.replace(/^[၊,\s]+|[၊,\s]+$/g, ''));
+    }
+
+    // Rebalance if the final phrase is a tiny 1-word orphan (e.g. "သိလိုက်ပါတယ်", "ရပါတယ်")
+    if (phrases.length >= 2 && phrases[phrases.length - 1].length < 18) {
+      const prevIdx = phrases.length - 2;
+      const combined = `${phrases[prevIdx]} ${phrases[phrases.length - 1]}`.trim();
+      if (combined.length <= maxCharsPerCue + 4) {
+        phrases[prevIdx] = combined;
+        phrases.pop();
+      } else {
+        const prevWords = phrases[prevIdx].split(/\s+/);
+        if (prevWords.length >= 3) {
+          const movedWord = prevWords.pop()!;
+          const nextLast = `${movedWord} ${phrases[phrases.length - 1]}`.trim();
+          if (nextLast.length <= maxCharsPerCue) {
+            phrases[prevIdx] = prevWords.join(' ');
+            phrases[phrases.length - 1] = nextLast;
+          }
+        }
+      }
     }
 
     // If a single continuous token without spaces was still longer than maxCharsPerCue, slice safely at Burmese syllable boundaries
@@ -2663,6 +2795,66 @@ export function resolveBurmeseFontMeta(fontStyle?: BurmeseFontStyle | string): B
   return found || BURMESE_FONT_STYLES[0];
 }
 
+export function resolveSubtitleFontMeta(
+  fontStyle?: BurmeseFontStyle | string,
+  subtitleLang?: TargetLanguageCode,
+  sampleText?: string
+): BurmeseFontStyleMeta {
+  const base = resolveBurmeseFontMeta(fontStyle);
+  const text = sampleText || '';
+  const lang = subtitleLang || 'my';
+
+  if (lang === 'ko' || /[\uAC00-\uD7AF\u1100-\u11FF]/.test(text)) {
+    return {
+      ...base,
+      cssFontFamily: '"Noto Sans KR", "Inter", sans-serif',
+      assFontName: 'Noto Sans KR',
+      pangoFontDesc: 'Noto Sans KR Bold',
+      pangoAssScale: 0.72,
+      assBold: -1,
+      fontWeight: 700,
+      letterSpacing: '0em'
+    };
+  }
+  if (lang === 'th' || /[\u0E00-\u0E7F]/.test(text)) {
+    return {
+      ...base,
+      cssFontFamily: '"Noto Sans Thai", "Noto Looped Thai", sans-serif',
+      assFontName: 'Noto Sans Thai',
+      pangoFontDesc: 'Noto Sans Thai Bold',
+      pangoAssScale: 0.72,
+      assBold: -1,
+      fontWeight: 700,
+      letterSpacing: '0em'
+    };
+  }
+  if (lang === 'zh' || lang === 'ja' || /[\u4E00-\u9FFF\u3040-\u30FF]/.test(text)) {
+    return {
+      ...base,
+      cssFontFamily: '"Noto Sans SC", "Noto Sans JP", "Unifont", sans-serif',
+      assFontName: 'Unifont',
+      pangoFontDesc: 'Unifont',
+      pangoAssScale: 0.72,
+      assBold: -1,
+      fontWeight: 700,
+      letterSpacing: '0em'
+    };
+  }
+  if (lang === 'en' && !/[\u1000-\u109F]/.test(text)) {
+    return {
+      ...base,
+      cssFontFamily: '"Inter", "DejaVu Sans", sans-serif',
+      assFontName: 'DejaVu Sans',
+      pangoFontDesc: 'DejaVu Sans Bold',
+      pangoAssScale: 0.72,
+      assBold: -1,
+      fontWeight: 700,
+      letterSpacing: '0em'
+    };
+  }
+  return base;
+}
+
 /* ============================================================================
  * ADMIN OWNER MULTI-API KEY POOL & AUTO-FAILOVER / ROTATION ENGINE
  * Supports 5-6+ Gemini API keys & 5-6+ Groq API keys managed by Admin Owner.
@@ -3568,4 +3760,170 @@ export function isGoogleRedirectUriAuthorizedHtml(
   }
   return true;
 }
+
+export interface PersistedAuthUser {
+  userId: string;
+  name: string;
+  email: string;
+  provider?: 'google' | 'email' | 'telegram';
+  photoUrl?: string;
+}
+
+function decodeBase64UrlUtf8(input: string): string {
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + '='.repeat(padLen);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(padded, 'base64').toString('utf-8');
+  }
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * Decodes the user profile embedded inside a `ttak1.<payloadB64>.<sigB64>` session token
+ * so the client can hydrate the signed-in user synchronously even if localStorage cache was cleared.
+ */
+export function decodeSignedTokenPayload(token: string | null | undefined): PersistedAuthUser | null {
+  if (!token || typeof token !== 'string') return null;
+  const clean = token.trim();
+  if (!clean.startsWith('ttak1.')) return null;
+  const parts = clean.split('.');
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const json = decodeBase64UrlUtf8(parts[1]);
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.exp && Number(parsed.exp) < Date.now()) return null;
+    const userId = typeof parsed.userId === 'string' ? parsed.userId.trim() : '';
+    const email = typeof parsed.email === 'string' ? parsed.email.trim() : '';
+    if (!userId || !email) return null;
+    return {
+      userId,
+      name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : email.split('@')[0],
+      email,
+      provider:
+        parsed.provider === 'google' || parsed.provider === 'email' || parsed.provider === 'telegram'
+          ? parsed.provider
+          : 'google',
+      photoUrl: typeof parsed.photoUrl === 'string' && parsed.photoUrl.trim() ? parsed.photoUrl.trim() : undefined
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function extractCookieValue(cookieHeaderOrDoc: string | null | undefined, key: string): string | null {
+  if (!cookieHeaderOrDoc || typeof cookieHeaderOrDoc !== 'string') return null;
+  const pairs = cookieHeaderOrDoc.split(';');
+  for (const pair of pairs) {
+    const idx = pair.indexOf('=');
+    if (idx === -1) continue;
+    const k = pair.slice(0, idx).trim();
+    if (k === key) {
+      try {
+        return decodeURIComponent(pair.slice(idx + 1).trim());
+      } catch {
+        return pair.slice(idx + 1).trim();
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Hydrates the authenticated user from localStorage cache, `ttak1.` signed token, or first-party cookie
+ * so reloading `ttak.site` keeps the user signed in immediately without re-prompting Google Login.
+ */
+export function parsePersistedAuthUser(opts: {
+  cachedUserJson?: string | null;
+  storedToken?: string | null;
+  cookieString?: string | null;
+}): { user: PersistedAuthUser | null; token: string | null } {
+  const cookieToken = extractCookieValue(opts.cookieString, 'ttak_auth_token');
+  const cookieUserJson = extractCookieValue(opts.cookieString, 'ttak_auth_user');
+  const effectiveToken = (opts.storedToken || cookieToken || '').trim() || null;
+
+  for (const candidateJson of [opts.cachedUserJson, cookieUserJson]) {
+    if (!candidateJson || typeof candidateJson !== 'string') continue;
+    try {
+      const parsed = JSON.parse(candidateJson);
+      const userId = typeof parsed?.userId === 'string' ? parsed.userId.trim() : '';
+      const email = typeof parsed?.email === 'string' ? parsed.email.trim() : '';
+      if (userId && email) {
+        return {
+          user: {
+            userId,
+            name:
+              typeof parsed.name === 'string' && parsed.name.trim()
+                ? parsed.name.trim()
+                : email.split('@')[0],
+            email,
+            provider:
+              parsed.provider === 'google' ||
+              parsed.provider === 'email' ||
+              parsed.provider === 'telegram'
+                ? parsed.provider
+                : 'google',
+            photoUrl:
+              typeof parsed.photoUrl === 'string' && parsed.photoUrl.trim()
+                ? parsed.photoUrl.trim()
+                : undefined
+          },
+          token: effectiveToken
+        };
+      }
+    } catch {}
+  }
+
+  const fromToken = decodeSignedTokenPayload(effectiveToken);
+  if (fromToken) {
+    return { user: fromToken, token: effectiveToken };
+  }
+
+  return { user: null, token: effectiveToken };
+}
+
+export function encodeAuthUserCacheHeader(user: PersistedAuthUser | null | undefined): string {
+  if (!user || !user.userId || !user.email) return '';
+  try {
+    const json = JSON.stringify({
+      userId: user.userId,
+      name: user.name,
+      email: user.email,
+      provider: user.provider || 'google',
+      photoUrl: user.photoUrl
+    });
+    if (typeof Buffer !== 'undefined') {
+      return Buffer.from(json, 'utf-8').toString('base64');
+    }
+    const bytes = new TextEncoder().encode(json);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Determines whether a root `/` visit should automatically enter `/app/free-recap`
+ * because the user is already authenticated (preventing reload on `https://ttak.site/`
+ * from dropping the user back onto the unauthenticated Landing page).
+ */
+export function shouldAutoRedirectAuthenticatedRoot(
+  pathname: string,
+  hasAuthenticatedUser: boolean
+): boolean {
+  if (!hasAuthenticatedUser) return false;
+  const clean = (pathname || '/').trim();
+  return clean === '' || clean === '/';
+}
+
 

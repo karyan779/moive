@@ -39,6 +39,7 @@ import {
   CAPTION_COLOR_PRESETS,
   BURMESE_FONT_STYLES,
   resolveBurmeseFontMeta,
+  resolveSubtitleFontMeta,
   isVoiceAllowedInMode,
   getVoicePreviewSampleText,
   loadSavedApiEngineConfig,
@@ -421,12 +422,14 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     enabled: true,
     style: 'box_black',
     fontStyle: 'Yati_Round',
+    subtitleLanguage: 'my',
     x: 50,
     y: 76,
     fontSize: 40,
     maxWidth: 88,
     samplePreviewLight: false
   });
+  const [isTranslatingSubtitles, setIsTranslatingSubtitles] = useState<boolean>(false);
 
   // Anti-Copyright / Edit Effects State:
   // In Credit Mode, ONLY FHD 1080p is ON by default; Dynamic zoom, Mirror flip, Color shift, Slight crop, Film grain, Audio pitch start OFF until user enables them.
@@ -2109,7 +2112,129 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
               {subtitleConfig.enabled && (
                 <div className="flex flex-col gap-3 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
-                  {targetLanguage === 'my' && (
+                  {/* Subtitle Display Language Selector (Voice stays Burmese while Captions can switch to English, Korean, Thai, etc.) */}
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                        {uiLang === 'my'
+                          ? 'စာတန်းထိုး ဘာသာစကား · Subtitle Language'
+                          : 'Subtitle Display Language'}
+                      </span>
+                      <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                        {isTranslatingSubtitles
+                          ? uiLang === 'my'
+                            ? 'ဘာသာပြန်နေသည်...'
+                            : 'Translating...'
+                          : (subtitleConfig.subtitleLanguage || 'my') === 'my'
+                            ? 'MYANMAR SUB'
+                            : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · MY VOICE`}
+                      </span>
+                    </div>
+
+                    <select
+                      data-testid="subtitle-language-select"
+                      aria-label="Subtitle display language"
+                      value={subtitleConfig.subtitleLanguage || 'my'}
+                      disabled={isTranslatingSubtitles}
+                      onChange={async (e) => {
+                        playUiSound('select');
+                        const nextSubLang = e.target.value as TargetLanguageCode;
+                        setSubtitleConfig((prev) => ({
+                          ...prev,
+                          subtitleLanguage: nextSubLang
+                        }));
+                        if (cues.length > 0) {
+                          setIsTranslatingSubtitles(true);
+                          try {
+                            const resp = await fetch('/api/recap/translate-subtitles', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                cues,
+                                subtitleLanguage: nextSubLang
+                              })
+                            });
+                            const data = await resp.json();
+                            if (data?.ok && Array.isArray(data.cues)) {
+                              setCues(data.cues);
+                            }
+                          } catch {}
+                          setIsTranslatingSubtitles(false);
+                        }
+                      }}
+                      className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                    >
+                      {TARGET_LANGUAGES.map((langOpt) => (
+                        <option key={langOpt.code} value={langOpt.code}>
+                          {langOpt.flag} {langOpt.labelMy} —{' '}
+                          {langOpt.code === 'my'
+                            ? 'မူရင်း မြန်မာစာတန်း'
+                            : `${langOpt.labelEn} စာတန်းထိုး (Voice မြန်မာအသံ)`}
+                        </option>
+                      ))}
+                    </select>
+
+                    {/* Quick Language Pills for Burmese, English, Korean, Thai, Chinese, Japanese */}
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {TARGET_LANGUAGES.map((langOpt) => {
+                        const activeSubLang = subtitleConfig.subtitleLanguage || 'my';
+                        const isSelected = activeSubLang === langOpt.code;
+                        return (
+                          <button
+                            key={langOpt.code}
+                            type="button"
+                            data-testid={`subtitle-lang-chip-${langOpt.code}`}
+                            disabled={isTranslatingSubtitles}
+                            onClick={async () => {
+                              playUiSound('select');
+                              const nextSubLang = langOpt.code;
+                              setSubtitleConfig((prev) => ({
+                                ...prev,
+                                subtitleLanguage: nextSubLang
+                              }));
+                              if (cues.length > 0) {
+                                setIsTranslatingSubtitles(true);
+                                try {
+                                  const resp = await fetch('/api/recap/translate-subtitles', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                      cues,
+                                      subtitleLanguage: nextSubLang
+                                    })
+                                  });
+                                  const data = await resp.json();
+                                  if (data?.ok && Array.isArray(data.cues)) {
+                                    setCues(data.cues);
+                                  }
+                                } catch {}
+                                setIsTranslatingSubtitles(false);
+                              }
+                            }}
+                            className={`flex items-center justify-center gap-1.5 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
+                              isSelected
+                                ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
+                                : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
+                            }`}
+                          >
+                            <span>{langOpt.flag}</span>
+                            <span className="truncate">{langOpt.labelEn}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {(subtitleConfig.subtitleLanguage || 'my') !== 'my' && (
+                      <p className="text-[11px] leading-relaxed text-teal-700 dark:text-teal-400">
+                        ✓ Voice Script နှင့် နောက်ခံစကားပြောအသံမှာ မြန်မာလိုသာ ထွက်ရှိမည်ဖြစ်ပြီး၊ Video ပေါ်ရှိ စာတန်းထိုး (Subtitle) ကိုသာ{' '}
+                        {TARGET_LANGUAGES.find((l) => l.code === subtitleConfig.subtitleLanguage)?.labelMy ||
+                          subtitleConfig.subtitleLanguage}{' '}
+                        ဖြင့် ဘာသာပြန်ထိုးပေးပါမည်။
+                      </p>
+                    )}
+                  </div>
+
+                  {(subtitleConfig.subtitleLanguage || 'my') === 'my' && targetLanguage === 'my' && (
                     <div className="flex flex-col gap-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
@@ -2229,9 +2354,18 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     <span
                       data-testid="sample-caption-preview-text"
                       style={{
-                        fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily,
-                        fontWeight: resolveBurmeseFontMeta(subtitleConfig.fontStyle).fontWeight,
-                        letterSpacing: resolveBurmeseFontMeta(subtitleConfig.fontStyle).letterSpacing,
+                        fontFamily: resolveSubtitleFontMeta(
+                          subtitleConfig.fontStyle,
+                          subtitleConfig.subtitleLanguage
+                        ).cssFontFamily,
+                        fontWeight: resolveSubtitleFontMeta(
+                          subtitleConfig.fontStyle,
+                          subtitleConfig.subtitleLanguage
+                        ).fontWeight,
+                        letterSpacing: resolveSubtitleFontMeta(
+                          subtitleConfig.fontStyle,
+                          subtitleConfig.subtitleLanguage
+                        ).letterSpacing,
                         fontSize: `${Math.max(7, Math.round(0.4 * subtitleConfig.fontSize))}px`,
                         color:
                           editConfig.captionTextColor ||
@@ -2249,7 +2383,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                             : '[text-shadow:0_1px_2px_rgba(255,255,255,0.8)]'
                       }`}
                     >
-                      ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်
+                      {TARGET_LANGUAGES.find(
+                        (l) => l.code === (subtitleConfig.subtitleLanguage || 'my')
+                      )?.sampleCaption || 'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်'}
                     </span>
                   </div>
 
@@ -3810,8 +3946,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             <h3 className="text-base font-bold text-stone-900 dark:text-white">
               {limitModalType === 'daily_limit'
                 ? uiLang === 'my'
-                  ? 'ယနေ့ အခမဲ့ Recap ပမာဏ ပြည့်သွားပါပြီ (3 / 3 ပုဒ်)'
-                  : 'Daily Free Recap Limit Reached (3 / 3)'
+                  ? `ယနေ့ အခမဲ့ Recap ပမာဏ ပြည့်သွားပါပြီ (${freeLimit} / ${freeLimit} ပုဒ်)`
+                  : `Daily Free Recap Limit Reached (${freeLimit} / ${freeLimit})`
                 : limitModalType === 'duration_limit'
                   ? uiLang === 'my'
                     ? 'Free Mode တွင် 2:30 မိနစ် (150s) အထိသာ ရပါသည်'

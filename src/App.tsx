@@ -2,6 +2,10 @@ import React, { useState, useEffect } from 'react';
 import {
   INITIAL_HISTORY_JOBS,
   FREE_DAILY_VIDEO_LIMIT,
+  parsePersistedAuthUser,
+  encodeAuthUserCacheHeader,
+  shouldAutoRedirectAuthenticatedRoot,
+  type PersistedAuthUser,
   type CreditPlanId,
   type RecapJobRecord
 } from './utils/recapEngine';
@@ -25,16 +29,64 @@ import {
   type AuthenticatedUserPayload
 } from './components/SecondaryViews';
 import { AdminPanelView } from './components/AdminPanelView';
-import { firebaseSignOut, waitForCurrentFirebaseUser } from './firebase';
+import {
+  firebaseSignOut,
+  waitForCurrentFirebaseUser,
+  subscribeFirebaseAuthState
+} from './firebase';
 
 const AUTH_TOKEN_KEY = 'ttak_auth_token';
+const AUTH_USER_CACHE_KEY = 'ttak_auth_user_cache';
 
-interface AuthUserState {
-  userId: string;
-  name: string;
-  email: string;
-  provider?: 'google' | 'email' | 'telegram';
-  photoUrl?: string;
+type AuthUserState = PersistedAuthUser;
+
+function readInitialPersistedSession(): {
+  user: AuthUserState | null;
+  token: string | null;
+} {
+  if (typeof window === 'undefined') return { user: null, token: null };
+  let cachedUserJson: string | null = null;
+  let storedToken: string | null = null;
+  try {
+    cachedUserJson = localStorage.getItem(AUTH_USER_CACHE_KEY);
+    storedToken = localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {}
+  const cookieString = typeof document !== 'undefined' ? document.cookie : '';
+  return parsePersistedAuthUser({ cachedUserJson, storedToken, cookieString });
+}
+
+function persistClientAuthSession(user: AuthUserState, token?: string | null) {
+  const userJson = JSON.stringify({
+    userId: user.userId,
+    name: user.name,
+    email: user.email,
+    provider: user.provider || 'google',
+    photoUrl: user.photoUrl
+  });
+  try {
+    if (token) {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+    }
+    localStorage.setItem(AUTH_USER_CACHE_KEY, userJson);
+  } catch {}
+  try {
+    const maxAge = 365 * 24 * 3600;
+    if (token) {
+      document.cookie = `ttak_auth_token=${encodeURIComponent(token)}; path=/; max-age=${maxAge}; SameSite=Lax`;
+    }
+    document.cookie = `ttak_auth_user=${encodeURIComponent(userJson)}; path=/; max-age=${maxAge}; SameSite=Lax`;
+  } catch {}
+}
+
+function clearClientAuthSession() {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_USER_CACHE_KEY);
+  } catch {}
+  try {
+    document.cookie = 'ttak_auth_token=; path=/; max-age=0; SameSite=Lax';
+    document.cookie = 'ttak_auth_user=; path=/; max-age=0; SameSite=Lax';
+  } catch {}
 }
 
 export default function App() {
@@ -42,9 +94,23 @@ export default function App() {
   const [isDark, setIsDark] = useState<boolean>(true);
   const [uiLang, setUiLang] = useState<'my' | 'en'>('my');
 
+  // Synchronously hydrate user from localStorage / cookie / signed token so page reloads on ttak.site never flash or log out
+  const [authUser, setAuthUser] = useState<AuthUserState | null>(() => {
+    return readInitialPersistedSession().user;
+  });
+  const [isAuthChecking, setIsAuthChecking] = useState<boolean>(() => {
+    return readInitialPersistedSession().user === null;
+  });
+  const [signInModalOpen, setSignInModalOpen] = useState<boolean>(false);
+  const [signInModalMode, setSignInModalMode] = useState<'signin' | 'signup'>('signup');
+
   // Default directly to /app/free-recap with ?tab=history or ?tab=settings support
   const [currentRoute, setCurrentRoute] = useState<AppRoute>(() => {
     const p = window.location.pathname;
+    const initialUser = readInitialPersistedSession().user;
+    if (shouldAutoRedirectAuthenticatedRoot(p, Boolean(initialUser))) {
+      return '/app/free-recap';
+    }
     if (
       p === '/app' ||
       p === '/app/long-form' ||
@@ -69,13 +135,7 @@ export default function App() {
 
   const [historyJobs, setHistoryJobs] = useState<RecapJobRecord[]>(INITIAL_HISTORY_JOBS);
 
-  // Real authenticated user session (zero hardcoded Gmail)
-  const [authUser, setAuthUser] = useState<AuthUserState | null>(null);
-  const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
-  const [signInModalOpen, setSignInModalOpen] = useState<boolean>(false);
-  const [signInModalMode, setSignInModalMode] = useState<'signin' | 'signup'>('signup');
-
-  // Free Mode: strictly 3 videos per day (max 2:30 minutes per video)
+  // Free Mode: strictly 5 videos per day (max 2:30 minutes per video)
   const [freeRemaining, setFreeRemaining] = useState<number>(FREE_DAILY_VIDEO_LIMIT);
   // Credits strictly 0 by default
   const [proCredits, setProCredits] = useState<number>(0);
@@ -85,13 +145,22 @@ export default function App() {
   const userEmail = authUser?.email || '';
   const userName = authUser?.name || '';
 
+  // Keep browser URL bar in sync if root `/` auto-redirected to `/app/free-recap` for an already signed-in user
+  useEffect(() => {
+    if (authUser && shouldAutoRedirectAuthenticatedRoot(window.location.pathname, true)) {
+      setCurrentRoute('/app/free-recap');
+      window.history.replaceState({}, '', `/app/free-recap?tab=${inspectorTab}`);
+    }
+  }, [authUser, inspectorTab]);
+
   // Verify stored session token with backend on initial load, with silent Firebase Google restore
   useEffect(() => {
     let isMounted = true;
-    const AUTH_USER_CACHE_KEY = 'ttak_auth_user_cache';
 
-    const trySilentFirebaseRestore = async (): Promise<boolean> => {
-      const fbUser = await waitForCurrentFirebaseUser();
+    const exchangeFirebaseUserForSession = async (fbUser: {
+      email?: string | null;
+      getIdToken: () => Promise<string>;
+    }): Promise<boolean> => {
       if (!fbUser || !fbUser.email) return false;
       try {
         const idToken = await fbUser.getIdToken();
@@ -103,10 +172,7 @@ export default function App() {
         });
         const gData = await gRes.json();
         if (gRes.ok && gData.ok && gData.user && gData.token) {
-          try {
-            localStorage.setItem(AUTH_TOKEN_KEY, gData.token);
-            localStorage.setItem(AUTH_USER_CACHE_KEY, JSON.stringify(gData.user));
-          } catch {}
+          persistClientAuthSession(gData.user, gData.token);
           if (isMounted) {
             setAuthUser(gData.user);
             setSignInModalOpen(false);
@@ -117,40 +183,53 @@ export default function App() {
       return false;
     };
 
+    const trySilentFirebaseRestore = async (): Promise<boolean> => {
+      const fbUser = await waitForCurrentFirebaseUser();
+      if (!fbUser || !fbUser.email) return false;
+      return exchangeFirebaseUserForSession(fbUser);
+    };
+
     const verifySession = async () => {
+      const initialPersisted = readInitialPersistedSession();
       try {
-        const token = localStorage.getItem(AUTH_TOKEN_KEY);
-        if (token) {
-          const res = await fetch('/api/auth/me', {
-            headers: { Authorization: `Bearer ${token}` }
-          });
+        const token = initialPersisted.token;
+        const cachedUser = initialPersisted.user;
+
+        if (token || cachedUser) {
+          const headers: Record<string, string> = {};
+          if (token) {
+            headers.Authorization = `Bearer ${token}`;
+            headers['x-auth-token'] = token;
+          }
+          const cacheHeader = encodeAuthUserCacheHeader(cachedUser);
+          if (cacheHeader) {
+            headers['x-auth-user-cache'] = cacheHeader;
+          }
+          const query = token ? `?token=${encodeURIComponent(token)}` : '';
+          const res = await fetch(`/api/auth/me${query}`, { headers });
           if (res.ok) {
             const data = await res.json();
             if (isMounted && data.ok && data.user) {
-              try {
-                localStorage.setItem(AUTH_USER_CACHE_KEY, JSON.stringify(data.user));
-              } catch {}
+              persistClientAuthSession(data.user, data.token || token);
               setAuthUser(data.user);
               setSignInModalOpen(false);
               return;
             }
           }
-          // Only drop token on explicit 401/403 (not transient 5xx network errors)
-          if (res.status === 401 || res.status === 403) {
-            localStorage.removeItem(AUTH_TOKEN_KEY);
-          } else {
-            try {
-              const cached = localStorage.getItem(AUTH_USER_CACHE_KEY);
-              if (cached && isMounted) {
-                setAuthUser(JSON.parse(cached));
-                setSignInModalOpen(false);
-                return;
-              }
-            } catch {}
+
+          // If we already have a persisted user profile, keep them logged in across reloads
+          // and attempt a silent Firebase token refresh in the background
+          if (cachedUser) {
+            if (isMounted) {
+              setAuthUser(cachedUser);
+              setSignInModalOpen(false);
+            }
+            trySilentFirebaseRestore().catch(() => {});
+            return;
           }
         }
 
-        // Before asking the user to sign in again, check if Firebase Auth already persists Google login
+        // Before asking the user to sign in, check if Firebase Auth already persists Google login
         const restored = await trySilentFirebaseRestore();
         if (restored) return;
 
@@ -162,17 +241,14 @@ export default function App() {
           }
         }
       } catch {
-        // Network offline / server starting up: try silent Firebase restore or cached user
+        // Network offline / server starting up: keep persisted user or try silent Firebase restore
+        if (initialPersisted.user && isMounted) {
+          setAuthUser(initialPersisted.user);
+          setSignInModalOpen(false);
+          return;
+        }
         const restored = await trySilentFirebaseRestore();
         if (restored) return;
-        try {
-          const cached = localStorage.getItem(AUTH_USER_CACHE_KEY);
-          if (cached && isMounted) {
-            setAuthUser(JSON.parse(cached));
-            setSignInModalOpen(false);
-            return;
-          }
-        } catch {}
         if (isMounted && window.location.pathname !== '/admin') {
           setSignInModalMode('signup');
           setSignInModalOpen(true);
@@ -183,8 +259,18 @@ export default function App() {
     };
 
     verifySession();
+
+    const unsubFirebase = subscribeFirebaseAuthState((fbUser) => {
+      if (!fbUser || !fbUser.email) return;
+      const currentPersisted = readInitialPersistedSession();
+      if (!currentPersisted.user || !currentPersisted.token) {
+        exchangeFirebaseUserForSession(fbUser).catch(() => {});
+      }
+    });
+
     return () => {
       isMounted = false;
+      unsubFirebase();
     };
   }, []);
 
@@ -256,24 +342,14 @@ export default function App() {
   };
 
   const handleAuthSuccess = (user: AuthenticatedUserPayload) => {
-    try {
-      localStorage.setItem(AUTH_TOKEN_KEY, user.token);
-      localStorage.setItem(
-        'ttak_auth_user_cache',
-        JSON.stringify({
-          userId: user.userId,
-          name: user.name,
-          email: user.email,
-          provider: user.provider
-        })
-      );
-    } catch {}
-    setAuthUser({
+    const nextUser: AuthUserState = {
       userId: user.userId,
       name: user.name,
       email: user.email,
       provider: user.provider
-    });
+    };
+    persistClientAuthSession(nextUser, user.token);
+    setAuthUser(nextUser);
     setSignInModalOpen(false);
     if (currentRoute === '/') {
       handleNavigate('/app/free-recap', 'settings');
@@ -283,7 +359,7 @@ export default function App() {
   const handleSignOut = async () => {
     try {
       await firebaseSignOut();
-      const token = localStorage.getItem(AUTH_TOKEN_KEY);
+      const token = readInitialPersistedSession().token;
       if (token) {
         await fetch('/api/auth/logout', {
           method: 'POST',
@@ -291,10 +367,7 @@ export default function App() {
         });
       }
     } catch {}
-    try {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-      localStorage.removeItem('ttak_auth_user_cache');
-    } catch {}
+    clearClientAuthSession();
     setAuthUser(null);
     setProCredits(0);
     setActivePlanId('free');
