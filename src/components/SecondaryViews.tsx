@@ -47,6 +47,10 @@ import {
   buildSyncedRecapCues,
   loadFreeUserApiKeys,
   saveFreeUserApiKeys,
+  loadSavedApiEngineConfig,
+  buildCinematicTranslateSystemPrompt,
+  isTransientPollHttpStatus,
+  computeNextPollDelayMs,
   maskApiKeyString,
   TELEGRAM_CHANNEL_URL,
   TELEGRAM_ADMIN_HANDLE,
@@ -57,6 +61,7 @@ import {
   type SubtitleCue,
   type TargetLanguageCode
 } from '../utils/recapEngine';
+import { uploadVideoDirect } from '../utils/r2ClientUpload';
 import {
   playUiSound,
   isUiSoundMuted,
@@ -172,15 +177,31 @@ export const SttStudioView: React.FC<{
   onNavigateToWallet: () => void;
 }> = ({ uiLang, proCredits, activePlanId, onDeductCredits, onNavigateToWallet }) => {
   const sttFileInputRef = useRef<HTMLInputElement | null>(null);
-  const [fileName, setFileName] = useState<string>('Wedding_Drama_SaveTik_Clip.mp4');
-  const [durationSec, setDurationSec] = useState<number>(70);
+  const sttFileRef = useRef<File | null>(null);
+  const [fileName, setFileName] = useState<string>('');
+  const [hasUploadedFile, setHasUploadedFile] = useState<boolean>(false);
+  const [durationSec, setDurationSec] = useState<number>(60);
   const [sttMode, setSttMode] = useState<'transcribe' | 'translate'>('translate');
   const [targetLang, setTargetLang] = useState<TargetLanguageCode>('my');
   const [speakerDiarization, setSpeakerDiarization] = useState<boolean>(true);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [cues, setCues] = useState<SubtitleCue[]>(() => {
-    return buildSyncedRecapCues(70, 'narrator', 'my', 'SaveTik.co_7673413291896605967-hd.mp4').cues;
-  });
+  const [sttProgress, setSttProgress] = useState<number>(0);
+  const [sttStatusMsg, setSttStatusMsg] = useState<string>('');
+  const [sttErrorMsg, setSttErrorMsg] = useState<string | null>(null);
+  const [cues, setCues] = useState<SubtitleCue[]>([
+    {
+      id: 'stt-sample-1',
+      start_ms: 0,
+      end_ms: 2800,
+      text: 'မင်း ဘယ်တုန်းက ပြန်ရောက်နေတာလဲ။ ငါ့ကို ဘာလို့ ဖုန်းမဆက်တာလဲ။'
+    },
+    {
+      id: 'stt-sample-2',
+      start_ms: 3100,
+      end_ms: 6200,
+      text: 'မနေ့ညကမှ ရောက်တာပါ... မင်းကို စိတ်ပူမှာစိုးလို့ မပြောဖြစ်တာ။'
+    }
+  ]);
 
   const sttCreditCost = calculateCreditCost(durationSec, false, {
     isSttMode: true,
@@ -191,13 +212,16 @@ export const SttStudioView: React.FC<{
   const handleUploadSttMedia = (file: File | undefined) => {
     if (!file) return;
     playUiSound('open');
+    sttFileRef.current = file;
+    setHasUploadedFile(true);
     setFileName(file.name);
+    setSttErrorMsg(null);
     const tempUrl = URL.createObjectURL(file);
     const media = document.createElement(file.type.startsWith('audio') ? 'audio' : 'video');
     media.preload = 'metadata';
     media.onloadedmetadata = () => {
       if (media.duration && Number.isFinite(media.duration)) {
-        setDurationSec(Math.max(10, Math.round(media.duration)));
+        setDurationSec(Math.max(6, Math.round(media.duration)));
       }
       URL.revokeObjectURL(tempUrl);
     };
@@ -206,40 +230,179 @@ export const SttStudioView: React.FC<{
 
   const handleRunStt = async () => {
     if (isProcessing) return;
+    setSttErrorMsg(null);
+    if (!sttFileRef.current) {
+      playUiSound('blocked');
+      setSttErrorMsg(
+        uiLang === 'my'
+          ? 'ကျေးဇူးပြု၍ စာတန်းထိုးထုတ်ယူလိုသော Video သို့မဟုတ် Audio ဖိုင်ကို အရင် Upload တင်ပေးပါ။'
+          : 'Please upload a video or audio file first before generating subtitles.'
+      );
+      return;
+    }
     if (proCredits < sttCreditCost) {
       playUiSound('blocked');
       onNavigateToWallet();
       return;
     }
+
     playUiSound('tap');
     setIsProcessing(true);
+    setSttProgress(8);
+    setSttStatusMsg('Uploading media...');
+
     try {
+      const savedEngineCfg = loadSavedApiEngineConfig();
+      const uploadRes = await uploadVideoDirect(
+        sttFileRef.current,
+        (pct, detail) => {
+          setSttProgress(Math.min(35, 8 + Math.round((pct / 100) * 27)));
+          setSttStatusMsg(detail || 'Uploading media...');
+        },
+        'recap',
+        true
+      );
+
+      setSttProgress(38);
+      setSttStatusMsg('Extracting speech audio...');
+
+      const systemPrompt = buildCinematicTranslateSystemPrompt({
+        targetLanguage: targetLang,
+        translateAudio: 'captions-only',
+        sttMode,
+        speakerDiarization
+      });
+
       const res = await fetch('/api/recap/free/generate-assets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          asyncMode: true,
+          isFreeMode: false,
+          isSttOnly: true,
+          sttMode,
+          speakerDiarization,
           durationSec,
           mode: 'translate',
-          scriptStyle: 'narrator',
+          translateAudio: 'captions-only',
           targetLanguage: targetLang,
-          voiceGender: 'male',
+          customPrompt: systemPrompt,
+          r2ObjectKey: uploadRes.r2ObjectKey,
+          localUploadId: uploadRes.localUploadId,
+          scriptModel: savedEngineCfg.scriptModel,
+          sttModel: savedEngineCfg.sttModel,
           title: fileName
         })
       });
-      const data = await res.json();
-      if (data.ok && Array.isArray(data.cues) && data.cues.length > 0) {
-        setCues(data.cues);
-      } else {
-        const built = buildSyncedRecapCues(durationSec, 'narrator', targetLang, fileName);
-        setCues(built.cues);
+
+      const rawText = await res.text();
+      let data: any = null;
+      if (rawText && !rawText.trim().startsWith('<')) {
+        try {
+          data = JSON.parse(rawText);
+        } catch {}
       }
-      onDeductCredits(sttCreditCost);
-      playUiSound('success');
-    } catch {
-      const built = buildSyncedRecapCues(durationSec, 'narrator', targetLang, fileName);
-      setCues(built.cues);
-      onDeductCredits(sttCreditCost);
-      playUiSound('success');
+      if (!data) {
+        throw new Error(
+          uiLang === 'my'
+            ? 'Server ချိတ်ဆက်မှု အချိန်ကြာသွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'Server returned an invalid gateway response. Please retry.'
+        );
+      }
+
+      if (data.ok && data.async && data.job_id) {
+        const pollJobId = String(data.job_id);
+        const pollDeadline = Date.now() + 10 * 60 * 1000;
+        let finalPayload: any = null;
+        let consecutiveErrors = 0;
+
+        while (Date.now() < pollDeadline) {
+          await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutiveErrors)));
+          let stResp: Response;
+          let stText = '';
+          try {
+            stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
+              cache: 'no-store',
+              signal: AbortSignal.timeout(12000)
+            });
+            stText = await stResp.text();
+          } catch {
+            consecutiveErrors++;
+            if (consecutiveErrors >= 15) {
+              throw new Error(
+                uiLang === 'my'
+                  ? 'STT စစ်ဆေးနေစဉ် Network ပြတ်တောက်သွားပါသည်။'
+                  : 'Lost connection while checking STT subtitle progress.'
+              );
+            }
+            continue;
+          }
+
+          let stData: any = null;
+          if (stText && !stText.trim().startsWith('<')) {
+            try {
+              stData = JSON.parse(stText);
+            } catch {}
+          }
+          if (!stData || (isTransientPollHttpStatus(stResp.status) && stData.status !== 'error')) {
+            consecutiveErrors++;
+            continue;
+          }
+          consecutiveErrors = 0;
+          if (typeof stData.progress === 'number') {
+            setSttProgress(Math.max(38, Math.min(98, stData.progress)));
+          }
+          if (stData.stage_message) {
+            setSttStatusMsg(String(stData.stage_message));
+          }
+          if (stData.status === 'done' && stData.result) {
+            finalPayload = stData.result;
+            break;
+          }
+          if (stData.status === 'error' || stData.ok === false) {
+            throw new Error(
+              (uiLang === 'my' ? stData.error : stData.error_en || stData.error) ||
+                stData.error ||
+                'STT subtitle extraction failed'
+            );
+          }
+        }
+        if (!finalPayload) {
+          throw new Error(
+            uiLang === 'my' ? 'STT စာတန်းထိုး ထုတ်ယူမှု အချိန်ကျော်လွန်သွားပါသည်။' : 'STT processing timed out.'
+          );
+        }
+        data = finalPayload;
+      } else if (!data.ok) {
+        throw new Error(
+          (uiLang === 'my' ? data.error : data.error_en || data.error) ||
+            data.error ||
+            'STT subtitle extraction failed'
+        );
+      }
+
+      if (Array.isArray(data.cues) && data.cues.length > 0) {
+        setCues(data.cues);
+        setSttProgress(100);
+        setSttStatusMsg('Done!');
+        onDeductCredits(sttCreditCost);
+        playUiSound('success');
+      } else {
+        throw new Error(
+          uiLang === 'my'
+            ? 'ဤဖိုင်ထဲတွင် စကားပြောအသံ မတွေ့ရှိပါ သို့မဟုတ် STT မအောင်မြင်ပါ။'
+            : 'No speech dialogue was detected in this media file.'
+        );
+      }
+    } catch (sttErr) {
+      playUiSound('error');
+      setSttErrorMsg(
+        sttErr instanceof Error
+          ? sttErr.message
+          : uiLang === 'my'
+            ? 'STT စာတန်းထိုး ထုတ်ယူမှု မအောင်မြင်ပါ။'
+            : 'Failed to generate STT subtitles.'
+      );
     } finally {
       setIsProcessing(false);
     }
@@ -257,11 +420,16 @@ export const SttStudioView: React.FC<{
     } else {
       content = cues.map((c) => c.text).join('\n');
     }
+    const baseName = (fileName || 'movie_subtitles').replace(/\.[^.]+$/, '');
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${fileName.replace(/\.[^.]+$/, '')}_${targetLang}.${fmt}`;
+    a.href = url;
+    a.download = `${baseName}_${targetLang}.${fmt}`;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
   };
 
   return (
@@ -282,17 +450,17 @@ export const SttStudioView: React.FC<{
         <div className="space-y-1">
           <div className="inline-flex items-center gap-1.5 text-[11px] font-bold text-teal-600 dark:text-teal-400 tracking-wide">
             <Subtitles className="size-3.5" />
-            <span>TTAK Auto Subtitles (STT) · Whisper v3 Turbo + Gemini Translator</span>
+            <span>TTAK Auto Subtitles (STT) · Whisper v3 Turbo + Gemini Movie Dialogue Translator</span>
           </div>
           <h2 className="text-lg font-bold text-stone-900 dark:text-slate-100">
             {uiLang === 'my'
-              ? 'Auto Subtitles (STT) · အသံမှ စာတန်းထိုး (.SRT / .VTT) ထုတ်ယူခြင်း'
-              : 'Auto Subtitles (STT) · Speech-to-Text & Burmese SRT Studio'}
+              ? 'Auto Subtitles (STT) · အသံမှ ရုပ်ရှင်စာတန်းထိုး (.SRT / .VTT) ထုတ်ယူခြင်း'
+              : 'Auto Subtitles (STT) · Speech-to-Text & Movie Dialogue SRT Studio'}
           </h2>
           <p className="text-xs text-stone-500 dark:text-slate-400 leading-relaxed">
             {uiLang === 'my'
-              ? 'ဗီဒီယို သို့မဟုတ် အသံဖိုင်မှ စကားပြောများကို အချိန်ကိုက် စာတန်းထိုး (.SRT / .VTT / .TXT) အဖြစ် ထုတ်ယူပြီး မြန်မာဘာသာသို့ တိုက်ရိုက်ပြန်ဆိုပေးပါသည်။'
-              : 'Extract frame-accurate .SRT, .VTT, and .TXT subtitles with multi-speaker recognition and Burmese translation.'}
+              ? 'ဗီဒီယို သို့မဟုတ် အသံဖိုင်မှ စကားပြောများကို Recap ပုံစံမဟုတ်ဘဲ မူရင်းရုပ်ရှင်စကားပြောအတိုင်း အချိန်ကိုက် (.SRT / .VTT / .TXT) စာတန်းထိုး ထုတ်ပေးပါသည်။'
+              : 'Extract frame-accurate dialogue .SRT, .VTT, and .TXT subtitles with natural movie translation (never summarized like a recap).'}
           </p>
         </div>
 
@@ -313,7 +481,7 @@ export const SttStudioView: React.FC<{
             {isProcessing ? (
               <>
                 <Loader2 className="size-4 animate-spin" />
-                <span>Transcribing...</span>
+                <span>{sttProgress > 0 ? `${sttProgress}% · ${sttStatusMsg || 'Transcribing...'}` : 'Transcribing...'}</span>
               </>
             ) : (
               <>
@@ -328,6 +496,16 @@ export const SttStudioView: React.FC<{
           </button>
         </div>
       </div>
+
+      {sttErrorMsg && (
+        <div
+          data-testid="stt-error-banner"
+          className="flex items-start gap-2.5 rounded-2xl border border-red-500/35 bg-red-500/10 p-4 text-xs font-medium text-red-700 dark:text-red-300"
+        >
+          <AlertTriangle className="size-4 shrink-0 mt-0.5 text-red-500" />
+          <span className="flex-1">{sttErrorMsg}</span>
+        </div>
+      )}
 
       {/* STT Credit Plan Pricing & Features Breakdown */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -376,13 +554,26 @@ export const SttStudioView: React.FC<{
 
             <button
               type="button"
+              data-testid="stt-upload-btn"
               onClick={() => sttFileInputRef.current?.click()}
-              className="w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 dark:border-slate-700 bg-[#FAF8F4] dark:bg-[#151C26] p-6 text-center cursor-pointer hover:border-amber-500/70 transition-colors"
+              className={`w-full flex flex-col items-center justify-center rounded-2xl border border-dashed p-6 text-center cursor-pointer transition-colors ${
+                hasUploadedFile
+                  ? 'border-teal-500/70 bg-teal-500/[0.05] dark:bg-[#151C26]'
+                  : 'border-stone-300 dark:border-slate-700 bg-[#FAF8F4] dark:bg-[#151C26] hover:border-amber-500/70'
+              }`}
             >
-              <Upload className="size-6 text-amber-500 mb-2" />
-              <p className="text-xs font-bold text-stone-900 dark:text-slate-100">{fileName}</p>
+              <Upload className={`size-6 mb-2 ${hasUploadedFile ? 'text-teal-500' : 'text-amber-500'}`} />
+              <p className="text-xs font-bold text-stone-900 dark:text-slate-100">
+                {hasUploadedFile
+                  ? fileName
+                  : uiLang === 'my'
+                    ? 'Video / Audio ဖိုင် ရွေးချယ်ရန် နှိပ်ပါ'
+                    : 'Click to select Video or Audio file'}
+              </p>
               <p className="text-[11px] text-stone-500 dark:text-slate-400 mt-1 font-mono tabular-nums">
-                Duration: {formatDuration(durationSec)} ({durationSec}s) · Select MP4, MP3, WAV, MKV
+                {hasUploadedFile
+                  ? `Duration: ${formatDuration(durationSec)} (${durationSec}s) · Ready`
+                  : 'Supports MP4, MP3, WAV, M4A, MKV'}
               </p>
             </button>
 

@@ -15,15 +15,13 @@ import {
   LONG_FORM_STYLE_PROMPTS,
   VOICE_OPTIONS,
   exportCuesToSrt,
-  isValidPlayableMediaResponse,
-  isValidMp4BufferHeader,
-  sanitizeMp4DownloadName,
   type LongFormStyleId,
   type VoiceGender,
   type SubtitleCue
 } from '../utils/recapEngine';
 import { formatBytesReadable, stripSrtTimestampsToText } from '../utils/r2Direct';
 import { uploadVideoDirect, uploadSrtToR2Direct } from '../utils/r2ClientUpload';
+import { downloadVerifiedMp4File } from '../utils/mp4Download';
 import { playUiSound } from '../utils/soundEffects';
 
 type LongFormOutputMode =
@@ -505,36 +503,14 @@ export const LongFormStudio: React.FC<{ uiLang: 'my' | 'en' }> = ({ uiLang }) =>
                       type="button"
                       onClick={async () => {
                         playUiSound('tap');
-                        const safeName = sanitizeMp4DownloadName(`${movieTitle.slice(0, 24)}_recap`, 'longform_recap');
-                        const sep = outputVideoUrl.includes('?') ? '&' : '?';
-                        const dlUrl = outputVideoUrl.startsWith('/api/recap/video/')
-                          ? `${outputVideoUrl}${sep}dl=1&name=${encodeURIComponent(safeName)}`
-                          : outputVideoUrl;
                         try {
-                          const resp = await fetch(dlUrl, { method: 'GET', cache: 'no-store' });
-                          if (!isValidPlayableMediaResponse(resp.status, resp.ok, resp.headers.get('content-type'), 'video/')) {
-                            playUiSound('error');
-                            return;
-                          }
-                          const rawBlob = await resp.blob();
-                          const head = new Uint8Array(await rawBlob.slice(0, 32).arrayBuffer());
-                          if (!isValidMp4BufferHeader(head, rawBlob.size)) {
-                            playUiSound('error');
-                            return;
-                          }
-                          const mp4Blob = new Blob([rawBlob], { type: 'video/mp4' });
-                          const objUrl = URL.createObjectURL(mp4Blob);
-                          const a = document.createElement('a');
-                          a.href = objUrl;
-                          a.download = safeName;
-                          document.body.appendChild(a);
-                          a.click();
-                          document.body.removeChild(a);
-                          setTimeout(() => {
-                            try {
-                              URL.revokeObjectURL(objUrl);
-                            } catch {}
-                          }, 60000);
+                          const ok = await downloadVerifiedMp4File({
+                            videoUrl: outputVideoUrl,
+                            rawTitle: `${movieTitle.slice(0, 24)}_recap`,
+                            fallbackFilename: 'longform_recap',
+                            isFreeMode: false
+                          });
+                          if (!ok) playUiSound('error');
                         } catch {
                           playUiSound('error');
                         }

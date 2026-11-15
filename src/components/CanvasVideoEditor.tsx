@@ -18,6 +18,7 @@ import {
   clampBlurRegion,
   computeAspectCanvasLayout,
   resolveBurmeseFontMeta,
+  shouldSyncCompanionAudioTime,
   DEFAULT_DEEPRECAP_EDIT_CONFIG,
   TARGET_LANGUAGES,
   type AspectRatioMode,
@@ -275,11 +276,59 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     null
   );
 
+  const [companionBlobUrl, setCompanionBlobUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (hasMuxedAudio) {
+      setCompanionBlobUrl(null);
+      return;
+    }
+    let revokedUrl: string | null = null;
+    let cancelled = false;
+
+    if (audioBase64) {
+      try {
+        const binStr = atob(audioBase64);
+        const bytes = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) {
+          bytes[i] = binStr.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: 'audio/wav' });
+        revokedUrl = URL.createObjectURL(blob);
+        setCompanionBlobUrl(revokedUrl);
+      } catch {
+        setCompanionBlobUrl(`data:audio/wav;base64,${audioBase64}`);
+      }
+    } else if (voiceoverAudioUrl) {
+      // Set direct URL immediately so playback starts without delay, then upgrade to in-memory Blob URL so 2+ min streams never stall at 0:21
+      setCompanionBlobUrl(voiceoverAudioUrl);
+      fetch(voiceoverAudioUrl, { credentials: 'same-origin' })
+        .then((r) => (r.ok ? r.blob() : null))
+        .then((b) => {
+          if (!cancelled && b && b.size > 512) {
+            revokedUrl = URL.createObjectURL(b);
+            setCompanionBlobUrl(revokedUrl);
+          }
+        })
+        .catch(() => {});
+    } else {
+      setCompanionBlobUrl(null);
+    }
+
+    return () => {
+      cancelled = true;
+      if (revokedUrl) {
+        try {
+          URL.revokeObjectURL(revokedUrl);
+        } catch {}
+      }
+    };
+  }, [hasMuxedAudio, audioBase64, voiceoverAudioUrl]);
+
   const companionAudioSrc = hasMuxedAudio
     ? null
-    : audioBase64
-      ? `data:audio/wav;base64,${audioBase64}`
-      : voiceoverAudioUrl || null;
+    : companionBlobUrl ||
+      (audioBase64 ? `data:audio/wav;base64,${audioBase64}` : voiceoverAudioUrl || null);
 
   useEffect(() => {
     setVideoLoadError(null);
@@ -513,13 +562,18 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     } else if (audioRef.current.src !== companionAudioSrc) {
       audioRef.current.src = companionAudioSrc;
     }
-    audioRef.current.loop = true;
+    audioRef.current.loop = false;
+    audioRef.current.preload = 'auto';
     audioRef.current.volume = 1.0;
     audioRef.current.muted = isMuted;
-    audioRef.current.playbackRate = effects.pitchShift ? 1.04 : 1.0;
+    audioRef.current.playbackRate = 1.0;
     if (isPlaying) {
-      audioRef.current.currentTime = videoRef.current?.currentTime || 0;
-      audioRef.current.play().catch(() => {});
+      const targetTime = videoRef.current?.currentTime || 0;
+      const aDur = audioRef.current.duration;
+      if (!Number.isFinite(aDur) || aDur <= 0 || targetTime < aDur - 0.25) {
+        audioRef.current.currentTime = targetTime;
+        audioRef.current.play().catch(() => {});
+      }
     }
   }, [companionAudioSrc, hasMuxedAudio, effects.pitchShift]);
 
@@ -828,24 +882,72 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                     onTimeUpdate={(e) => {
                       const t = e.currentTarget.currentTime;
                       setCurrentTime(t);
-                      if (bgVideoRef.current && Math.abs(bgVideoRef.current.currentTime - t) > 0.25) {
+                      if (
+                        bgVideoRef.current &&
+                        !bgVideoRef.current.seeking &&
+                        Math.abs(bgVideoRef.current.currentTime - t) > 1.25
+                      ) {
                         bgVideoRef.current.currentTime = t;
                       }
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
+                        const a = audioRef.current;
+                        const aDur = a.duration;
+                        const withinAudioRange =
+                          !Number.isFinite(aDur) || aDur <= 0.5 || t < aDur - 0.25;
+                        if (withinAudioRange) {
+                          if (
+                            shouldSyncCompanionAudioTime(
+                              t,
+                              a.currentTime,
+                              aDur,
+                              a.seeking,
+                              0.85
+                            )
+                          ) {
+                            a.currentTime = t;
+                          }
+                          if (isPlaying && a.paused && !e.currentTarget.paused) {
+                            a.play().catch(() => {});
+                          }
+                        } else if (!a.paused) {
+                          a.pause();
+                        }
+                      }
+                    }}
+                    onSeeked={(e) => {
+                      const t = e.currentTarget.currentTime;
+                      if (bgVideoRef.current && !bgVideoRef.current.seeking) {
+                        bgVideoRef.current.currentTime = t;
+                      }
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
+                        const aDur = audioRef.current.duration;
+                        if (!Number.isFinite(aDur) || aDur <= 0.5 || t < aDur - 0.2) {
+                          audioRef.current.currentTime = t;
+                          if (isPlaying && audioRef.current.paused) {
+                            audioRef.current.play().catch(() => {});
+                          }
+                        }
+                      }
+                    }}
+                    onWaiting={() => {
+                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio && !audioRef.current.paused) {
+                        audioRef.current.pause();
+                      }
+                    }}
+                    onPlaying={() => {
                       if (
                         audioRef.current &&
                         companionAudioSrc &&
                         !hasMuxedAudio &&
-                        Math.abs(audioRef.current.currentTime - t) > 0.35
+                        isPlaying &&
+                        audioRef.current.paused
                       ) {
-                        audioRef.current.currentTime = t;
-                      }
-                    }}
-                    onSeeked={(e) => {
-                      if (bgVideoRef.current) {
-                        bgVideoRef.current.currentTime = e.currentTarget.currentTime;
-                      }
-                      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
-                        audioRef.current.currentTime = e.currentTarget.currentTime;
+                        const t = videoRef.current?.currentTime || 0;
+                        const aDur = audioRef.current.duration;
+                        if (!Number.isFinite(aDur) || aDur <= 0.5 || t < aDur - 0.25) {
+                          audioRef.current.currentTime = t;
+                          audioRef.current.play().catch(() => {});
+                        }
                       }
                     }}
                     onPlay={() => {
@@ -855,7 +957,11 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                         bgVideoRef.current.play().catch(() => {});
                       }
                       if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
-                        audioRef.current.play().catch(() => {});
+                        const t = videoRef.current?.currentTime || 0;
+                        const aDur = audioRef.current.duration;
+                        if (!Number.isFinite(aDur) || aDur <= 0.5 || t < aDur - 0.25) {
+                          audioRef.current.play().catch(() => {});
+                        }
                       }
                     }}
                     onPause={() => {
@@ -907,6 +1013,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                           : 'object-contain'
                     }`}
                     playsInline
+                    preload="auto"
                     muted={isMuted || (!hasMuxedAudio && Boolean(companionAudioSrc))}
                     loop
                     autoPlay

@@ -48,12 +48,14 @@ import {
   calculateCreditCost,
   exportCuesToSrt,
   resolveStudioWorkflowStep,
-  isValidPlayableMediaResponse,
-  isValidMp4BufferHeader,
-  sanitizeMp4DownloadName,
   getDefaultAntiCopyrightEffects,
   buildPaymentNoticeKey,
   shouldShowPaymentNotificationBanner,
+  isTransientPollHttpStatus,
+  computeNextPollDelayMs,
+  buildCinematicTranslateSystemPrompt,
+  extractJobIdFromVideoUrl,
+  resolveEffectiveVideoDurationSec,
   type RecapMode,
   type TranslateAudioMode,
   type VoiceGender,
@@ -74,6 +76,7 @@ import {
 } from '../utils/recapEngine';
 import { playUiSound } from '../utils/soundEffects';
 import { uploadVideoDirect } from '../utils/r2ClientUpload';
+import { downloadVerifiedMp4File } from '../utils/mp4Download';
 import {
   CanvasVideoEditor,
   type DemoScenePreset
@@ -486,6 +489,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [isExportingVideo, setIsExportingVideo] = useState<boolean>(false);
   const [exportProgressPct, setExportProgressPct] = useState<number>(0);
   const [studioErrorMsg, setStudioErrorMsg] = useState<string | null>(null);
+  const studioErrorRef = useRef<HTMLDivElement | null>(null);
   const [isDownloadingMp3, setIsDownloadingMp3] = useState<boolean>(false);
 
   // AI Voice Preview State (Listen to Thiha / Nilar / Pro Voices before generating video)
@@ -607,6 +611,16 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       URL.revokeObjectURL(dubbedBlobUrl);
       setDubbedBlobUrl(null);
     }
+    try {
+      const probeEl = document.createElement('video');
+      probeEl.preload = 'metadata';
+      probeEl.src = objUrl;
+      probeEl.onloadedmetadata = () => {
+        if (probeEl.duration && Number.isFinite(probeEl.duration) && probeEl.duration > 0.5) {
+          setVideoDuration(Math.round(probeEl.duration));
+        }
+      };
+    } catch {}
   };
 
   // Load a saved Recap Job from the History tab (`rI()`)
@@ -617,6 +631,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setVideoTitle(job.title);
     setVideoDuration(job.durationSec);
     setMode(job.mode);
+    setTranslateAudio(job.translateAudio || 'dub');
     setScriptStyle(job.scriptStyle);
     setTargetLanguage(job.targetLanguage);
     setVoiceGender(
@@ -633,10 +648,12 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     const isMuxedUrl = Boolean(job.videoUrl && job.videoUrl.startsWith('/api/recap/video/'));
     setHasMuxedAudio(isMuxedUrl);
     setDubbedVideoUrl(isMuxedUrl ? job.videoUrl : null);
-    const extractedJobMatch = job.videoUrl?.match(/\/(job_[a-zA-Z0-9_]+)_(?:recap|preview)\.mp4/);
-    setLastJobId(extractedJobMatch ? extractedJobMatch[1] : null);
+    const extractedJobId = extractJobIdFromVideoUrl(job.videoUrl);
+    setLastJobId(extractedJobId);
     setVoiceoverMp3Url(
-      extractedJobMatch ? `/api/recap/audio/${extractedJobMatch[1]}_voiceover.mp3` : null
+      extractedJobId && job.translateAudio !== 'captions-only'
+        ? `/api/recap/audio/${extractedJobId}_voiceover.mp3`
+        : null
     );
     if (job.videoUrl?.includes('island')) setDemoScene('island');
     else if (job.videoUrl?.includes('scifi')) setDemoScene('scifi');
@@ -733,7 +750,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         scriptStyle,
         targetLanguage,
         voiceGender,
-        customPrompt: SCRIPT_STYLE_PROMPTS[scriptStyle].systemPrompt,
+        customPrompt:
+          mode === 'translate'
+            ? buildCinematicTranslateSystemPrompt({ targetLanguage, translateAudio })
+            : SCRIPT_STYLE_PROMPTS[scriptStyle].systemPrompt,
         title: videoTitle || originalFilename,
         r2ObjectKey: r2ObjectKeyPayload,
         localUploadId: localUploadIdPayload,
@@ -753,7 +773,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       };
 
       setRenderProgress(37);
-      setRenderMessage(uiLang === 'my' ? 'Server တွင် Recap စတင်ဖန်တီးနေသည်...' : 'Starting AI recap job...');
+      setRenderMessage('Starting AI recap job...');
 
       const response = await fetch('/api/recap/free/generate-assets', {
         method: 'POST',
@@ -781,19 +801,56 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         const pollJobId = String(data.job_id);
         const pollDeadline = Date.now() + 12 * 60 * 1000;
         let finalPayload: any = null;
+        let consecutivePollErrors = 0;
         while (Date.now() < pollDeadline) {
-          await new Promise((r) => setTimeout(r, 1200));
-          const stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
-            cache: 'no-store'
-          });
-          const stText = await stResp.text();
+          await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutivePollErrors)));
+          let stResp: Response;
+          let stText = '';
+          try {
+            stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
+              cache: 'no-store',
+              signal: AbortSignal.timeout(12000)
+            });
+            stText = await stResp.text();
+          } catch (pollNetErr) {
+            consecutivePollErrors++;
+            if (consecutivePollErrors >= 3) {
+              setRenderMessage(`Reconnecting to server (${consecutivePollErrors}/15)...`);
+            }
+            if (consecutivePollErrors >= 15) {
+              throw new Error(
+                uiLang === 'my'
+                  ? 'အင်တာနက်ချိတ်ဆက်မှု ပြတ်တောက်သွားပါသည်။ Network ပြန်စစ်ပြီး ထပ်မံကြိုးစားကြည့်ပါ။'
+                  : 'Lost network connection while checking recap progress. Please retry.'
+              );
+            }
+            continue;
+          }
+
           let stData: any = null;
           if (stText && !stText.trim().startsWith('<')) {
             try {
               stData = JSON.parse(stText);
             } catch {}
           }
-          if (!stData) continue;
+          if (!stData) {
+            if (isTransientPollHttpStatus(stResp.status) || consecutivePollErrors < 12) {
+              consecutivePollErrors++;
+              continue;
+            }
+            throw new Error(
+              uiLang === 'my'
+                ? 'Server တုံ့ပြန်မှု ပုံစံမမှန်ပါ (Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
+                : 'Server returned an invalid gateway response while polling.'
+            );
+          }
+
+          if (isTransientPollHttpStatus(stResp.status) && stData.status !== 'error') {
+            consecutivePollErrors++;
+            continue;
+          }
+
+          consecutivePollErrors = 0;
           if (typeof stData.progress === 'number') {
             setRenderProgress((prev) => Math.max(prev, Math.min(98, stData.progress)));
           }
@@ -829,6 +886,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       }
 
       const generatedCues: SubtitleCue[] = data.cues || [];
+      const authoritativeDur = Math.round(
+        resolveEffectiveVideoDurationSec(Number(data.duration_sec), safeDur, generatedCues)
+      );
+      setVideoDuration(authoritativeDur);
       setCues(generatedCues);
       setAudioBase64(data.audio_base64);
       setLastJobId(data.job_id || null);
@@ -868,9 +929,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         title: data.title || videoTitle || originalFilename || 'Video Recap',
         sourceUrl: sourceUrlInput || undefined,
         createdAt: 'Just now',
-        durationSec: safeDur,
+        durationSec: authoritativeDur,
         resolution: effects.outputHD ? '1080p' : '720p',
         mode,
+        translateAudio: mode === 'translate' ? translateAudio : undefined,
         scriptStyle,
         targetLanguage,
         voiceGender,
@@ -879,7 +941,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         videoUrl: finalVideoUrl,
         audioBase64: data.audio_base64,
         scriptText: data.script_text || '',
-        systemPromptUsed: SCRIPT_STYLE_PROMPTS[scriptStyle].systemPrompt,
+        systemPromptUsed:
+          mode === 'translate'
+            ? buildCinematicTranslateSystemPrompt({ targetLanguage, translateAudio })
+            : SCRIPT_STYLE_PROMPTS[scriptStyle].systemPrompt,
         cues: generatedCues,
         highlightClips: data.highlight_clips || [],
         blurRegions,
@@ -900,63 +965,31 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             ? 'Recap ထုတ်လုပ်မှု မအောင်မြင်ပါ။ ထပ်မံကြိုးစားကြည့်ပါ။'
             : 'Recap generation failed. Please try again.';
       setStudioErrorMsg(errMsg);
+      setTimeout(() => {
+        studioErrorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 60);
       console.error('[RecapStudio] Render failed:', err);
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // Download handlers (Async non-blocking FFmpeg + polling so Cloudflare 100s timeout never returns .mp4.html)
+  // Download handlers (StreamWaveAI R2 presigned URL flow + verified in-session Blob fallback so Android Chrome never produces .mp4.html)
   const handleDownloadVideo = async () => {
     if (isExportingVideo) return;
     playUiSound('tap');
     setStudioErrorMsg(null);
-    const downloadFilename = sanitizeMp4DownloadName(
-      `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_${isFreeTier ? 'free' : 'pro'}_recap`,
-      isFreeTier ? 'ttak_free_recap' : 'ttak_pro_recap'
-    );
 
     const verifyAndTriggerVideoDownload = async (rawUrl: string): Promise<boolean> => {
       try {
-        const isBlobUrl = rawUrl.startsWith('blob:');
-        const sep = rawUrl.includes('?') ? '&' : '?';
-        const dlUrl =
-          !isBlobUrl && rawUrl.startsWith('/api/recap/video/')
-            ? `${rawUrl}${sep}dl=1&name=${encodeURIComponent(downloadFilename)}`
-            : rawUrl;
-
-        // Always fetch inside the active browser session & validate MP4 header bytes
-        // so Android/Mobile DownloadManager + Cloudflare can NEVER save a page as `.mp4.html`!
-        const resp = await fetch(dlUrl, { method: 'GET', cache: 'no-store' });
-        if (!isBlobUrl) {
-          const ct = resp.headers.get('content-type');
-          if (!isValidPlayableMediaResponse(resp.status, resp.ok, ct, 'video/')) {
-            return false;
-          }
-        } else if (!resp.ok) {
-          return false;
-        }
-
-        const rawBlob = await resp.blob();
-        const headBuf = new Uint8Array(await rawBlob.slice(0, 32).arrayBuffer());
-        if (!isValidMp4BufferHeader(headBuf, rawBlob.size)) {
-          return false;
-        }
-
-        const mp4Blob = new Blob([rawBlob], { type: 'video/mp4' });
-        const objectUrl = URL.createObjectURL(mp4Blob);
-        const a = document.createElement('a');
-        a.href = objectUrl;
-        a.download = downloadFilename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => {
-          try {
-            URL.revokeObjectURL(objectUrl);
-          } catch {}
-        }, 60000);
-        return true;
+        return await downloadVerifiedMp4File({
+          videoUrl: rawUrl,
+          jobId: lastJobId,
+          rawTitle: `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_${isFreeTier ? 'free' : 'pro'}_recap`,
+          fallbackFilename: isFreeTier ? 'ttak_free_recap' : 'ttak_pro_recap',
+          isFreeMode: isFreeTier,
+          onProgress: (pct) => setExportProgressPct((prev) => Math.max(prev, pct))
+        });
       } catch {
         return false;
       }
@@ -995,6 +1028,15 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           } catch {}
         }
 
+        if (!exportRes.ok || exportData?.ok === false) {
+          throw new Error(
+            exportData?.error ||
+              (uiLang === 'my'
+                ? 'စာတန်းထိုး MP4 Export မအောင်မြင်ပါ။ Video ကို ပြန်လည် Generate လုပ်ပြီး Download ဆွဲပေးပါ။'
+                : 'Subtitle burn-in MP4 export failed. Please regenerate and try downloading again.')
+          );
+        }
+
         let resolvedExportUrl: string | null = null;
         if (exportData?.ok && exportData.dubbed_video_url) {
           resolvedExportUrl = exportData.dubbed_video_url;
@@ -1002,19 +1044,39 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           const exportDeadline = Date.now() + 12 * 60 * 1000;
           const exportId = String(exportData.exportId);
           setExportProgressPct(Number(exportData.progress) || 20);
+          let consecutiveExportPollErrors = 0;
           while (Date.now() < exportDeadline) {
-            await new Promise((r) => setTimeout(r, 1200));
-            const stResp = await fetch(`/api/recap/render-status/${encodeURIComponent(exportId)}`, {
-              cache: 'no-store'
-            });
-            const stRaw = await stResp.text();
+            await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutiveExportPollErrors)));
+            let stResp: Response;
+            let stRaw = '';
+            try {
+              stResp = await fetch(`/api/recap/render-status/${encodeURIComponent(exportId)}`, {
+                cache: 'no-store',
+                signal: AbortSignal.timeout(12000)
+              });
+              stRaw = await stResp.text();
+            } catch {
+              consecutiveExportPollErrors++;
+              if (consecutiveExportPollErrors >= 15) {
+                throw new Error(
+                  uiLang === 'my'
+                    ? 'Export status စစ်ဆေးနေစဉ် Network ပြတ်တောက်သွားပါသည်။'
+                    : 'Lost connection while rendering subtitled MP4 export.'
+                );
+              }
+              continue;
+            }
             let stData: any = null;
             if (stRaw && !stRaw.trim().startsWith('<')) {
               try {
                 stData = JSON.parse(stRaw);
               } catch {}
             }
-            if (!stData) continue;
+            if (!stData) {
+              consecutiveExportPollErrors++;
+              continue;
+            }
+            consecutiveExportPollErrors = 0;
             if (typeof stData.progress === 'number') {
               setExportProgressPct(stData.progress);
             }
@@ -1023,22 +1085,33 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               break;
             }
             if (stData.status === 'error' || stData.ok === false) {
-              throw new Error(stData.error || 'Export render failed');
+              throw new Error(stData.error || 'Subtitle MP4 export render failed');
             }
           }
         }
 
-        if (resolvedExportUrl) {
-          setExportProgressPct(100);
-          setDubbedVideoUrl(resolvedExportUrl);
-          const valid = await verifyAndTriggerVideoDownload(resolvedExportUrl);
-          if (valid) return;
+        if (!resolvedExportUrl) {
+          throw new Error(
+            uiLang === 'my'
+              ? 'စာတန်းထိုး MP4 ဖန်တီးမှု အချိန်ကျော်လွန်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+              : 'Timed out waiting for subtitled MP4 export. Please try again.'
+          );
         }
+
+        setExportProgressPct(100);
+        setDubbedVideoUrl(resolvedExportUrl);
+        const valid = await verifyAndTriggerVideoDownload(resolvedExportUrl);
+        if (valid) return;
+        throw new Error(
+          uiLang === 'my'
+            ? 'Export လုပ်ထားသော MP4 ဖိုင်ကို Download ဆွဲ၍မရပါ။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'Exported subtitled MP4 failed verification. Please try again.'
+        );
       }
 
       if (dubbedBlobUrl) {
-        await verifyAndTriggerVideoDownload(dubbedBlobUrl);
-        return;
+        const validBlob = await verifyAndTriggerVideoDownload(dubbedBlobUrl);
+        if (validBlob) return;
       }
 
       if (dubbedVideoUrl) {
@@ -1635,11 +1708,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       {isLoadingVoicePreview ? (
                         <>
                           <Loader2 className="size-3.5 animate-spin text-teal-500" />
-                          <span>
-                            {uiLang === 'my'
-                              ? 'AI အသံ နမူနာ ထုတ်နေပါသည်…'
-                              : 'Synthesizing Voice Sample…'}
-                          </span>
+                          <span>Synthesizing AI Voice Sample…</span>
                         </>
                       ) : isPlayingVoicePreview ? (
                         <>
@@ -1685,28 +1754,50 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                 </div>
               )}
 
-              {/* Script style & Language side-by-side / stacked cleanly inside Section 01 */}
+              {/* Script style (Recap only) or Cinematic Translation info (Translate) + Language */}
               <div className="grid grid-cols-1 gap-2.5 pt-1">
-                <div className="flex flex-col gap-1.5">
-                  <DottedTooltipLabel
-                    label={t.scriptStyleLabel}
-                    tooltip="Choose the tone and pacing for your narration."
-                  />
-                  <select
-                    value={scriptStyle}
-                    onChange={(e) => {
-                      playUiSound('select');
-                      setScriptStyle(e.target.value as ScriptStyleId);
-                    }}
-                    className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                {mode === 'recap' ? (
+                  <div className="flex flex-col gap-1.5">
+                    <DottedTooltipLabel
+                      label={t.scriptStyleLabel}
+                      tooltip="Choose the tone and pacing for your narration."
+                    />
+                    <select
+                      value={scriptStyle}
+                      onChange={(e) => {
+                        playUiSound('select');
+                        setScriptStyle(e.target.value as ScriptStyleId);
+                      }}
+                      className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                    >
+                      <option value="narrator">Fast Recap</option>
+                      <option value="drama">Storytelling</option>
+                      <option value="casual">Gen Z</option>
+                      <option value="news">News</option>
+                      <option value="none">Documentary</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div
+                    data-testid="translate-dialogue-hint"
+                    className="rounded-xl border border-teal-500/30 bg-teal-500/8 px-3 py-2 text-[11px] leading-relaxed text-teal-800 dark:border-teal-500/25 dark:bg-teal-500/10 dark:text-teal-200"
                   >
-                    <option value="narrator">Fast Recap</option>
-                    <option value="drama">Storytelling</option>
-                    <option value="casual">Gen Z</option>
-                    <option value="news">News</option>
-                    <option value="none">Documentary</option>
-                  </select>
-                </div>
+                    <span className="font-bold block">
+                      {translateAudio === 'captions-only'
+                        ? uiLang === 'my'
+                          ? 'Captions Only · မူရင်းအသံ + ရုပ်ရှင်စာတန်းထိုး'
+                          : 'Captions Only · Original Audio + Movie Subtitles'
+                        : uiLang === 'my'
+                          ? 'Translate & Dub · ရုပ်ရှင်စကားပြော ဘာသာပြန်အသံသွင်း'
+                          : 'Translate & Dub · Natural Movie Dialogue Dubbing'}
+                    </span>
+                    <span className="text-[10px] opacity-85">
+                      {uiLang === 'my'
+                        ? 'Recap ပုံစံမဟုတ်ဘဲ မူရင်းဇာတ်ကောင်များ စကားပြောသည့်အတိုင်း သဘာဝကျကျ ဘာသာပြန်ပေးပါမည်။'
+                        : 'Translates natural spoken character dialogue line-by-line rather than summarizing like a recap.'}
+                    </span>
+                  </div>
+                )}
 
                 {/* Language */}
                 <div className="flex flex-col gap-1.5">
@@ -3146,6 +3237,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
           {studioErrorMsg && (
             <div
+              ref={studioErrorRef}
               data-testid="studio-error-banner"
               className="flex items-start justify-between gap-3 rounded-2xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-xs text-red-700 dark:text-red-300 shadow-xs"
             >
@@ -3362,21 +3454,23 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     </button>
                   )}
 
-                  <button
-                    type="button"
-                    data-testid="download-audio-mp3-btn"
-                    disabled={isDownloadingMp3}
-                    onClick={handleDownloadAudioMp3}
-                    title="Download standalone MP3 voiceover audio for CapCut"
-                    className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-teal-500/35 bg-teal-500/10 px-4 text-xs font-semibold text-teal-700 shadow-2xs transition-all hover:bg-teal-500/20 active:scale-95 disabled:opacity-50 dark:border-teal-500/35 dark:bg-teal-500/15 dark:text-teal-300 dark:hover:bg-teal-500/25"
-                  >
-                    {isDownloadingMp3 ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Volume2 className="size-3.5" />
-                    )}
-                    <span>{uiLang === 'my' ? 'MP3 အသံသီးသန့်' : 'Audio .MP3'}</span>
-                  </button>
+                  {!(mode === 'translate' && translateAudio === 'captions-only') && (
+                    <button
+                      type="button"
+                      data-testid="download-audio-mp3-btn"
+                      disabled={isDownloadingMp3}
+                      onClick={handleDownloadAudioMp3}
+                      title="Download standalone MP3 voiceover audio for CapCut"
+                      className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-teal-500/35 bg-teal-500/10 px-4 text-xs font-semibold text-teal-700 shadow-2xs transition-all hover:bg-teal-500/20 active:scale-95 disabled:opacity-50 dark:border-teal-500/35 dark:bg-teal-500/15 dark:text-teal-300 dark:hover:bg-teal-500/25"
+                    >
+                      {isDownloadingMp3 ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Volume2 className="size-3.5" />
+                      )}
+                      <span>{uiLang === 'my' ? 'MP3 အသံသီးသန့်' : 'Audio .MP3'}</span>
+                    </button>
+                  )}
 
                   <button
                     type="button"
@@ -3392,9 +3486,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     )}
                     <span>
                       {isExportingVideo
-                        ? uiLang === 'my'
-                          ? `Export လုပ်နေသည် ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
-                          : `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
+                        ? `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
                         : t.downloadBtn}
                     </span>
                   </button>
@@ -3544,29 +3636,29 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     )}
                     <span className="truncate">
                       {isExportingVideo
-                        ? uiLang === 'my'
-                          ? `Export လုပ်နေသည် ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
-                          : `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
+                        ? `Exporting ${exportProgressPct > 0 ? `${exportProgressPct}%` : '…'}`
                         : t.downloadBtn}
                     </span>
                   </button>
 
-                  <button
-                    type="button"
-                    data-testid="mobile-download-audio-mp3-btn"
-                    disabled={isDownloadingMp3}
-                    onClick={handleDownloadAudioMp3}
-                    className="flex h-11 cursor-pointer items-center justify-center gap-2 rounded-xl border border-teal-500/35 bg-teal-500/10 px-3 text-xs font-semibold text-teal-700 shadow-xs transition-all select-none hover:bg-teal-500/20 active:scale-95 disabled:opacity-50 dark:border-teal-500/35 dark:bg-teal-500/15 dark:text-teal-300"
-                  >
-                    {isDownloadingMp3 ? (
-                      <Loader2 className="size-4 shrink-0 animate-spin" />
-                    ) : (
-                      <Volume2 className="size-4 shrink-0" />
-                    )}
-                    <span className="truncate">
-                      {uiLang === 'my' ? 'MP3 အသံသီးသန့်' : 'Audio .MP3'}
-                    </span>
-                  </button>
+                  {!(mode === 'translate' && translateAudio === 'captions-only') && (
+                    <button
+                      type="button"
+                      data-testid="mobile-download-audio-mp3-btn"
+                      disabled={isDownloadingMp3}
+                      onClick={handleDownloadAudioMp3}
+                      className="flex h-11 cursor-pointer items-center justify-center gap-2 rounded-xl border border-teal-500/35 bg-teal-500/10 px-3 text-xs font-semibold text-teal-700 shadow-xs transition-all select-none hover:bg-teal-500/20 active:scale-95 disabled:opacity-50 dark:border-teal-500/35 dark:bg-teal-500/15 dark:text-teal-300"
+                    >
+                      {isDownloadingMp3 ? (
+                        <Loader2 className="size-4 shrink-0 animate-spin" />
+                      ) : (
+                        <Volume2 className="size-4 shrink-0" />
+                      )}
+                      <span className="truncate">
+                        {uiLang === 'my' ? 'MP3 အသံသီးသန့်' : 'Audio .MP3'}
+                      </span>
+                    </button>
+                  )}
                 </div>
 
                 <button

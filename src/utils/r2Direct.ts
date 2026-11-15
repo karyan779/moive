@@ -196,3 +196,18 @@ export function buildPublicR2ObjectUrl(
   const cleanKey = objectKey.replace(/^\/+/, '');
   return `${cleanBase}/${cleanKey}`;
 }
+
+export function formatUploadMbProgress(loadedBytes: number, totalBytes: number): string {
+  const safeTotal = Math.max(1, Number(totalBytes) || 0);
+  const safeLoaded = Math.max(0, Math.min(safeTotal, Number(loadedBytes) || 0));
+  const mb = 1024 * 1024;
+  return `${(safeLoaded / mb).toFixed(1)} / ${(safeTotal / mb).toFixed(1)} MB`;
+}
+
+export function shouldAbortStalledUpload(
+  elapsedSinceProgressMs: number,
+  stallTimeoutMs = 20_000
+): boolean {
+  return Number.isFinite(elapsedSinceProgressMs) && elapsedSinceProgressMs >= stallTimeoutMs;
+}
+

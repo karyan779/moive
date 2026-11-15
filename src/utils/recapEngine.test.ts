@@ -27,7 +27,33 @@ import {
   buildPaymentNoticeKey,
   shouldShowPaymentNotificationBanner,
   isValidMp4BufferHeader,
-  sanitizeMp4DownloadName
+  sanitizeMp4DownloadName,
+  isTransientPollHttpStatus,
+  computeNextPollDelayMs,
+  shouldSkipWorkersAiForPayloadSize,
+  parseWorkersAiWhisperTimedResult,
+  formatTimedSttSegments,
+  normalizeRecapTimelineCues,
+  groupCuesIntoTimedBlocks,
+  isTransientModelOverloadError,
+  resolveFallbackScriptModels,
+  extractReadableGeminiErrorDetail,
+  normalizeDialogueSubtitleCues,
+  parseTimedSttTranscriptToCues,
+  buildCinematicTranslateSystemPrompt,
+  extractJobIdFromVideoUrl,
+  MAX_SAFE_BLOB_DOWNLOAD_BYTES,
+  shouldUseBlobDownloadForSize,
+  buildDownloadVideoApiPath,
+  resolveEffectiveVideoDurationSec,
+  shouldSyncCompanionAudioTime,
+  RANGE_DOWNLOAD_PROBE_BYTES,
+  RANGE_DOWNLOAD_CHUNK_BYTES,
+  parseContentRangeTotalBytes,
+  computeRangeDownloadChunks,
+  extractCustomDomainHostname,
+  resolveCustomAuthDomainInfo,
+  isGoogleRedirectUriAuthorizedHtml
 } from './recapEngine.ts';
 
 test('formatDuration formats seconds into M:SS and H:MM:SS', () => {
@@ -616,6 +642,284 @@ test('isValidMp4BufferHeader accepts real MP4 ftyp bytes and rejects HTML/JSON e
   assert.equal(sanitizeMp4DownloadName('action_movie (2026).mp4'), 'action_movie_2026.mp4');
 });
 
+test('polling resilience helpers retry transient Cloudflare/proxy errors with bounded backoff', () => {
+  assert.equal(isTransientPollHttpStatus(502), true);
+  assert.equal(isTransientPollHttpStatus(524), true);
+  assert.equal(isTransientPollHttpStatus(429), true);
+  assert.equal(isTransientPollHttpStatus(404), false);
+  assert.equal(isTransientPollHttpStatus(200), false);
 
+  assert.equal(computeNextPollDelayMs(0), 1200);
+  assert.equal(computeNextPollDelayMs(1), 2000);
+  assert.equal(computeNextPollDelayMs(10), 4000);
+
+  assert.equal(shouldSkipWorkersAiForPayloadSize(100), true);
+  assert.equal(shouldSkipWorkersAiForPayloadSize(1_100_000), false);
+  assert.equal(shouldSkipWorkersAiForPayloadSize(4_000_000), true);
+});
+
+test('3+ minute timeline sync helpers format timed STT, normalize cues, group 15s blocks, and avoid drift', () => {
+  const timed = parseWorkersAiWhisperTimedResult({
+    result: {
+      text: 'Hello Wait stop',
+      segments: [
+        { start: 0, end: 4, text: 'First scene line' },
+        { start: 92, end: 97, text: 'Midpoint plot twist' },
+        { start: 175, end: 181, text: 'Ending confrontation' }
+      ]
+    }
+  });
+  assert.ok(timed.includes('[00:00 - 00:04] First scene line'));
+  assert.ok(timed.includes('[01:32 - 01:37] Midpoint plot twist'));
+  assert.ok(timed.includes('[02:55 - 03:01] Ending confrontation'));
+
+  // Downsampling caps >120 segments cleanly while keeping timeline endpoints
+  const manySegs = Array.from({ length: 200 }, (_, i) => ({
+    start: i * 2,
+    end: i * 2 + 1.5,
+    text: `Seg ${i}`
+  }));
+  const sampled = formatTimedSttSegments(manySegs, '', 50);
+  assert.equal(sampled.split('\n').length, 50);
+  assert.ok(sampled.includes('Seg 0'));
+  assert.ok(sampled.includes('Seg 199'));
+
+  // Compressed or bunched 3-min cues get rescaled proportionally across 181s
+  const compressed = Array.from({ length: 12 }, (_, i) => ({
+    id: `c-${i + 1}`,
+    start_ms: i * 5000,
+    end_ms: i * 5000 + 4000,
+    text: `ဇာတ်ဝင်ခန်း အမှတ် ${i + 1} အဖြစ်အပျက်`
+  }));
+  const normalized = normalizeRecapTimelineCues(compressed, 181);
+  assert.equal(normalized.length, 12);
+  assert.ok(normalized[normalized.length - 1].end_ms > 150_000);
+  assert.ok(normalized[normalized.length - 1].end_ms <= 181_000);
+  for (let i = 1; i < normalized.length; i++) {
+    assert.ok(normalized[i].start_ms >= normalized[i - 1].end_ms + 80);
+  }
+
+  // Group 181s cues into ~15s scene blocks
+  const evenCues = Array.from({ length: 45 }, (_, i) => ({
+    id: `e-${i + 1}`,
+    start_ms: i * 4000,
+    end_ms: i * 4000 + 3600,
+    text: `စာတန်း ${i + 1}`
+  }));
+  const blocks = groupCuesIntoTimedBlocks(evenCues, 15000);
+  assert.ok(blocks.length >= 10 && blocks.length <= 15);
+  assert.ok(blocks[blocks.length - 1].endMs <= 180_000);
+
+  // alignCuesWithAudioSync on 181s prevents 4s-8s dead-air gap explosion and fits within duration
+  const longSchedule = alignCuesWithAudioSync(
+    evenCues,
+    evenCues.map(() => 3400),
+    100,
+    true,
+    181_000,
+    360
+  );
+  assert.equal(longSchedule.length, evenCues.length);
+  assert.ok(longSchedule[longSchedule.length - 1].cue.end_ms <= 181_000);
+  for (let i = 1; i < longSchedule.length; i++) {
+    const gap = longSchedule[i].cue.start_ms - longSchedule[i - 1].cue.end_ms;
+    assert.ok(gap >= 100 && gap <= 700, `Unexpected gap ${gap}ms at cue ${i}`);
+  }
+});
+
+test('503 high-demand model spikes trigger fallback models instead of 24h key cooldown or raw JSON errors', () => {
+  const spikeErr = new Error(
+    '{"error":{"code":503,"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.","status":"UNAVAILABLE"}}'
+  );
+
+  // 1) 503 spike is classified as transient model overload, NOT a 24h API key quota limit
+  assert.equal(isTransientModelOverloadError(spikeErr), true);
+  const keyCheck = isApiKeyQuotaOrLimitError(spikeErr);
+  assert.equal(keyCheck.shouldRotate, false);
+  assert.equal(keyCheck.isQuotaLimit, false);
+  assert.equal(keyCheck.cooldownMs, 0);
+
+  // 2) 429 quota error is NOT transient overload; still triggers 24h key cooldown
+  const quotaErr = new Error('{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}');
+  assert.equal(isTransientModelOverloadError(quotaErr), false);
+  assert.equal(isApiKeyQuotaOrLimitError(quotaErr).shouldRotate, true);
+
+  // 3) Model fallback resolution automatically backs up preview models with gemini-2.5-flash
+  assert.deepEqual(resolveFallbackScriptModels('gemini-3-flash-preview'), [
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash'
+  ]);
+  assert.deepEqual(resolveFallbackScriptModels('gemini-3.1-pro-preview'), [
+    'gemini-3.1-pro-preview',
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash'
+  ]);
+  assert.deepEqual(resolveFallbackScriptModels('gemini-2.5-flash'), [
+    'gemini-2.5-flash',
+    'gemini-3-flash-preview'
+  ]);
+
+  // 4) Error message formatter returns clean Burmese/English guidance with NO truncated JSON braces
+  const uiErr = detectGeminiFailureMessage(spikeErr.message, true, false);
+  assert.equal(uiErr.code, 'overloaded');
+  assert.ok(uiErr.messageMy.includes('503'));
+  assert.ok(!uiErr.messageMy.includes('{"error"'));
+  assert.ok(!uiErr.messageEn.includes('{"error"'));
+
+  // 5) extractReadableGeminiErrorDetail cleans arbitrary SDK JSON payloads
+  const cleaned = extractReadableGeminiErrorDetail(
+    'ApiError: {"error":{"code":500,"message":"Internal upstream failure occurred."}}'
+  );
+  assert.equal(cleaned, '500: Internal upstream failure occurred.');
+});
+
+test('Translate & STT dialogue helpers preserve silent gaps, parse Whisper lines, enforce cinematic prompts, and match export jobIds', () => {
+  // 1) Dialogue cue normalizer must preserve silent gaps (never stretch 0-12s dialogue over a 60s silent outro)
+  const sparseDialogue = [
+    { id: 'c1', start_ms: 1200, end_ms: 3600, text: 'မင်း ဘာလို့ ဒီကိုရောက်နေတာလဲ။' },
+    { id: 'c2', start_ms: 14500, end_ms: 17200, text: 'ငါ မင်းကို ရှာနေတာ ကြာပြီ။' }
+  ];
+  const normalized = normalizeDialogueSubtitleCues(sparseDialogue, 60);
+  assert.equal(normalized.length, 2);
+  assert.equal(normalized[0].start_ms, 1200);
+  assert.equal(normalized[0].end_ms, 3600);
+  assert.equal(normalized[1].start_ms, 14500);
+  assert.equal(normalized[1].end_ms, 17200);
+
+  // 2) parseTimedSttTranscriptToCues parses timed Whisper lines cleanly
+  const whisperText = `[00:02 - 00:05] Where have you been all night?\n[00:06 - 00:09] I was looking for you everywhere.`;
+  const parsedStt = parseTimedSttTranscriptToCues(whisperText, 20);
+  assert.equal(parsedStt.length, 2);
+  assert.equal(parsedStt[0].start_ms, 2000);
+  assert.equal(parsedStt[0].end_ms, 5000);
+  assert.equal(parsedStt[0].text, 'Where have you been all night?');
+
+  // 3) Cinematic translate prompt enforces first/second-person movie subtitles and bans recap narration
+  const dubPrompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'dub'
+  });
+  assert.ok(dubPrompt.includes('Movie Dialogue Translator'));
+  assert.ok(dubPrompt.includes('NOT A MOVIE RECAP'));
+
+  const verbatimSttPrompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'captions-only',
+    sttMode: 'transcribe',
+    speakerDiarization: true
+  });
+  assert.ok(verbatimSttPrompt.includes('VERBATIM'));
+  assert.ok(verbatimSttPrompt.includes('Speaker'));
+
+  // 4) extractJobIdFromVideoUrl recovers jobId from preview, recap, AND exported MP4 URLs
+  assert.equal(extractJobIdFromVideoUrl('/api/recap/video/job_1700_abc_preview.mp4'), 'job_1700_abc');
+  assert.equal(extractJobIdFromVideoUrl('/api/recap/video/job_1700_abc_recap.mp4'), 'job_1700_abc');
+  assert.equal(extractJobIdFromVideoUrl('/api/recap/video/job_1700_abc_export_9f8e7d6c5b.mp4'), 'job_1700_abc');
+  assert.equal(extractJobIdFromVideoUrl('blob:https://example.com/123'), null);
+
+  // 5) StreamWaveAI download path builder & mobile-safe Blob RAM threshold
+  assert.equal(shouldUseBlobDownloadForSize(0), true);
+  assert.equal(shouldUseBlobDownloadForSize(50 * 1024 * 1024), true);
+  assert.equal(shouldUseBlobDownloadForSize(MAX_SAFE_BLOB_DOWNLOAD_BYTES), true);
+  assert.equal(shouldUseBlobDownloadForSize(MAX_SAFE_BLOB_DOWNLOAD_BYTES + 1), false);
+
+  const proDlApi = buildDownloadVideoApiPath(
+    'job_1700_abc',
+    'movie_recap.mp4',
+    '/api/recap/video/job_1700_abc_export_12ab.mp4?t=123',
+    false
+  );
+  assert.equal(
+    proDlApi,
+    '/api/recap/job_1700_abc/download/video?name=movie_recap.mp4&file=job_1700_abc_export_12ab.mp4'
+  );
+
+  const freeDlApi = buildDownloadVideoApiPath(
+    'job_1700_free',
+    '1000101658_free_recap.mp4',
+    '/api/recap/video/job_1700_free_recap.mp4',
+    true
+  );
+  assert.equal(
+    freeDlApi,
+    '/api/recap/job_1700_free/download/video?name=1000101658_free_recap.mp4&file=job_1700_free_recap.mp4&free=1'
+  );
+
+  // 6) resolveEffectiveVideoDurationSec never truncates a 2-minute video to 15s if ffprobe returns 0
+  assert.equal(resolveEffectiveVideoDurationSec(123.667, 15), 123.67);
+  assert.equal(resolveEffectiveVideoDurationSec(0, 124), 124);
+  assert.equal(
+    resolveEffectiveVideoDurationSec(0, 0, [{ id: 'c1', start_ms: 118000, end_ms: 123572, text: 'End' }]),
+    123.57
+  );
+  assert.equal(resolveEffectiveVideoDurationSec(0, 0, []), 15);
+
+  // 7) shouldSyncCompanionAudioTime blocks seek-past-duration thrashing & micro-seeks
+  assert.equal(shouldSyncCompanionAudioTime(21.0, 0.2, 15.05, false, 0.85), false);
+  assert.equal(shouldSyncCompanionAudioTime(21.0, 20.6, 123.67, false, 0.85), false);
+  assert.equal(shouldSyncCompanionAudioTime(21.0, 18.0, 123.67, false, 0.85), true);
+  assert.equal(shouldSyncCompanionAudioTime(21.0, 18.0, 123.67, true, 0.85), false);
+
+  // 8) HTTP 206 Range download chunking splits 48.7MB export into <=8MB chunks under Cloud Run 32MB limit
+  const total48Mb = 48_709_617;
+  assert.equal(
+    parseContentRangeTotalBytes('bytes 0-65535/48709617', '65536', 206),
+    total48Mb
+  );
+  assert.equal(parseContentRangeTotalBytes(null, '12000000', 200), 12_000_000);
+  assert.equal(parseContentRangeTotalBytes(null, '65536', 206), 0);
+
+  const rangeChunks = computeRangeDownloadChunks(total48Mb, RANGE_DOWNLOAD_PROBE_BYTES);
+  assert.equal(rangeChunks.length, 6);
+  assert.equal(rangeChunks[0].start, 65536);
+  assert.equal(rangeChunks[rangeChunks.length - 1].end, total48Mb - 1);
+
+  let coveredBytes = RANGE_DOWNLOAD_PROBE_BYTES;
+  for (let i = 0; i < rangeChunks.length; i++) {
+    const c = rangeChunks[i];
+    const span = c.end - c.start + 1;
+    assert.ok(span > 0 && span <= RANGE_DOWNLOAD_CHUNK_BYTES);
+    if (i > 0) {
+      assert.equal(c.start, rangeChunks[i - 1].end + 1);
+    }
+    coveredBytes += span;
+  }
+  assert.equal(coveredBytes, total48Mb);
+
+  // 9) Custom domain authDomain resolution for ttakb.site vs built-in Cloud Run / Firebase domains
+  assert.equal(extractCustomDomainHostname('ttakb.site'), 'ttakb.site');
+  assert.equal(extractCustomDomainHostname('https://ttakb.site/admin'), 'ttakb.site');
+  assert.equal(extractCustomDomainHostname('www.ttakb.site:443'), 'www.ttakb.site');
+  assert.equal(extractCustomDomainHostname('localhost:3000'), null);
+  assert.equal(extractCustomDomainHostname('127.0.0.1'), null);
+  assert.equal(
+    extractCustomDomainHostname('ais-dev-iwslrdcjvk4m6m3i2tsp6k-944018305379.asia-southeast1.run.app'),
+    null
+  );
+  assert.equal(extractCustomDomainHostname('brilliant-turbine-fdzcr.firebaseapp.com'), null);
+
+  const domainInfo = resolveCustomAuthDomainInfo({
+    windowHost: 'localhost',
+    appUrl: 'https://ttakb.site/admin',
+    defaultAuthDomain: 'brilliant-turbine-fdzcr.firebaseapp.com',
+    projectId: 'brilliant-turbine-fdzcr'
+  });
+  assert.equal(domainInfo.customDomain, 'ttakb.site');
+  assert.equal(domainInfo.requiredRedirectUri, 'https://ttakb.site/__/auth/handler');
+  assert.equal(domainInfo.requiredJsOrigin, 'https://ttakb.site');
+
+  assert.equal(
+    isGoogleRedirectUriAuthorizedHtml('<html>Error 400: redirect_uri_mismatch</html>', 400),
+    false
+  );
+  assert.equal(
+    isGoogleRedirectUriAuthorizedHtml('<html>redirect_uri_mismatch</html>', 200),
+    false
+  );
+  assert.equal(
+    isGoogleRedirectUriAuthorizedHtml('<html><title>Sign in - Google Accounts</title></html>', 200),
+    true
+  );
+});
 
 

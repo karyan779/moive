@@ -14,7 +14,9 @@ import {
   buildPublicR2ObjectUrl,
   createUploadUlid,
   getMediaContentType,
-  stripSrtTimestampsToText
+  stripSrtTimestampsToText,
+  formatUploadMbProgress,
+  shouldAbortStalledUpload
 } from './r2Direct.ts';
 
 test('isValidR2Config and maskR2Secret validate and safely mask R2 credentials', () => {
@@ -97,4 +99,7 @@ test('computeMultipartPlan splits up to 2GB into exact contiguous byte ranges', 
   assert.equal(formatBytesReadable(1536), '1.5 KB');
   assert.equal(formatBytesReadable(104857600), '100.0 MB');
   assert.equal(formatBytesReadable(2 * 1024 * 1024 * 1024), '2.00 GB');
+  assert.equal(formatUploadMbProgress(5 * 1024 * 1024, 20 * 1024 * 1024), '5.0 / 20.0 MB');
+  assert.equal(shouldAbortStalledUpload(19999, 20000), false);
+  assert.equal(shouldAbortStalledUpload(20000, 20000), true);
 });

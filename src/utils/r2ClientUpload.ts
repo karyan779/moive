@@ -3,6 +3,8 @@ import {
   computeMultipartPlan,
   getMediaContentType,
   stripSrtTimestampsToText,
+  formatUploadMbProgress,
+  shouldAbortStalledUpload,
   R2_MAX_UPLOAD_BYTES
 } from './r2Direct';
 
@@ -63,12 +65,15 @@ export async function fetchR2PublicStatus(): Promise<R2PublicStatus> {
   };
 }
 
+const R2_STALL_TIMEOUT_MS = 20000; // Abort R2 direct PUT if zero bytes transfer for 20s and fall back cleanly
+
 function xhrUploadBinary(
   url: string,
   method: 'PUT' | 'POST',
   body: Blob | File,
   headers: Record<string, string>,
-  onLoadedBytes?: (loaded: number) => void
+  onLoadedBytes?: (loaded: number) => void,
+  stallTimeoutMs = 0
 ): Promise<{ status: number; responseText: string; etag?: string }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -79,12 +84,38 @@ function xhrUploadBinary(
         xhr.setRequestHeader(k, v);
       }
     }
+
+    let lastLoaded = 0;
+    let lastProgressAt = Date.now();
+    let settled = false;
+    let stallTimer: ReturnType<typeof setInterval> | null = null;
+    if (stallTimeoutMs > 0) {
+      stallTimer = setInterval(() => {
+        if (!settled && shouldAbortStalledUpload(Date.now() - lastProgressAt, stallTimeoutMs)) {
+          settled = true;
+          if (stallTimer) clearInterval(stallTimer);
+          xhr.abort();
+          reject(new Error('Direct cloud upload stalled — switching to direct stream'));
+        }
+      }, 3000);
+    }
+
+    const cleanup = () => {
+      settled = true;
+      if (stallTimer) clearInterval(stallTimer);
+    };
+
     xhr.upload.onprogress = (ev) => {
+      if (ev.loaded > lastLoaded) {
+        lastLoaded = ev.loaded;
+        lastProgressAt = Date.now();
+      }
       if (ev.lengthComputable && onLoadedBytes) {
         onLoadedBytes(ev.loaded);
       }
     };
     xhr.onload = () => {
+      cleanup();
       const etag = xhr.getResponseHeader('ETag') || xhr.getResponseHeader('etag') || undefined;
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve({ status: xhr.status, responseText: xhr.responseText || '', etag });
@@ -92,14 +123,25 @@ function xhrUploadBinary(
         reject(new Error(`Upload failed (${xhr.status}): ${xhr.responseText?.slice(0, 140) || xhr.statusText}`));
       }
     };
-    xhr.onerror = () => reject(new Error('Network error during direct upload (check R2 CORS)'));
-    xhr.ontimeout = () => reject(new Error('Direct upload timed out'));
-    xhr.onabort = () => reject(new Error('Upload aborted'));
+    xhr.onerror = () => {
+      cleanup();
+      reject(new Error('Network error during direct upload (check R2 CORS)'));
+    };
+    xhr.ontimeout = () => {
+      cleanup();
+      reject(new Error('Direct upload timed out'));
+    };
+    xhr.onabort = () => {
+      if (!settled) {
+        cleanup();
+        reject(new Error('Upload aborted'));
+      }
+    };
     xhr.send(body);
   });
 }
 
-const LOCAL_STREAM_CHUNK_BYTES = 16 * 1024 * 1024; // 16MB per chunk (well below Cloud Run's 32MB request cap)
+const LOCAL_STREAM_CHUNK_BYTES = 6 * 1024 * 1024; // 6MB per chunk (fast and safe under Cloudflare 100s timeout on slow mobile/VPN)
 
 async function uploadToLocalDirectStream(
   file: File,
@@ -115,7 +157,7 @@ async function uploadToLocalDirectStream(
       (loaded) => {
         if (onProgress && totalBytes > 0) {
           const pct = Math.min(100, Math.round((loaded / totalBytes) * 100));
-          onProgress(pct, `Uploading video ${pct}%…`);
+          onProgress(pct, `Uploading video ${pct}% (${formatUploadMbProgress(loaded, totalBytes)})…`);
         }
       }
     );
@@ -133,7 +175,7 @@ async function uploadToLocalDirectStream(
     };
   }
 
-  // Multi-chunk 16MB streaming upload for large 8+ minute videos (>16MB)
+  // Multi-chunk streaming upload for larger videos
   let localUploadId = '';
   let offset = 0;
   let chunkIndex = 0;
@@ -155,8 +197,12 @@ async function uploadToLocalDirectStream(
       { 'Content-Type': 'application/octet-stream' },
       (loaded) => {
         if (onProgress && totalBytes > 0) {
-          const pct = Math.min(100, Math.round(((currentOffset + loaded) / totalBytes) * 100));
-          onProgress(pct, `Uploading video (${chunkIndex + 1}/${totalChunks}) · ${pct}%…`);
+          const sent = currentOffset + loaded;
+          const pct = Math.min(100, Math.round((sent / totalBytes) * 100));
+          onProgress(
+            pct,
+            `Uploading video (${chunkIndex + 1}/${totalChunks}) · ${pct}% (${formatUploadMbProgress(sent, totalBytes)})…`
+          );
         }
       }
     );
@@ -249,9 +295,13 @@ export async function uploadVideoDirect(
         (loaded) => {
           if (onProgress && file.size > 0) {
             const pct = Math.min(100, Math.round((loaded / file.size) * 100));
-            onProgress(pct, `Uploading to High-Speed Cloud (${pct}%)…`);
+            onProgress(
+              pct,
+              `Uploading to High-Speed Cloud (${pct}% · ${formatUploadMbProgress(loaded, file.size)})…`
+            );
           }
-        }
+        },
+        R2_STALL_TIMEOUT_MS
       );
 
       onProgress?.(100, '✓ Uploaded to High-Speed Cloud!');
@@ -325,9 +375,10 @@ export async function uploadVideoDirect(
           const pct = Math.min(99, Math.round((totalLoaded / file.size) * 100));
           onProgress?.(
             pct,
-            `Uploading Cloud Part (${part.partNumber}/${plan.totalParts}) · ${pct}%…`
+            `Uploading Cloud Part (${part.partNumber}/${plan.totalParts}) · ${pct}% (${formatUploadMbProgress(totalLoaded, file.size)})…`
           );
-        }
+        },
+        R2_STALL_TIMEOUT_MS
       );
 
       uploadedBytesCompleted += part.sizeBytes;

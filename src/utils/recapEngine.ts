@@ -179,6 +179,7 @@ export interface RecapJobRecord {
   durationSec: number;
   resolution: '720p' | '1080p';
   mode: RecapMode;
+  translateAudio?: TranslateAudioMode;
   scriptStyle: ScriptStyleId;
   targetLanguage: TargetLanguageCode;
   voiceGender: VoiceGender;
@@ -226,14 +227,13 @@ export const SCRIPT_STYLE_PROMPTS: Record<ScriptStyleId, ScriptStylePromptDefini
     descriptionMy: 'ကြည့်ရှုသူကို ၃ စက္ကန့်အတွင်း ဆွဲဆောင်နိုင်မယ့် သွက်လက်တိကျသော ၁ ကြောင်းစာ စာတန်းထိုးနှင့် ပြောဟန်။',
     pacingWpm: 150,
     systemPrompt: `You are TTAK MOVIE RECAP's Senior Burmese Movie Recap Narrator ("Fast Recap / narrator" preset).
-TASK: Transform the input video's audio speech and visual scenes into a high-retention, CONTINUOUS movie recap script with SHORT 1-LINE PHRASES that keep the narrator speaking smoothly across the ENTIRE video duration.
+TASK: Transform the input video's timestamped dialogue and visual/audio events into a high-retention, scene-locked movie recap script with SHORT 1-LINE PHRASES synced accurately from the opening second to the final scene.
 CRITICAL PACING, SYNC & CAPTION RULES:
-1. SHORT 1-LINE PHRASES ONLY: Each cue.text MUST be a natural spoken Burmese phrase of 5 to 9 words (28 to 48 Burmese characters, ~2.2s–2.8s when spoken). Never output huge multi-line paragraphs in one cue.
-2. FULL TIMELINE CONTINUITY (85%–95% COVERAGE): Cover the ENTIRE video from 0ms to the end continuously! Leave ONLY 100ms–250ms natural breath gaps between cues. NEVER leave 2s–5s dead-air gaps in the middle or second half of the video.
-3. SCENE-MATCHED TIMING: Anchor each cue's start_ms and end_ms directly to what is happening on screen in that exact timestamp window (early scenes, mid-video turning points, climax, and ending).
-4. HOOK FIRST (0.0s - 3.0s): Start immediately with the core conflict on screen.
-5. NATURAL SPOKEN BURMESE: Write smooth, conversational Burmese suitable for my-MM-ThihaNeural / my-MM-NilarNeural TTS flow. Do NOT include trailing "။" inside subtitle bars.
-6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+1. SHORT 1-LINE PHRASES ONLY: Every cue.text MUST be a natural spoken Burmese phrase of 5 to 10 words (26 to 52 Burmese characters, ~2.2s–3.2s when spoken). Never write long multi-sentence paragraphs inside a single cue.
+2. STRICT TIMELINE LOCK (NO DRIFT): Match cue timestamps (start_ms, end_ms) directly to the scenes and dialogue happening at that exact time in the video across the ENTIRE duration (opening hook, early setup, midpoint conflict, climax, and ending) with only 100ms–260ms natural breath pauses between cues.
+3. HOOK FIRST (0.0s - 3.5s): Open immediately with the main conflict or gripping question on screen.
+4. NATURAL SPOKEN BURMESE: Write clear, expressive spoken Burmese storytelling (using conversational connectors like "အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "နောက်ဆုံးမှာတော့") tailored for Burmese TTS voiceover. Avoid trailing "။" inside subtitle text.
+5. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   drama: {
     id: 'drama',
@@ -244,10 +244,10 @@ CRITICAL PACING, SYNC & CAPTION RULES:
     descriptionMy: 'ဇာတ်ကောင်တွေရဲ့ စိတ်ခံစားချက်နဲ့ လှည့်ကွက်တွေကို ၁ ကြောင်းစာ စာတန်းထိုးဖြင့် ပြောပြမယ့်ဟန်။',
     pacingWpm: 140,
     systemPrompt: `You are TTAK MOVIE RECAP's Cinematic Storytelling Recap Writer ("Storytelling / drama" preset).
-TASK: Craft an emotionally immersive, CONTINUOUS movie recap script using SHORT 1-LINE PHRASES (28–48 Burmese characters per cue, 2.2s–3.0s each) that narrates every scene from start to finish without long silent gaps.
+TASK: Craft an emotionally gripping, continuous movie recap script using SHORT 1-LINE PHRASES (26–52 Burmese characters per cue, 2.3s–3.3s each) synchronized tightly to every scene from start to finale.
 RULES:
-1. CONTINUOUS NARRATION (85%–95% VIDEO COVERAGE): Keep narration flowing steadily through the beginning, middle, climax, and finale with only 120ms–260ms natural pauses between cues—never leave 2s+ silent gaps halfway through.
-2. SCENE-LOCKED TIMESTAMPS: Match every cue to the visual action and emotional turning point at that exact time.
+1. CONTINUOUS SCENE-LOCKED NARRATION: Keep narration flowing smoothly across the beginning, middle turning points, climax, and ending with 120ms–260ms natural pauses and zero multi-second silent gaps or timing drift.
+2. EMOTIONAL DEPTH: Highlight character motives, betrayals, tension, and plot twists in vivid spoken Burmese synced to when they occur on screen.
 3. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   casual: {
@@ -259,9 +259,9 @@ RULES:
     descriptionMy: 'TikTok နဲ့ Reels အတွက် အထူးသင့်တော်တဲ့ လူငယ်ဆန်ဆန် ၁ ကြောင်းစာ စာတန်းထိုး ပြောဟန်။',
     pacingWpm: 158,
     systemPrompt: `You are TTAK MOVIE RECAP's Viral Gen-Z Short-Form Creator ("Gen Z / casual" preset).
-TASK: Write a punchy, energetic, continuous short-form recap script for TikTok/Reels with SHORT 1-LINE PHRASES (28–46 Burmese characters per cue, 2.0s–2.6s each).
+TASK: Write a punchy, energetic, continuous movie recap script for TikTok/Reels with SHORT 1-LINE PHRASES (26–50 Burmese characters per cue, 2.0s–2.9s each).
 RULES:
-1. ZERO DEAD AIR: Maintain lively continuous commentary across 90%+ of the video timeline from 0ms to end with tight 100ms–200ms pauses between cues.
+1. ZERO DEAD AIR & SCENE-SYNCED: Maintain lively commentary synchronized to every visual beat from 0ms to end with tight 100ms–220ms pauses between cues.
 2. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   news: {
@@ -273,7 +273,7 @@ RULES:
     descriptionMy: 'သတင်းကြေညာသူတစ်ဦးလို တိကျရှင်းလင်းသော ၁ ကြောင်းစာ စာတန်းထိုး တင်ဆက်ဟန်။',
     pacingWpm: 145,
     systemPrompt: `You are TTAK MOVIE RECAP's Broadcast News & Fact Recap Anchor ("News / news" preset).
-TASK: Summarize the video's events in a clear, continuous broadcast narration with SHORT 1-LINE PHRASES (28–48 Burmese characters per cue, 2.2s–2.8s each) covering 85%–95% of the video duration with only 120ms–250ms pauses.
+TASK: Summarize the video's events in a clear, continuous broadcast narration with SHORT 1-LINE PHRASES (28–52 Burmese characters per cue, 2.2s–3.1s each) synced accurately to the timeline from start to finish with 120ms–250ms pauses.
 OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   none: {
@@ -285,7 +285,7 @@ OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, 
     descriptionMy: 'မှတ်တမ်းရုပ်ရှင်တစ်ခုလို လေးနက်တည်ငြိမ်သော ၁ ကြောင်းစာ စာတန်းထိုး ရှင်းပြဟန်။',
     pacingWpm: 135,
     systemPrompt: `You are TTAK MOVIE RECAP's Documentary Narrator ("Documentary / none" preset).
-TASK: Write an insightful, continuous documentary narration with SHORT 1-LINE PHRASES (28–48 Burmese characters per cue, 2.3s–3.0s each) covering 85%–95% of the full video duration without multi-second silent gaps.
+TASK: Write an insightful, continuous documentary narration with SHORT 1-LINE PHRASES (28–52 Burmese characters per cue, 2.3s–3.2s each) locked to every scene from start to finish without multi-second silent gaps.
 OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   }
 };
@@ -612,6 +612,66 @@ export function parseWorkersAiWhisperResult(payload: unknown): string {
   return '';
 }
 
+function formatSecBadge(sec: number): string {
+  const safe = Math.max(0, Math.round(sec));
+  const mins = Math.floor(safe / 60);
+  const rem = safe % 60;
+  return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
+export function formatTimedSttSegments(
+  segments: Array<{ start?: unknown; end?: unknown; text?: unknown }> | undefined | null,
+  fallbackPlainText = '',
+  maxSegments = 120
+): string {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return fallbackPlainText.trim();
+  }
+  const clean = segments
+    .map((s) => {
+      const start = Number(s?.start);
+      const end = Number(s?.end);
+      const text = typeof s?.text === 'string' ? s.text.trim() : '';
+      if (!text) return null;
+      return {
+        start: Number.isFinite(start) ? Math.max(0, start) : 0,
+        end: Number.isFinite(end) ? Math.max(Number.isFinite(start) ? start : 0, end) : 0,
+        text
+      };
+    })
+    .filter((s): s is { start: number; end: number; text: string } => s !== null);
+
+  if (clean.length === 0) {
+    return fallbackPlainText.trim();
+  }
+
+  let sampled = clean;
+  if (clean.length > maxSegments) {
+    sampled = [];
+    for (let i = 0; i < maxSegments; i++) {
+      const idx = Math.min(clean.length - 1, Math.floor((i * (clean.length - 1)) / (maxSegments - 1)));
+      if (!sampled.length || sampled[sampled.length - 1] !== clean[idx]) {
+        sampled.push(clean[idx]);
+      }
+    }
+  }
+
+  return sampled
+    .map((s) => `[${formatSecBadge(s.start)} - ${formatSecBadge(Math.max(s.start + 1, s.end))}] ${s.text}`)
+    .join('\n');
+}
+
+export function parseWorkersAiWhisperTimedResult(payload: unknown): string {
+  const plain = parseWorkersAiWhisperResult(payload);
+  if (!payload || typeof payload !== 'object') return plain;
+  const data = payload as {
+    result?: {
+      segments?: Array<{ start?: unknown; end?: unknown; text?: unknown }>;
+    };
+  };
+  return formatTimedSttSegments(data.result?.segments, plain);
+}
+
 export type SttProviderOrder = ('user_groq' | 'workers_ai' | 'groq_pool')[];
 
 /**
@@ -716,19 +776,22 @@ export function alignCuesWithAudioSync(
   maxGapMs = 360
 ): SyncedCueScheduleItem[] {
   const safePause = Math.max(80, Math.min(120, Math.round(breathPauseMs || 100)));
+  const isLongTimeline = Boolean(totalDurationMs && totalDurationMs > 120_000);
   const totalRawSpokenMs = cues.reduce(
     (sum, c, idx) =>
       sum + Math.max(320, Math.round(spokenDurationsMs[idx] || c.end_ms - c.start_ms || 1500)),
     0
   );
   const dynamicNeededGap =
+    isLongTimeline &&
     totalDurationMs &&
-    totalDurationMs > 120_000 &&
     cues.length > 1 &&
     totalDurationMs > totalRawSpokenMs
       ? Math.round(((totalDurationMs - totalRawSpokenMs) / cues.length) * 1.15)
       : 0;
-  const safeMaxGap = Math.max(safePause, Math.round(maxGapMs || 360), dynamicNeededGap);
+  // On 3+ min timelines, cap gap inflation so we never inject 4s-8s dead-air holes or push cues off their scene
+  const cappedDynamicGap = isLongTimeline ? Math.min(680, dynamicNeededGap) : dynamicNeededGap;
+  const safeMaxGap = Math.max(safePause, Math.round(maxGapMs || 360), cappedDynamicGap);
   const schedule: SyncedCueScheduleItem[] = [];
   let audioCursorMs = 60;
 
@@ -744,20 +807,36 @@ export function alignCuesWithAudioSync(
         alignedStartMs = prevEndMs + safeMaxGap;
       }
     }
+    if (totalDurationMs && totalDurationMs > 1200) {
+      const minReserveMs = Math.max(350, (cues.length - 1 - i) * 380);
+      const maxAllowedStartMs = Math.max(60, totalDurationMs - 100 - minReserveMs);
+      if (alignedStartMs > maxAllowedStartMs) {
+        alignedStartMs = Math.max(audioCursorMs, Math.min(alignedStartMs, maxAllowedStartMs));
+      }
+    }
 
-    // Method 3: Compute available scene slot before next cue or video end
+    // Method 3: Compute available scene slot before next cue or video end (preventing domino drift past totalDurationMs)
     const hasNext = i + 1 < cues.length;
     const rawNextTargetMs = hasNext
       ? cues[i + 1].start_ms
       : totalDurationMs && totalDurationMs > alignedStartMs + 500
-        ? totalDurationMs - 120
+        ? totalDurationMs - 100
         : Math.max(alignedStartMs + rawSpokenMs, cue.end_ms);
 
     const nextSceneBoundaryMs = hasNext
       ? Math.max(alignedStartMs + 480, rawNextTargetMs - safePause)
       : Math.max(alignedStartMs + 480, rawNextTargetMs);
 
-    const availableSlotMs = Math.max(480, nextSceneBoundaryMs - alignedStartMs);
+    let availableSlotMs = Math.max(480, nextSceneBoundaryMs - alignedStartMs);
+    if (isLongTimeline && totalDurationMs && totalDurationMs > alignedStartMs + 400) {
+      const avgRemainingSlot = Math.max(
+        480,
+        Math.round((totalDurationMs - 100 - alignedStartMs) / Math.max(1, cues.length - i))
+      );
+      if (availableSlotMs > avgRemainingSlot * 1.35) {
+        availableSlotMs = Math.max(480, Math.round(avgRemainingSlot * 1.2));
+      }
+    }
 
     let tempoFactor = 1.0;
     let effectiveSpokenMs = rawSpokenMs;
@@ -767,9 +846,10 @@ export function alignCuesWithAudioSync(
         tempoFactor = Number(Math.min(1.24, Math.max(1.0, rawSpokenMs / availableSlotMs)).toFixed(3));
         effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
       } else if (cues.length > 1 && totalDurationMs && availableSlotMs - rawSpokenMs > safeMaxGap) {
-        // Gently relax cadence (down to 0.86x) so the narrator fills the scene window smoothly instead of leaving dead air
+        // Gently relax cadence so the narrator fills the scene window smoothly instead of leaving dead air
+        const minRelax = isLongTimeline ? 0.90 : 0.86;
         const targetFillMs = Math.max(rawSpokenMs, availableSlotMs - Math.min(safeMaxGap, 240));
-        const relaxedFactor = Math.max(0.86, Math.min(1.0, rawSpokenMs / targetFillMs));
+        const relaxedFactor = Math.max(minRelax, Math.min(1.0, rawSpokenMs / targetFillMs));
         if (relaxedFactor < 0.97) {
           tempoFactor = Number(relaxedFactor.toFixed(3));
           effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
@@ -795,6 +875,257 @@ export function alignCuesWithAudioSync(
   }
 
   return schedule;
+}
+
+/**
+ * Normalizes Gemini-generated cues against the actual video duration so timestamps stay
+ * strictly monotonic, never exceed totalDurationSec, and span the whole timeline evenly.
+ */
+export function normalizeRecapTimelineCues(
+  cues: SubtitleCue[],
+  totalDurationSec: number
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const totalMs = Math.max(4000, Math.round(totalDurationSec * 1000));
+  const clean = cues
+    .map((c, idx) => ({
+      ...c,
+      id: c.id || `cue-${idx + 1}`,
+      text: String(c.text || '').replace(/[။។]/g, ' ').replace(/\s+/g, ' ').trim(),
+      start_ms: Math.max(0, Math.round(Number(c.start_ms) || 0)),
+      end_ms: Math.max(400, Math.round(Number(c.end_ms) || 0))
+    }))
+    .filter((c) => c.text.length > 0);
+
+  if (clean.length === 0) return [];
+
+  const maxCueEnd = Math.max(...clean.map((c) => c.end_ms));
+  const needsRescale =
+    clean.length >= 4 && (maxCueEnd > totalMs * 1.12 || maxCueEnd < totalMs * 0.65);
+
+  const scale = needsRescale && maxCueEnd > 0 ? (totalMs - 140) / maxCueEnd : 1;
+  let cursorMs = 80;
+  const result: SubtitleCue[] = [];
+
+  for (let i = 0; i < clean.length; i++) {
+    const c = clean[i];
+    const scaledStart = Math.round(c.start_ms * scale);
+    const scaledEnd = Math.round(c.end_ms * scale);
+    const rawDur = Math.max(900, scaledEnd - scaledStart);
+
+    const startMs = Math.max(cursorMs, Math.min(totalMs - 450, scaledStart));
+    const remainingCues = clean.length - 1 - i;
+    const maxEndAllowed = Math.max(startMs + 350, totalMs - 100 - remainingCues * 420);
+    const endMs = Math.min(maxEndAllowed, Math.max(startMs + 450, startMs + rawDur));
+
+    result.push({
+      ...c,
+      id: `cue-${i + 1}`,
+      start_ms: startMs,
+      end_ms: endMs
+    });
+    cursorMs = endMs + 90;
+  }
+
+  return result;
+}
+
+/**
+ * Normalizes direct movie dialogue / STT subtitle cues without stretching them across silent
+ * outro/music gaps, preserving exact spoken dialogue timing within 0..totalDurationSec.
+ */
+export function normalizeDialogueSubtitleCues(
+  cues: SubtitleCue[],
+  totalDurationSec: number
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const totalMs = Math.max(4000, Math.round(totalDurationSec * 1000));
+  const clean = cues
+    .map((c, idx) => ({
+      ...c,
+      id: c.id || `cue-${idx + 1}`,
+      text: String(c.text || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim(),
+      start_ms: Math.max(0, Math.round(Number(c.start_ms) || 0)),
+      end_ms: Math.max(350, Math.round(Number(c.end_ms) || 0))
+    }))
+    .filter((c) => c.text.length > 0)
+    .sort((a, b) => a.start_ms - b.start_ms);
+
+  if (clean.length === 0) return [];
+
+  // Only scale down if timestamps significantly overshoot the video length
+  const maxCueEnd = Math.max(...clean.map((c) => c.end_ms));
+  const scale = maxCueEnd > totalMs * 1.1 ? (totalMs - 100) / maxCueEnd : 1;
+
+  let cursorMs = 0;
+  const result: SubtitleCue[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    const c = clean[i];
+    const scaledStart = Math.round(c.start_ms * scale);
+    const scaledEnd = Math.round(c.end_ms * scale);
+    const rawDur = Math.max(450, scaledEnd - scaledStart);
+
+    const startMs = Math.max(cursorMs, Math.min(totalMs - 400, scaledStart));
+    const endMs = Math.min(totalMs, Math.max(startMs + 380, startMs + rawDur));
+
+    result.push({
+      ...c,
+      id: `cue-${i + 1}`,
+      start_ms: startMs,
+      end_ms: endMs
+    });
+    cursorMs = endMs + 40;
+  }
+  return result;
+}
+
+/**
+ * Parses `[MM:SS - MM:SS] text` formatted Whisper STT segments directly into SubtitleCue[]
+ * for verbatim Original Speech STT mode or resilient subtitle fallback.
+ */
+export function parseTimedSttTranscriptToCues(
+  transcript: string,
+  totalDurationSec: number
+): SubtitleCue[] {
+  if (!transcript || typeof transcript !== 'string') return [];
+  const lines = transcript.split(/\r?\n/);
+  const cues: SubtitleCue[] = [];
+  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+
+  const toMs = (a: string, b: string, c?: string) => {
+    if (c !== undefined) {
+      return (Number(a) * 3600 + Number(b) * 60 + Number(c)) * 1000;
+    }
+    return (Number(a) * 60 + Number(b)) * 1000;
+  };
+
+  for (const rawLine of lines) {
+    const m = rawLine.trim().match(lineRegex);
+    if (!m) continue;
+    const startMs = toMs(m[1], m[2], m[3]);
+    const endMs = Math.max(startMs + 500, toMs(m[4], m[5], m[6]));
+    const text = m[7].trim();
+    if (!text) continue;
+    cues.push({
+      id: `stt-${cues.length + 1}`,
+      start_ms: startMs,
+      end_ms: endMs,
+      text
+    });
+  }
+  return normalizeDialogueSubtitleCues(cues, totalDurationSec);
+}
+
+/**
+ * Builds dedicated system instructions for:
+ * - Cinematic Movie Dialogue Translation (`dub` & `captions-only`, or STT + AI Translation)
+ * - Verbatim Original Speech Transcription (`sttMode === 'transcribe'`)
+ * Explicitly forbids third-person Movie Recap storytelling ("အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့").
+ */
+export function buildCinematicTranslateSystemPrompt(opts: {
+  targetLanguage: TargetLanguageCode;
+  translateAudio: 'dub' | 'captions-only';
+  sttMode?: 'transcribe' | 'translate';
+  speakerDiarization?: boolean;
+}): string {
+  const langLabel =
+    opts.targetLanguage === 'my'
+      ? 'Burmese (မြန်မာဘာသာ ရုပ်ရှင်စကားပြောဟန်)'
+      : opts.targetLanguage === 'th'
+        ? 'Thai'
+        : opts.targetLanguage === 'ja'
+          ? 'Japanese'
+          : opts.targetLanguage === 'ko'
+            ? 'Korean'
+            : opts.targetLanguage === 'zh'
+              ? 'Chinese'
+              : 'English';
+
+  if (opts.sttMode === 'transcribe') {
+    const speakerRule = opts.speakerDiarization
+      ? '3. SPEAKER DIARIZATION: Prefix speaker turns concisely like "[Speaker 1] " or "[Speaker 2] " when speakers change.'
+      : '3. CLEAN SINGLE-LINE CAPTIONS: Output clean spoken subtitle lines without extra metadata.';
+    return `You are TTAK MOVIE RECAP's Precision Speech-to-Text (STT) Subtitler.
+TASK: Transcribe EVERY spoken sentence in the audio/video accurately in its ORIGINAL spoken language (DO NOT translate and DO NOT summarize or turn it into a movie recap).
+RULES:
+1. VERBATIM SPOKEN WORDS: Transcribe what the speakers actually say word-for-word cleanly with proper punctuation and exact timing [start_ms, end_ms].
+2. SILENCE & MUSIC GAPS: Only create cues when speech is actually heard; keep silent/music scenes empty.
+${speakerRule}
+4. SHORT READABLE LINES: Keep each cue concise (1 readable subtitle line, 4 to 12 words).
+5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
+  }
+
+  const isCaptionsOnly = opts.translateAudio === 'captions-only';
+  const myanmarStyleGuide =
+    opts.targetLanguage === 'my'
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).`
+      : '';
+  const speakerNote = opts.speakerDiarization
+    ? `\n- SPEAKER TURNS: When multiple characters exchange quick lines inside a cue or change speakers, mark speaker turns cleanly (e.g., "- ဘယ်သွားနေတာလဲ").`
+    : '';
+
+  return `You are TTAK MOVIE RECAP's Senior Cinematic Movie Dialogue Translator (${isCaptionsOnly ? 'Subtitles / Captions-Only Mode' : 'Voice Dubbing Mode'}).
+TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into ${langLabel}, synchronized tightly to the exact moments each line is spoken in the video.
+CRITICAL ANTI-RECAP RULES (MUST OBEY):
+1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate what the characters are saying in first/second person as if they are speaking on screen!
+2. STRICTLY FORBIDDEN RECAP PHRASES: NEVER write third-person movie recap narrator commentary such as "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
+3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the timestamped Whisper transcript and audio speech. Keep silent/music gaps uncaptioned instead of inventing filler narration.${myanmarStyleGuide}${speakerNote}
+4. ${isCaptionsOnly ? 'CRISP MOVIE SUBTITLE LINES: Keep each cue concise (1 clean subtitle line, 4–12 words, 22–54 characters) so viewers read effortlessly while listening to original audio.' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
+5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
+}
+
+export interface TimedCueBlock {
+  startMs: number;
+  endMs: number;
+  cues: SubtitleCue[];
+  combinedText: string;
+}
+
+/**
+ * Groups consecutive cues into ~15s timed scene blocks so multi-minute Pro Gemini TTS
+ * generates audio locked to each 15s scene window instead of drifting over 3+ minutes.
+ */
+export function groupCuesIntoTimedBlocks(
+  cues: SubtitleCue[],
+  targetBlockMs = 15000
+): TimedCueBlock[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const blocks: TimedCueBlock[] = [];
+  let current: SubtitleCue[] = [];
+  let blockStart = cues[0].start_ms;
+
+  for (let i = 0; i < cues.length; i++) {
+    const cue = cues[i];
+    if (
+      current.length > 0 &&
+      (cue.end_ms - blockStart > targetBlockMs || current.length >= 6)
+    ) {
+      const last = current[current.length - 1];
+      blocks.push({
+        startMs: blockStart,
+        endMs: Math.max(blockStart + 600, last.end_ms),
+        cues: current,
+        combinedText: current.map((c) => c.text.trim()).filter(Boolean).join(' ')
+      });
+      current = [cue];
+      blockStart = cue.start_ms;
+    } else {
+      if (current.length === 0) blockStart = cue.start_ms;
+      current.push(cue);
+    }
+  }
+
+  if (current.length > 0) {
+    const last = current[current.length - 1];
+    blocks.push({
+      startMs: blockStart,
+      endMs: Math.max(blockStart + 600, last.end_ms),
+      cues: current,
+      combinedText: current.map((c) => c.text.trim()).filter(Boolean).join(' ')
+    });
+  }
+
+  return blocks;
 }
 
 export const UI_TRANSLATIONS: Record<'my' | 'en', Record<string, string>> = {
@@ -2425,10 +2756,64 @@ export function parseBulkApiKeysInput(rawInput: string, _provider?: ApiProviderT
 }
 
 /**
+ * Determines whether an upstream Gemini/AI error is a transient model/server spike
+ * (HTTP 503 high demand, model overloaded, 502/504 gateway, timeout) rather than an
+ * API key quota exhaustion or invalid key.
+ */
+export function isTransientModelOverloadError(err: unknown): boolean {
+  const rawMsg =
+    err instanceof Error
+      ? `${err.name}: ${err.message}`
+      : typeof err === 'string'
+        ? err
+        : JSON.stringify(err || '');
+  const lower = rawMsg.toLowerCase();
+
+  return (
+    lower.includes('"code":503') ||
+    lower.includes('code": 503') ||
+    lower.includes('status: 503') ||
+    lower.includes(' 503 ') ||
+    lower.includes('(503)') ||
+    lower.includes('high demand') ||
+    lower.includes('spikes in demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('"status":"unavailable"') ||
+    lower.includes('service unavailable') ||
+    lower.includes('"code":502') ||
+    lower.includes('"code":504') ||
+    lower.includes('timed out') ||
+    lower.includes('timeout') ||
+    lower.includes('econnreset') ||
+    lower.includes('etimedout') ||
+    lower.includes('fetch failed')
+  );
+}
+
+/**
+ * Resolves ordered Gemini script model candidates so transient 503 demand spikes on
+ * preview models (like `gemini-3-flash-preview`) automatically fall back to stable models.
+ */
+export function resolveFallbackScriptModels(primaryModel?: string): ScriptAiModelId[] {
+  const clean = (primaryModel || 'gemini-3-flash-preview').trim() as ScriptAiModelId;
+  const presets: Record<string, ScriptAiModelId[]> = {
+    'gemini-3-flash-preview': ['gemini-3-flash-preview', 'gemini-2.5-flash'],
+    'gemini-3.1-pro-preview': ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash'],
+    'gemini-2.5-flash': ['gemini-2.5-flash', 'gemini-3-flash-preview']
+  };
+  if (presets[clean]) {
+    return presets[clean];
+  }
+  const defaults: ScriptAiModelId[] = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+  return [clean, ...defaults.filter((m) => m !== clean)];
+}
+
+/**
  * Inspects an error thrown by Gemini or Groq SDK/HTTP calls to determine if it is a
- * quota / rate-limit error (429 / RESOURCE_EXHAUSTED / rate_limit / overloaded) or an
- * invalid/revoked key error (401 / 403 / API_KEY_INVALID), returning a 24-hour rest duration
+ * quota / rate-limit error (429 / RESOURCE_EXHAUSTED / rate_limit) or an
+ * invalid/revoked key error (401 / API_KEY_INVALID), returning a 24-hour rest duration
  * so the pool immediately switches to the next Admin key and auto-restores after 24 hours.
+ * Transient model 503/high-demand spikes are intentionally NOT treated as 24h key quota failures.
  */
 export function isApiKeyQuotaOrLimitError(err: unknown): {
   shouldRotate: boolean;
@@ -2473,9 +2858,7 @@ export function isApiKeyQuotaOrLimitError(err: unknown): {
     lower.includes('too many requests') ||
     lower.includes('tokens per minute') ||
     lower.includes('requests per minute') ||
-    lower.includes('requests per day') ||
-    lower.includes('overloaded') ||
-    lower.includes('503');
+    lower.includes('requests per day');
 
   if (isQuotaLimit) {
     return {
@@ -2731,13 +3114,41 @@ export function shouldFailInsteadOfWeddingFallback(opts: {
 }
 
 /**
+ * Extracts a concise, readable error string from SDK JSON error payloads so users
+ * never see raw truncated `{"error":{"code":...` fragments.
+ */
+export function extractReadableGeminiErrorDetail(rawReason: string | undefined | null): string {
+  const raw = String(rawReason || '').trim();
+  if (!raw) return 'Timeout / Connection error';
+  const jsonStart = raw.indexOf('{');
+  if (jsonStart >= 0) {
+    try {
+      const parsed = JSON.parse(raw.slice(jsonStart));
+      const innerMsg = parsed?.error?.message || parsed?.message;
+      const innerCode = parsed?.error?.code || parsed?.code;
+      if (typeof innerMsg === 'string' && innerMsg.trim()) {
+        const cleanMsg = innerMsg.trim().slice(0, 110);
+        return innerCode ? `${innerCode}: ${cleanMsg}` : cleanMsg;
+      }
+    } catch {
+      const msgMatch = raw.match(/"message"\s*:\s*"([^"]{4,140})"/i);
+      const codeMatch = raw.match(/"code"\s*:\s*(\d{3})/i);
+      if (msgMatch?.[1]) {
+        return codeMatch?.[1] ? `${codeMatch[1]}: ${msgMatch[1]}` : msgMatch[1];
+      }
+    }
+  }
+  return raw.replace(/\s+/g, ' ').slice(0, 110);
+}
+
+/**
  * Produces a clear, actionable Burmese & English message explaining why Gemini script generation failed.
  */
 export function detectGeminiFailureMessage(
   rawReason: string | undefined | null,
   hasPoolKeys: boolean,
   isFreeMode: boolean
-): { code: 'no_key' | 'quota' | 'invalid_key' | 'error'; messageMy: string; messageEn: string } {
+): { code: 'no_key' | 'quota' | 'invalid_key' | 'overloaded' | 'error'; messageMy: string; messageEn: string } {
   const msg = String(rawReason || '').trim();
   const lower = msg.toLowerCase();
 
@@ -2782,10 +3193,21 @@ export function detectGeminiFailureMessage(
     };
   }
 
+  if (isTransientModelOverloadError(msg)) {
+    return {
+      code: 'overloaded',
+      messageMy:
+        'Google Gemini AI Server လက်ရှိ အသုံးပြုသူ များပြားနေပါသည် (503 High Demand)။ စက္ကန့်အနည်းငယ်စောင့်ပြီး ထပ်မံကြိုးစားကြည့်ပါ။',
+      messageEn:
+        'Gemini AI servers are temporarily experiencing high demand (503). Please wait a few seconds and try again.'
+    };
+  }
+
+  const detail = extractReadableGeminiErrorDetail(msg);
   return {
     code: 'error',
-    messageMy: `AI Script ထုတ်လုပ်မှု မအောင်မြင်ပါ (${msg ? msg.slice(0, 90) : 'Timeout / Connection error'})။ ပြန်လည်ကြိုးစားကြည့်ပါ။`,
-    messageEn: `AI Script generation failed (${msg ? msg.slice(0, 90) : 'Timeout / Connection error'}). Please try again.`
+    messageMy: `AI Script ထုတ်လုပ်မှု မအောင်မြင်ပါ (${detail})။ ပြန်လည်ကြိုးစားကြည့်ပါ။`,
+    messageEn: `AI Script generation failed (${detail}). Please try again.`
   };
 }
 
@@ -2879,7 +3301,271 @@ export function sanitizeMp4DownloadName(rawTitle: string | undefined | null, fal
   return `${base || fallback}.mp4`;
 }
 
+export function isTransientPollHttpStatus(status: number): boolean {
+  return (
+    status === 408 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    (status >= 520 && status <= 524)
+  );
+}
 
+export function computeNextPollDelayMs(consecutiveErrors: number): number {
+  const errs = Math.max(0, Math.floor(consecutiveErrors));
+  if (errs === 0) return 1200;
+  return Math.min(4000, 1500 + errs * 500);
+}
 
+export function shouldSkipWorkersAiForPayloadSize(
+  audioByteLength: number,
+  maxBytes = 3_500_000
+): boolean {
+  return !Number.isFinite(audioByteLength) || audioByteLength < 200 || audioByteLength > maxBytes;
+}
 
+/**
+ * Extracts the server jobId (`job_...`) from `/api/recap/video/job_..._{preview|recap|export_...}.mp4`
+ * so Studio Downloads & History items always locate the server source & re-burn subtitles properly.
+ */
+export function extractJobIdFromVideoUrl(videoUrl: string | undefined | null): string | null {
+  if (!videoUrl || typeof videoUrl !== 'string') return null;
+  const match = videoUrl.match(/\/(job_[a-zA-Z0-9_]+)_(?:recap|preview|export_[a-zA-Z0-9]+)\.mp4/);
+  return match ? match[1] : null;
+}
+
+export const MAX_SAFE_BLOB_DOWNLOAD_BYTES = 180 * 1024 * 1024; // 180 MB mobile-safe RAM threshold
+
+export function shouldUseBlobDownloadForSize(
+  contentLengthBytes: number,
+  maxBlobBytes = MAX_SAFE_BLOB_DOWNLOAD_BYTES
+): boolean {
+  if (!Number.isFinite(contentLengthBytes) || contentLengthBytes <= 0) {
+    return true;
+  }
+  return contentLengthBytes <= maxBlobBytes;
+}
+
+export function buildDownloadVideoApiPath(
+  jobId: string,
+  downloadFilename: string,
+  videoUrl?: string | null,
+  isFreeMode = false
+): string {
+  const safeJob = jobId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const params = new URLSearchParams();
+  if (downloadFilename) params.set('name', downloadFilename);
+  if (videoUrl) {
+    const cleanPath = videoUrl.split('?')[0];
+    const base = cleanPath.split('/').pop() || '';
+    if (base) params.set('file', base);
+  }
+  if (isFreeMode) params.set('free', '1');
+  return `/api/recap/${encodeURIComponent(safeJob)}/download/video?${params.toString()}`;
+}
+
+/**
+ * Resolves the authoritative video duration in seconds from ffprobe output, client metadata, and subtitle cues,
+ * ensuring a failed probe (0) never overwrites a real 2+ minute video with a 15-second fallback.
+ */
+export function resolveEffectiveVideoDurationSec(
+  probedSec?: number | null,
+  clientSec?: number | null,
+  cues?: SubtitleCue[]
+): number {
+  const cueMaxSec =
+    Array.isArray(cues) && cues.length > 0
+      ? Math.max(0, ...cues.map((c) => (Number(c?.end_ms) || 0) / 1000))
+      : 0;
+  const p = Number(probedSec) || 0;
+  const cl = Number(clientSec) || 0;
+  if (Number.isFinite(p) && p > 1) {
+    return Number(Math.max(p, cueMaxSec).toFixed(2));
+  }
+  if (Number.isFinite(cl) && cl > 1) {
+    return Number(Math.max(cl, cueMaxSec).toFixed(2));
+  }
+  if (cueMaxSec > 1) {
+    return Number(cueMaxSec.toFixed(2));
+  }
+  return 15;
+}
+
+/**
+ * Determines whether the companion voiceover <audio> element should seek to match <video> currentTime,
+ * preventing seek-past-duration thrashing and micro-seek audio/video stalls around 0:21.
+ */
+export function shouldSyncCompanionAudioTime(
+  videoTimeSec: number,
+  audioTimeSec: number,
+  audioDurationSec: number,
+  isAudioSeeking = false,
+  maxDriftSec = 0.85
+): boolean {
+  if (isAudioSeeking) return false;
+  if (!Number.isFinite(videoTimeSec) || videoTimeSec < 0) return false;
+  if (
+    Number.isFinite(audioDurationSec) &&
+    audioDurationSec > 0.5 &&
+    videoTimeSec >= audioDurationSec - 0.25
+  ) {
+    return false;
+  }
+  if (!Number.isFinite(audioTimeSec)) return false;
+  return Math.abs(audioTimeSec - videoTimeSec) > maxDriftSec;
+}
+
+export const RANGE_DOWNLOAD_PROBE_BYTES = 65536; // 64 KB initial header & size probe
+export const RANGE_DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MB per 206 Range chunk (< Cloud Run 32MB limit)
+
+/**
+ * Parses total file size in bytes from an HTTP 206 `Content-Range: bytes start-end/total` header,
+ * falling back to `Content-Length` only when the server returned a full `200 OK` response.
+ */
+export function parseContentRangeTotalBytes(
+  contentRangeHeader: string | null | undefined,
+  contentLengthHeader?: string | null | undefined,
+  httpStatus = 206
+): number {
+  if (contentRangeHeader && typeof contentRangeHeader === 'string') {
+    const match = contentRangeHeader.match(/bytes\s+\d+-\d+\/(\d+)/i);
+    if (match && match[1]) {
+      const total = Number(match[1]);
+      if (Number.isFinite(total) && total > 0) return total;
+    }
+  }
+  if (httpStatus === 200 && contentLengthHeader) {
+    const len = Number(contentLengthHeader);
+    if (Number.isFinite(len) && len > 0) return len;
+  }
+  return 0;
+}
+
+/**
+ * Computes contiguous inclusive `[start, end]` HTTP Range byte intervals from `initialOffsetBytes`
+ * through `totalBytes - 1` so multi-minute MP4 exports (>32MB) download reliably in 8MB chunks
+ * without hitting Cloud Run / reverse-proxy single-response size limits.
+ */
+export function computeRangeDownloadChunks(
+  totalBytes: number,
+  initialOffsetBytes: number,
+  chunkSizeBytes = RANGE_DOWNLOAD_CHUNK_BYTES
+): Array<{ start: number; end: number }> {
+  const safeTotal = Math.floor(Number(totalBytes) || 0);
+  const safeStart = Math.max(0, Math.floor(Number(initialOffsetBytes) || 0));
+  const safeChunk = Math.max(65536, Math.floor(Number(chunkSizeBytes) || RANGE_DOWNLOAD_CHUNK_BYTES));
+  if (safeTotal <= 0 || safeStart >= safeTotal) return [];
+
+  const chunks: Array<{ start: number; end: number }> = [];
+  let cursor = safeStart;
+  while (cursor < safeTotal) {
+    const end = Math.min(safeTotal - 1, cursor + safeChunk - 1);
+    chunks.push({ start: cursor, end });
+    cursor = end + 1;
+  }
+  return chunks;
+}
+
+/**
+ * Extracts a clean custom domain hostname (e.g. `ttakb.site`) from a hostname or URL,
+ * returning null for localhost, IPs, or managed cloud/Firebase preview domains.
+ */
+export function extractCustomDomainHostname(
+  rawHostOrUrl: string | null | undefined
+): string | null {
+  if (!rawHostOrUrl || typeof rawHostOrUrl !== 'string') return null;
+  let candidate = rawHostOrUrl.trim().toLowerCase();
+  if (!candidate) return null;
+
+  if (candidate.includes('://')) {
+    try {
+      candidate = new URL(candidate).hostname.toLowerCase();
+    } catch {
+      return null;
+    }
+  } else {
+    candidate = candidate.split('/')[0].split(':')[0].trim();
+  }
+
+  if (!candidate || !candidate.includes('.')) return null;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(candidate)) return null;
+
+  const builtInSuffixes = [
+    '.run.app',
+    '.firebaseapp.com',
+    '.web.app',
+    '.ai.studio',
+    '.usercontent.goog',
+    '.localhost'
+  ];
+  if (
+    candidate === 'localhost' ||
+    builtInSuffixes.some((suffix) => candidate.endsWith(suffix))
+  ) {
+    return null;
+  }
+
+  return /^[a-z0-9.-]+$/.test(candidate) ? candidate : null;
+}
+
+export interface CustomAuthDomainResolution {
+  customDomain: string | null;
+  defaultAuthDomain: string;
+  requiredRedirectUri: string | null;
+  requiredJsOrigin: string | null;
+  gcpCredentialsUrl: string;
+  gcpConsentScreenUrl: string;
+}
+
+export function resolveCustomAuthDomainInfo(opts: {
+  windowHost?: string | null;
+  envAuthDomain?: string | null;
+  appUrl?: string | null;
+  defaultAuthDomain: string;
+  projectId?: string | null;
+  oauthClientId?: string | null;
+}): CustomAuthDomainResolution {
+  const customDomain =
+    extractCustomDomainHostname(opts.envAuthDomain) ||
+    extractCustomDomainHostname(opts.windowHost) ||
+    extractCustomDomainHostname(opts.appUrl) ||
+    null;
+
+  const proj = (opts.projectId || 'brilliant-turbine-fdzcr').trim();
+  const clientId = (
+    opts.oauthClientId ||
+    '631636882768-gveb2b4oirdu0j1g7fc9kle343q9202h.apps.googleusercontent.com'
+  ).trim();
+  return {
+    customDomain,
+    defaultAuthDomain: opts.defaultAuthDomain,
+    requiredRedirectUri: customDomain ? `https://${customDomain}/__/auth/handler` : null,
+    requiredJsOrigin: customDomain ? `https://${customDomain}` : null,
+    gcpCredentialsUrl: `https://console.cloud.google.com/apis/credentials/oauthclient/${encodeURIComponent(clientId)}?project=${encodeURIComponent(proj)}`,
+    gcpConsentScreenUrl: `https://console.cloud.google.com/apis/credentials/consent?project=${encodeURIComponent(proj)}`
+  };
+}
+
+/**
+ * Checks whether Google's OAuth 2.0 authorization endpoint accepted the custom domain's
+ * `https://<domain>/__/auth/handler` redirect_uri without returning `redirect_uri_mismatch`.
+ */
+export function isGoogleRedirectUriAuthorizedHtml(
+  htmlOrText: string | null | undefined,
+  httpStatus: number
+): boolean {
+  if (!Number.isFinite(httpStatus) || httpStatus < 200 || httpStatus >= 400) {
+    return false;
+  }
+  const body = String(htmlOrText || '');
+  if (!body) return false;
+  if (
+    /redirect_uri_mismatch|origin_mismatch|invalid_request|Error\s*400/i.test(body)
+  ) {
+    return false;
+  }
+  return true;
+}
 
