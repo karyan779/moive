@@ -7,6 +7,8 @@ import {
   signOut,
   indexedDBLocalPersistence,
   browserLocalPersistence,
+  browserSessionPersistence,
+  browserPopupRedirectResolver,
   onAuthStateChanged,
   type Auth,
   type User
@@ -22,7 +24,12 @@ const envCustomAuthDomain =
 function createOrGetPersistentAuth(app: FirebaseApp): Auth {
   try {
     return initializeAuth(app, {
-      persistence: [indexedDBLocalPersistence, browserLocalPersistence]
+      persistence: [
+        indexedDBLocalPersistence,
+        browserLocalPersistence,
+        browserSessionPersistence
+      ],
+      popupRedirectResolver: browserPopupRedirectResolver
     });
   } catch {
     return getAuth(app);
@@ -121,17 +128,26 @@ export interface GooglePopupAuthResult {
 export async function signInWithGooglePopup(): Promise<GooglePopupAuthResult> {
   let credential;
   try {
-    credential = await signInWithPopup(activeFirebaseAuth, googleProvider);
+    credential = await signInWithPopup(
+      activeFirebaseAuth,
+      googleProvider,
+      browserPopupRedirectResolver
+    );
   } catch (err: any) {
     const code = String(err?.code || '');
     if (
       activeFirebaseAuth !== firebaseAuth &&
       (code === 'auth/unauthorized-domain' ||
         code === 'auth/invalid-oauth-client-id' ||
-        code === 'auth/internal-error')
+        code === 'auth/internal-error' ||
+        code === 'auth/argument-error')
     ) {
       activeFirebaseAuth = firebaseAuth;
-      credential = await signInWithPopup(firebaseAuth, googleProvider);
+      credential = await signInWithPopup(
+        firebaseAuth,
+        googleProvider,
+        browserPopupRedirectResolver
+      );
     } else {
       throw err;
     }
@@ -148,14 +164,6 @@ export async function signInWithGooglePopup(): Promise<GooglePopupAuthResult> {
 
 function getAllCandidateAuthInstances(): Auth[] {
   const instances = new Set<Auth>([activeFirebaseAuth, firebaseAuth]);
-  if (typeof window !== 'undefined') {
-    const hostCustom = extractCustomDomainHostname(window.location.hostname);
-    if (hostCustom && hostCustom !== firebaseConfig.authDomain) {
-      try {
-        instances.add(getOrCreateCustomDomainAuth(hostCustom));
-      } catch {}
-    }
-  }
   return Array.from(instances);
 }
 
