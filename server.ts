@@ -5651,12 +5651,14 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
   // Handle incoming Telegram Updates (Messages & Button Clicks)
   async function handleTelegramUpdate(update: any) {
     try {
-      // 1. If user sent a message
-      if (update.message) {
-        const chatId = String(update.message.chat?.id);
-        const text = (update.message.text || '').trim();
+      // 1. If user sent a message (or edited message)
+      const incomingMessage = update.message || update.edited_message;
+      if (incomingMessage) {
+        const chatId = String(incomingMessage.chat?.id);
+        const text = (incomingMessage.text || '').trim();
+        const cmd = text.split(/\s+/)[0].split('@')[0].toLowerCase();
 
-        if (text === '/id' || (chatId !== TELEGRAM_ADMIN_CHAT_ID && text === '/start')) {
+        if (cmd === '/id' || (chatId !== TELEGRAM_ADMIN_CHAT_ID && cmd === '/start')) {
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -5668,7 +5670,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (text === '/admin' || text === '/start' || text === '/pending')) {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (cmd === '/admin' || cmd === '/start' || cmd === '/pending')) {
           await sendTelegramAdminDashboard(chatId);
           return;
         }
@@ -5676,7 +5678,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         // Owner API Key Management Commands (Admin Chat ID ONLY)
         if (
           chatId === TELEGRAM_ADMIN_CHAT_ID &&
-          (text === '/keys' || text === '/apikeys' || text === '/keylimit' || text === '/keystats')
+          (cmd === '/keys' || cmd === '/apikeys' || cmd === '/keylimit' || cmd === '/keystats')
         ) {
           await sendTelegramApiKeysReport(chatId);
           return;
@@ -5684,11 +5686,11 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
 
         if (
           chatId === TELEGRAM_ADMIN_CHAT_ID &&
-          (text.startsWith('/addgemini') || text.startsWith('/addgroq'))
+          (cmd === '/addgemini' || cmd === '/addgroq')
         ) {
-          const isGeminiCmd = text.startsWith('/addgemini');
+          const isGeminiCmd = cmd === '/addgemini';
           const provider: ApiProviderType = isGeminiCmd ? 'gemini' : 'groq';
-          const rawBody = text.replace(/^\/add(?:gemini|groq)\s*/i, '').trim();
+          const rawBody = text.replace(/^\/add(?:gemini|groq)(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim();
 
           if (!rawBody) {
             await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -5775,7 +5777,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text === '/resetkeys') {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/resetkeys') {
           const state = loadApiKeyPoolState();
           state.keys = state.keys.map((k) => ({
             ...k,
@@ -5796,8 +5798,8 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text.startsWith('/resetkey ')) {
-          const arg = text.replace(/^\/resetkey\s+/i, '').trim();
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/resetkey') {
+          const arg = text.replace(/^\/resetkey(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim();
           const state = loadApiKeyPoolState();
           const ordered = [
             ...state.keys.filter((k) => k.provider === 'gemini'),
@@ -5837,8 +5839,8 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text.startsWith('/delkey ')) {
-          const arg = text.replace(/^\/delkey\s+/i, '').trim();
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/delkey') {
+          const arg = text.replace(/^\/delkey(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim();
           const state = loadApiKeyPoolState();
           const ordered = [
             ...state.keys.filter((k) => k.provider === 'gemini'),
@@ -5885,28 +5887,28 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (text === '/users' || text === '/stats')) {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (cmd === '/users' || cmd === '/stats')) {
           await sendTelegramUserStatsReport(chatId, 'all');
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (text === '/free' || text === '/freeusage' || text === '/daily')) {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (cmd === '/free' || cmd === '/freeusage' || cmd === '/daily')) {
           await sendTelegramUserStatsReport(chatId, 'free_active');
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text === '/freeusers') {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/freeusers') {
           await sendTelegramUserStatsReport(chatId, 'free');
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text === '/paid') {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/paid') {
           await sendTelegramUserStatsReport(chatId, 'paid');
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text.startsWith('/user')) {
-          const query = text.replace(/^\/user\s*/i, '').trim().toLowerCase();
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/user') {
+          const query = text.replace(/^\/user(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim().toLowerCase();
           if (!query) {
             await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
               method: 'POST',
@@ -5966,7 +5968,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && text === '/help') {
+        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/help') {
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -5992,7 +5994,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           return;
         }
 
-        if (text.startsWith('/approve')) {
+        if (cmd === '/approve') {
           const parts = text.split(/\s+/);
           const query = parts[1];
           if (!query) {
@@ -6297,25 +6299,55 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
     }
   }
 
+  // Optional Webhook Fallback Endpoint (if Telegram webhook is pointed to this server)
+  app.post('/api/telegram/webhook', async (req, res) => {
+    try {
+      await handleTelegramUpdate(req.body);
+      res.status(200).json({ ok: true });
+    } catch (e: any) {
+      res.status(200).json({ ok: false, error: e?.message });
+    }
+  });
+
   // Telegram Long Polling Background Loop
   let lastTelegramUpdateId = 0;
   let isTelegramPollingStarted = false;
 
+  async function clearTelegramWebhookForPolling() {
+    try {
+      await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=false`,
+        { signal: AbortSignal.timeout(10000) }
+      );
+    } catch (e) {
+      console.warn('deleteWebhook warning:', e);
+    }
+  }
+
   function startTelegramBotPolling() {
     if (isTelegramPollingStarted) return;
-    if (process.env.DISABLE_TELEGRAM_POLLING === 'true') {
-      console.log('🤖 Telegram Bot polling disabled on AI Studio preview (active on VPS).');
+    const isAiStudioContainer =
+      fs.existsSync('/app/applet') && process.env.ENABLE_TELEGRAM_POLLING !== 'true';
+    if (process.env.DISABLE_TELEGRAM_POLLING === 'true' || isAiStudioContainer) {
+      console.log('🤖 Telegram Bot polling skipped in AI Studio preview container (active on VPS).');
       return;
     }
     isTelegramPollingStarted = true;
 
     console.log(`🤖 Telegram Bot polling started for @ttakrecap_bot...`);
 
+    const allowedUpdatesParam = encodeURIComponent(
+      JSON.stringify(['message', 'edited_message', 'callback_query'])
+    );
+
     const poll = async () => {
+      // Ensure any conflicting external webhook is removed before long-polling
+      await clearTelegramWebhookForPolling();
+
       while (true) {
         try {
           const res = await fetch(
-            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=10`,
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=10&allowed_updates=${allowedUpdatesParam}`,
             { signal: AbortSignal.timeout(20000) }
           );
           const data = (await res.json()) as any;
@@ -6324,6 +6356,13 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
               lastTelegramUpdateId = Math.max(lastTelegramUpdateId, update.update_id);
               await handleTelegramUpdate(update);
             }
+          } else if (data.error_code === 409) {
+            // If an external webhook was re-attached (409 Conflict), delete it automatically
+            console.warn('⚠️ Telegram getUpdates 409 Conflict detected — clearing webhook...');
+            await clearTelegramWebhookForPolling();
+            await new Promise((r) => setTimeout(r, 2000));
+          } else if (!data.ok) {
+            await new Promise((r) => setTimeout(r, 2000));
           }
         } catch {
           // Wait briefly before retrying polling
