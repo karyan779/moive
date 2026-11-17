@@ -1169,3 +1169,142 @@ test('computeVisualKeyframePlan, parseFfmpegShowinfoPtsTimes, and alignCuesWithA
   );
 });
 
+test('isApiKeyQuotaOrLimitError uses 90s cooldown for temporary RPM/TPM 429 bursts and 24h cooldown for daily quota exhaustion', () => {
+  const transientRpm = isApiKeyQuotaOrLimitError(
+    new Error('429 Too Many Requests: Requests per minute limit exceeded, please retry in 18s')
+  );
+  assert.equal(transientRpm.shouldRotate, true);
+  assert.equal(transientRpm.isQuotaLimit, true);
+  assert.equal(transientRpm.cooldownMs, 90_000);
+
+  const geminiRpmWithResourceExhausted = isApiKeyQuotaOrLimitError(
+    new Error(
+      'ApiError: {"error":{"code":429,"message":"You exceeded your current quota, Quota exceeded for quota metric \'Generate Content API requests per minute\'","status":"RESOURCE_EXHAUSTED"}}'
+    )
+  );
+  assert.equal(geminiRpmWithResourceExhausted.shouldRotate, true);
+  assert.equal(geminiRpmWithResourceExhausted.cooldownMs, 90_000);
+
+  const dailyQuota = isApiKeyQuotaOrLimitError(
+    new Error(
+      'ApiError: {"error":{"code":429,"message":"You exceeded your current quota: GenerateContentRequestsPerDay","status":"RESOURCE_EXHAUSTED"}}'
+    )
+  );
+  assert.equal(dailyQuota.shouldRotate, true);
+  assert.equal(dailyQuota.cooldownMs, OWNER_KEY_LIMIT_COOLDOWN_MS);
+});
+
+import {
+  parseAndNormalizeVideoSourceUrl,
+  buildSafeFetchedVideoFilename
+} from './recapEngine.ts';
+
+test('parseAndNormalizeVideoSourceUrl extracts social links from share text, blocks SSRF hosts, and classifies platforms', () => {
+  const tiktokShort = parseAndNormalizeVideoSourceUrl('Check out this clip https://vt.tiktok.com/ZSptXq56x/!');
+  assert.equal(tiktokShort.valid, true);
+  assert.equal(tiktokShort.platform, 'tiktok');
+  assert.equal(tiktokShort.normalizedUrl, 'https://vt.tiktok.com/ZSptXq56x/');
+
+  const ytShort = parseAndNormalizeVideoSourceUrl('https://youtube.com/shorts/abc123XYZ');
+  assert.equal(ytShort.valid, true);
+  assert.equal(ytShort.platform, 'youtube');
+
+  const fbWatch = parseAndNormalizeVideoSourceUrl('https://fb.watch/xyz987/');
+  assert.equal(fbWatch.valid, true);
+  assert.equal(fbWatch.platform, 'facebook');
+
+  const directMp4 = parseAndNormalizeVideoSourceUrl('https://cdn.example.com/movies/clip_01.mp4?token=1');
+  assert.equal(directMp4.valid, true);
+  assert.equal(directMp4.platform, 'direct');
+
+  // Blocks SSRF/private/invalid URLs cleanly
+  assert.equal(parseAndNormalizeVideoSourceUrl('http://127.0.0.1:3000/secret.mp4').valid, false);
+  assert.equal(parseAndNormalizeVideoSourceUrl('http://169.254.169.254/latest/meta-data').valid, false);
+  assert.equal(parseAndNormalizeVideoSourceUrl('not a valid link').valid, false);
+
+  assert.equal(
+    buildSafeFetchedVideoFilename('#movierecap အပိုင်း (၁)', 'tiktok', 'loc_12345678'),
+    'movierecap.mp4'
+  );
+  assert.equal(
+    buildSafeFetchedVideoFilename('မြန်မာဇာတ်ကား', 'tiktok', 'loc_12345678'),
+    'tiktok_345678.mp4'
+  );
+  assert.equal(
+    buildSafeFetchedVideoFilename('Epic Action Scene 2026', 'youtube', 'loc_12345678'),
+    'Epic_Action_Scene_2026.mp4'
+  );
+});
+
+import {
+  extractRedNoteVideoInfoFromHtml,
+  normalizeRedNoteCanonicalUrl
+} from './recapEngine.ts';
+
+test('RedNote (Xiaohongshu) helpers parse share snippets, normalize domains, and extract watermark-free streams', () => {
+  // 1) Handles Chinese RedNote mobile share text with bare xhslink.com URL and trailing punctuation
+  const shareSnippet = parseAndNormalizeVideoSourceUrl(
+    '68 某博主发布了一篇小红书笔记，快来看吧！ xhslink.com/a/K9xYz123！复制本条信息，打开【小红书】'
+  );
+  assert.equal(shareSnippet.valid, true);
+  assert.equal(shareSnippet.platform, 'rednote');
+  assert.equal(shareSnippet.normalizedUrl, 'https://xhslink.com/a/K9xYz123');
+
+  const fullXhs = parseAndNormalizeVideoSourceUrl(
+    'https://www.xiaohongshu.com/discovery/item/673a1b2c000000001e01a2b3?xsec_token=abc123'
+  );
+  assert.equal(fullXhs.valid, true);
+  assert.equal(fullXhs.platform, 'rednote');
+
+  const rednoteDomain = parseAndNormalizeVideoSourceUrl(
+    'https://www.rednote.com/explore/673a1b2c000000001e01a2b3'
+  );
+  assert.equal(rednoteDomain.valid, true);
+  assert.equal(rednoteDomain.platform, 'rednote');
+  assert.equal(
+    normalizeRedNoteCanonicalUrl(rednoteDomain.normalizedUrl),
+    'https://www.xiaohongshu.com/explore/673a1b2c000000001e01a2b3'
+  );
+
+  // 2) Extracts watermark-free originVideoKey & stream.h264 masterUrl while rejecting watermarked URLs
+  const mockXhsHtml = `
+    <html>
+      <head><meta property="og:title" content="Awesome Movie Clip - 小红书"></head>
+      <body>
+        <script>
+          window.__INITIAL_STATE__={
+            "note":{
+              "title":"Awesome Movie Clip",
+              "duration":45000,
+              "video":{
+                "consumer":{"originVideoKey":"pre_post\\u002F01e7abc123.mp4"},
+                "media":{
+                  "stream":{
+                    "h264":[
+                      {"masterUrl":"http:\\u002F\\u002Fsns-video-bd.xhscdn.com\\u002Fstream\\u002F110\\u002F258\\u002Fclean_hd.mp4?sign=1&amp;watermark=0"},
+                      {"masterUrl":"http:\\u002F\\u002Fsns-video-bd.xhscdn.com\\u002Fstream\\u002Fwm_bad.mp4?watermark=1"}
+                    ]
+                  }
+                }
+              }
+            }
+          };
+        </script>
+      </body>
+    </html>
+  `;
+  const extracted = extractRedNoteVideoInfoFromHtml(mockXhsHtml);
+  assert.equal(extracted.title, 'Awesome Movie Clip');
+  assert.equal(extracted.durationSec, 45);
+  assert.equal(extracted.videoUrls[0], 'https://sns-video-bd.xhscdn.com/pre_post/01e7abc123.mp4');
+  assert.ok(
+    extracted.videoUrls.includes(
+      'https://sns-video-bd.xhscdn.com/stream/110/258/clean_hd.mp4?sign=1&watermark=0'
+    )
+  );
+  assert.equal(
+    extracted.videoUrls.some((u) => u.includes('wm_bad') || u.includes('watermark=1')),
+    false
+  );
+});
+

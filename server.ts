@@ -74,6 +74,10 @@ import {
   isGoogleRedirectUriAuthorizedHtml,
   computeVisualKeyframePlan,
   parseFfmpegShowinfoPtsTimes,
+  parseAndNormalizeVideoSourceUrl,
+  buildSafeFetchedVideoFilename,
+  extractRedNoteVideoInfoFromHtml,
+  normalizeRedNoteCanonicalUrl,
   type AdminApiKeyRecord,
   type AntiCopyrightEffects,
   type ApiProviderType,
@@ -787,32 +791,30 @@ async function synthesizeGeminiProVoiceCuesWavBuffer(
   }
 
   const sampleRate = 24000;
-  const blocks = groupCuesIntoTimedBlocks(cues, 15000);
+  const blocks = groupCuesIntoTimedBlocks(cues, 25000);
   const blockAudio: Array<{ pcm: Buffer; durationMs: number } | null> = new Array(blocks.length).fill(null);
 
-  const concurrency = 3;
-  for (let b = 0; b < blocks.length; b += concurrency) {
-    const slice = blocks.slice(b, b + concurrency);
-    await Promise.all(
-      slice.map(async (block, idx) => {
-        const blockIdx = b + idx;
-        const slotSec = Math.max(2, (block.endMs - block.startMs) / 1000);
-        const res = await synthesizeGeminiProVoiceWavBuffer(
-          ai,
-          block.combinedText,
-          geminiVoiceName,
-          `${jobId}_blk${blockIdx}`,
-          slotSec * 1.08,
-          rethrowOnRotate
-        );
-        if (res && res.wavBuffer.length > 44) {
-          blockAudio[blockIdx] = {
-            pcm: res.wavBuffer.subarray(44),
-            durationMs: res.durationMs
-          };
-        }
-      })
+  // Sequential pacing (concurrency = 1 with 350ms gap) prevents Gemini Pro TTS RPM 429 bursts on a single API key
+  for (let blockIdx = 0; blockIdx < blocks.length; blockIdx++) {
+    const block = blocks[blockIdx];
+    const slotSec = Math.max(2, (block.endMs - block.startMs) / 1000);
+    const res = await synthesizeGeminiProVoiceWavBuffer(
+      ai,
+      block.combinedText,
+      geminiVoiceName,
+      `${jobId}_blk${blockIdx}`,
+      slotSec * 1.08,
+      rethrowOnRotate
     );
+    if (res && res.wavBuffer.length > 44) {
+      blockAudio[blockIdx] = {
+        pcm: res.wavBuffer.subarray(44),
+        durationMs: res.durationMs
+      };
+    }
+    if (blockIdx + 1 < blocks.length) {
+      await new Promise((r) => setTimeout(r, 350));
+    }
   }
 
   if (blockAudio.some((b) => !b)) {
@@ -2519,14 +2521,16 @@ async function executeWithGeminiKeyPool<T>(
         const nextHealthy =
           nextPick.selected && nextPick.selected.id !== selected.id ? nextPick.selected : null;
         console.info(
-          `[Gemini Key Pool] ${selected.label} (${selected.maskedKey}) hit limit (${errInfo.reason}); resting 24h & switching to ${nextHealthy ? nextHealthy.label : 'fallback'}...`
+          `[Gemini Key Pool] ${selected.label} (${selected.maskedKey}) hit limit (${errInfo.reason}); resting ${errInfo.cooldownMs >= 3_600_000 ? '24h' : Math.round(errInfo.cooldownMs / 1000) + 's'} & switching to ${nextHealthy ? nextHealthy.label : 'fallback'}...`
         );
-        void notifyTelegramKeyLimitAndSwitch(
-          updatedFailedKey,
-          nextHealthy,
-          errInfo.reason,
-          updatedFailedKey.cooldownUntil
-        );
+        if (errInfo.cooldownMs >= 3_600_000) {
+          void notifyTelegramKeyLimitAndSwitch(
+            updatedFailedKey,
+            nextHealthy,
+            errInfo.reason,
+            updatedFailedKey.cooldownUntil
+          );
+        }
         continue;
       }
       saveApiKeyPoolState(latest);
@@ -4203,11 +4207,18 @@ async function startServer() {
       const localSrcPath = path.join(JOBS_TEMP_DIR, `${safeLocId}_upload.mp4`);
       if (fs.existsSync(localSrcPath)) {
         try {
-          fs.renameSync(localSrcPath, candidateInputPath);
+          const statSize = fs.statSync(localSrcPath).size;
+          if (statSize > 150 * 1024 * 1024) {
+            fs.renameSync(localSrcPath, candidateInputPath);
+          } else {
+            fs.copyFileSync(localSrcPath, candidateInputPath);
+          }
           inputVideoPath = candidateInputPath;
         } catch {
-          fs.copyFileSync(localSrcPath, candidateInputPath);
-          inputVideoPath = candidateInputPath;
+          try {
+            fs.copyFileSync(localSrcPath, candidateInputPath);
+            inputVideoPath = candidateInputPath;
+          } catch {}
         }
       }
     } else if (videoBase64 && videoBase64.length > 100) {
@@ -5484,6 +5495,701 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
     });
   });
 
+  const URL_FETCH_MAX_BYTES = 260 * 1024 * 1024;
+  const YT_DLP_BIN_DIR = path.join(JOBS_TEMP_DIR, 'bin');
+  const YT_DLP_BIN_PATH = path.join(YT_DLP_BIN_DIR, 'yt-dlp');
+  let ytDlpInstallPromise: Promise<string | null> | null = null;
+
+  async function resolveYtDlpBinaryPath(): Promise<string | null> {
+    try {
+      const { stdout } = await execFileAsync('which', ['yt-dlp'], { timeout: 3000 });
+      if (stdout.trim()) return stdout.trim();
+    } catch {}
+    if (fs.existsSync(YT_DLP_BIN_PATH) && fs.statSync(YT_DLP_BIN_PATH).size > 1_000_000) {
+      return YT_DLP_BIN_PATH;
+    }
+    if (fs.existsSync('/tmp/sw_recap_bin/yt-dlp') && fs.statSync('/tmp/sw_recap_bin/yt-dlp').size > 1_000_000) {
+      return '/tmp/sw_recap_bin/yt-dlp';
+    }
+    if (!ytDlpInstallPromise) {
+      ytDlpInstallPromise = (async () => {
+        try {
+          fs.mkdirSync(YT_DLP_BIN_DIR, { recursive: true });
+          const dlUrl =
+            process.arch === 'arm64'
+              ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64'
+              : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+          const resp = await fetch(dlUrl, {
+            headers: { 'User-Agent': 'TTAK-Movie-Recap/1.0' },
+            signal: AbortSignal.timeout(35_000)
+          });
+          if (!resp.ok || !resp.body) return null;
+          const tmpBin = `${YT_DLP_BIN_PATH}.tmp`;
+          await pipeline(Readable.fromWeb(resp.body as any), fs.createWriteStream(tmpBin));
+          fs.chmodSync(tmpBin, 0o755);
+          fs.renameSync(tmpBin, YT_DLP_BIN_PATH);
+          return YT_DLP_BIN_PATH;
+        } catch {
+          return null;
+        } finally {
+          ytDlpInstallPromise = null;
+        }
+      })();
+    }
+    return ytDlpInstallPromise;
+  }
+
+  async function downloadStreamToFileWithLimit(
+    streamUrl: string,
+    destPath: string,
+    referer?: string,
+    timeoutMs = 55_000
+  ): Promise<{ ok: boolean; contentType: string; bytes: number }> {
+    const resp = await fetch(streamUrl, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        ...(referer ? { Referer: referer } : {})
+      },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
+    if (!resp.ok || !resp.body) {
+      return { ok: false, contentType, bytes: 0 };
+    }
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      return { ok: false, contentType, bytes: 0 };
+    }
+    const contentLen = Number(resp.headers.get('content-length') || 0);
+    if (contentLen > URL_FETCH_MAX_BYTES) {
+      throw new Error('Video file size exceeds 260MB limit.');
+    }
+
+    let written = 0;
+    const ws = fs.createWriteStream(destPath);
+    try {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          written += value.byteLength;
+          if (written > URL_FETCH_MAX_BYTES) {
+            reader.cancel().catch(() => {});
+            throw new Error('Video file size exceeds 260MB limit.');
+          }
+          if (!ws.write(Buffer.from(value))) {
+            await new Promise<void>((resolve) => ws.once('drain', resolve));
+          }
+        }
+      }
+      await new Promise<void>((resolve, reject) => {
+        ws.on('finish', resolve);
+        ws.on('error', reject);
+        ws.end();
+      });
+    } catch (dlErr) {
+      try {
+        ws.destroy();
+      } catch {}
+      throw dlErr;
+    }
+
+    return { ok: written > 10_000, contentType, bytes: written };
+  }
+
+  interface UrlFetchJobState {
+    fetchId: string;
+    status: 'processing' | 'done' | 'error';
+    progress: number;
+    stageMessage: string;
+    result?: {
+      ok: true;
+      localUploadId: string;
+      videoUrl: string;
+      filename: string;
+      title: string;
+      durationSec: number;
+      width: number;
+      height: number;
+      sizeBytes: number;
+      platform: string;
+    };
+    error?: string;
+    errorEn?: string;
+    createdAt: number;
+  }
+
+  const urlFetchJobs = new Map<string, UrlFetchJobState>();
+
+  async function ensureBrowserCompatibleH264Mp4(filePath: string): Promise<void> {
+    if (!fs.existsSync(filePath)) return;
+    try {
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-select_streams',
+          'v:0',
+          '-show_entries',
+          'stream=codec_name',
+          '-of',
+          'default=noprint_wrappers=1:nokey=1',
+          filePath
+        ],
+        { timeout: 15_000 }
+      );
+      const codec = stdout.trim().toLowerCase();
+      if (codec && codec !== 'h264') {
+        const tmpH264 = `${filePath}.h264.mp4`;
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-y',
+            '-i',
+            filePath,
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-crf',
+            '20',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-movflags',
+            '+faststart',
+            tmpH264
+          ],
+          { timeout: 90_000 }
+        );
+        if (fs.existsSync(tmpH264) && fs.statSync(tmpH264).size > 10_000) {
+          fs.renameSync(tmpH264, filePath);
+        }
+      }
+    } catch {}
+  }
+
+  async function resolveUrlWithCookies(
+    startUrl: string,
+    userAgent: string,
+    maxHops = 5
+  ): Promise<{ finalUrl: string; html: string; cookieHeader: string }> {
+    let currentUrl = startUrl;
+    const cookies = new Map<string, string>();
+    let lastHtml = '';
+    for (let hop = 0; hop < maxHops; hop++) {
+      const cookieHeader = Array.from(cookies.entries())
+        .map(([k, v]) => `${k}=${v}`)
+        .join('; ');
+      const resp = await fetch(currentUrl, {
+        redirect: 'manual',
+        headers: {
+          'User-Agent': userAgent,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+          Referer: 'https://www.xiaohongshu.com/',
+          ...(cookieHeader ? { Cookie: cookieHeader } : {})
+        },
+        signal: AbortSignal.timeout(15_000)
+      });
+      const setCookies =
+        typeof (resp.headers as any).getSetCookie === 'function'
+          ? ((resp.headers as any).getSetCookie() as string[])
+          : resp.headers.get('set-cookie')
+            ? [resp.headers.get('set-cookie') as string]
+            : [];
+      for (const sc of setCookies) {
+        const kv = String(sc).split(';')[0]?.trim();
+        const eqIdx = kv?.indexOf('=') ?? -1;
+        if (kv && eqIdx > 0) {
+          cookies.set(kv.slice(0, eqIdx).trim(), kv.slice(eqIdx + 1).trim());
+        }
+      }
+      const loc = resp.headers.get('location');
+      if (resp.status >= 300 && resp.status < 400 && loc) {
+        currentUrl = new URL(loc, currentUrl).toString();
+        continue;
+      }
+      const ct = String(resp.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('text/html') || ct.includes('application/xhtml')) {
+        lastHtml = await resp.text();
+      }
+      break;
+    }
+    const finalCookieHeader = Array.from(cookies.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+    return { finalUrl: currentUrl, html: lastHtml, cookieHeader: finalCookieHeader };
+  }
+
+  async function executeUrlVideoFetch(
+    rawUrl: string,
+    onProgress: (pct: number, msg: string) => void
+  ): Promise<
+    | { ok: true; payload: NonNullable<UrlFetchJobState['result']> }
+    | { ok: false; statusCode: number; error: string; errorEn: string }
+  > {
+    const parsed = parseAndNormalizeVideoSourceUrl(rawUrl);
+    if (!parsed.valid) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: parsed.errorMy || 'Invalid video URL',
+        errorEn: parsed.errorEn || 'Invalid video URL'
+      };
+    }
+
+    const localUploadId = `loc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const destPath = path.join(JOBS_TEMP_DIR, `${localUploadId}_upload.mp4`);
+    let resolvedTitle = '';
+    let resolvedDuration = 0;
+
+    const cleanupDest = () => {
+      try {
+        if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+      } catch {}
+    };
+
+    try {
+      onProgress(20, `Resolving ${parsed.platform.toUpperCase()} video link...`);
+
+      // Strategy 1: Direct MP4 / MOV / WEBM link
+      if (parsed.platform === 'direct') {
+        try {
+          onProgress(45, 'Downloading direct video file...');
+          const dl = await downloadStreamToFileWithLimit(parsed.normalizedUrl, destPath);
+          if (dl.ok && fs.existsSync(destPath)) {
+            const meta = await probeVideoDimensions(destPath);
+            if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+              const filename = buildSafeFetchedVideoFilename(
+                parsed.normalizedUrl.split('/').pop(),
+                'direct',
+                localUploadId
+              );
+              return {
+                ok: true,
+                payload: {
+                  ok: true,
+                  localUploadId,
+                  videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+                  filename,
+                  title: filename.replace(/\.mp4$/i, ''),
+                  durationSec: Math.round(meta.durationSec),
+                  width: meta.width,
+                  height: meta.height,
+                  sizeBytes: fs.statSync(destPath).size,
+                  platform: parsed.platform
+                }
+              };
+            }
+          }
+          cleanupDest();
+        } catch {
+          cleanupDest();
+        }
+      }
+
+      // Strategy 2: TikTok & Douyin watermark-free resolver (TikWM API)
+      if (parsed.platform === 'tiktok' || parsed.platform === 'douyin') {
+        try {
+          onProgress(35, 'Fetching watermark-free TikTok/Douyin stream...');
+          const tikwmResp = await fetch(
+            `https://www.tikwm.com/api/?url=${encodeURIComponent(parsed.normalizedUrl)}&hd=1`,
+            {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                Accept: 'application/json'
+              },
+              signal: AbortSignal.timeout(18_000)
+            }
+          );
+          if (tikwmResp.ok) {
+            const tikwmData = (await tikwmResp.json()) as {
+              code?: number;
+              data?: {
+                title?: string;
+                duration?: number;
+                play?: string;
+                hdplay?: string;
+                wmplay?: string;
+              };
+            };
+            if (tikwmData?.code === 0 && tikwmData.data) {
+              resolvedTitle = String(tikwmData.data.title || '').trim();
+              resolvedDuration = Number(tikwmData.data.duration || 0);
+              const candidateStreams = [
+                tikwmData.data.hdplay,
+                tikwmData.data.play,
+                tikwmData.data.wmplay
+              ]
+                .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
+                .map((u) => (u.startsWith('/') ? `https://www.tikwm.com${u}` : u));
+
+              for (const streamUrl of candidateStreams) {
+                try {
+                  onProgress(58, 'Downloading MP4 video...');
+                  const dl = await downloadStreamToFileWithLimit(
+                    streamUrl,
+                    destPath,
+                    'https://www.tikwm.com/'
+                  );
+                  if (dl.ok && fs.existsSync(destPath)) {
+                    const meta = await probeVideoDimensions(destPath);
+                    if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+                      const filename = buildSafeFetchedVideoFilename(
+                        resolvedTitle,
+                        parsed.platform,
+                        localUploadId
+                      );
+                      return {
+                        ok: true,
+                        payload: {
+                          ok: true,
+                          localUploadId,
+                          videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+                          filename,
+                          title: resolvedTitle || `${parsed.platform.toUpperCase()} Video`,
+                          durationSec: Math.round(meta.durationSec || resolvedDuration || 15),
+                          width: meta.width,
+                          height: meta.height,
+                          sizeBytes: fs.statSync(destPath).size,
+                          platform: parsed.platform
+                        }
+                      };
+                    }
+                  }
+                  cleanupDest();
+                } catch {
+                  cleanupDest();
+                }
+              }
+            }
+          }
+        } catch {
+          cleanupDest();
+        }
+      }
+
+      // Strategy 2B: RedNote (Xiaohongshu / xhslink.com / rednote.com) Watermark-Free Resolver
+      let redNoteResolvedUrl = '';
+      if (parsed.platform === 'rednote') {
+        try {
+          onProgress(35, 'Resolving RedNote (Xiaohongshu) watermark-free video...');
+          const desktopUa =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+          const mobileUa =
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+
+          const firstHop = await resolveUrlWithCookies(parsed.normalizedUrl, desktopUa);
+          redNoteResolvedUrl = normalizeRedNoteCanonicalUrl(firstHop.finalUrl || parsed.normalizedUrl);
+
+          const htmlCandidates: string[] = [];
+          if (firstHop.html) htmlCandidates.push(firstHop.html);
+
+          const altUrls = Array.from(
+            new Set([redNoteResolvedUrl, normalizeRedNoteCanonicalUrl(parsed.normalizedUrl)].filter(Boolean))
+          );
+          for (const pageUrl of altUrls) {
+            for (const ua of [desktopUa, mobileUa]) {
+              if (htmlCandidates.some((h) => extractRedNoteVideoInfoFromHtml(h).videoUrls.length > 0)) {
+                break;
+              }
+              try {
+                const hopRes = await resolveUrlWithCookies(pageUrl, ua);
+                if (hopRes.finalUrl && !redNoteResolvedUrl) {
+                  redNoteResolvedUrl = normalizeRedNoteCanonicalUrl(hopRes.finalUrl);
+                }
+                if (hopRes.html) htmlCandidates.push(hopRes.html);
+              } catch {}
+            }
+          }
+
+          let extractedRedNote = { videoUrls: [] as string[], title: '', durationSec: 0 };
+          for (const htmlBody of htmlCandidates) {
+            const info = extractRedNoteVideoInfoFromHtml(htmlBody);
+            if (info.videoUrls.length > 0) {
+              extractedRedNote = info;
+              break;
+            }
+          }
+
+          if (extractedRedNote.title) resolvedTitle = extractedRedNote.title;
+          if (extractedRedNote.durationSec > 0) resolvedDuration = extractedRedNote.durationSec;
+
+          for (const streamUrl of extractedRedNote.videoUrls) {
+            try {
+              onProgress(58, 'Downloading RedNote MP4 (No Watermark)...');
+              const dl = await downloadStreamToFileWithLimit(
+                streamUrl,
+                destPath,
+                'https://www.xiaohongshu.com/'
+              );
+              if (dl.ok && fs.existsSync(destPath)) {
+                await ensureBrowserCompatibleH264Mp4(destPath);
+                const meta = await probeVideoDimensions(destPath);
+                if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+                  const filename = buildSafeFetchedVideoFilename(
+                    resolvedTitle || 'RedNote_NoWatermark',
+                    'rednote',
+                    localUploadId
+                  );
+                  return {
+                    ok: true,
+                    payload: {
+                      ok: true,
+                      localUploadId,
+                      videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+                      filename,
+                      title: resolvedTitle || 'RedNote Video',
+                      durationSec: Math.round(meta.durationSec || resolvedDuration || 15),
+                      width: meta.width,
+                      height: meta.height,
+                      sizeBytes: fs.statSync(destPath).size,
+                      platform: 'rednote'
+                    }
+                  };
+                }
+              }
+              cleanupDest();
+            } catch {
+              cleanupDest();
+            }
+          }
+        } catch {
+          cleanupDest();
+        }
+      }
+
+      // Strategy 3: Universal yt-dlp extractor (YouTube, Shorts, TikTok, RedNote XiaoHongShu fallback, Facebook, Instagram, etc.)
+      onProgress(65, 'Extracting video stream with yt-dlp...');
+      const ytDlpBin = await resolveYtDlpBinaryPath();
+      if (ytDlpBin) {
+        try {
+          const ytOutTemplate = path.join(JOBS_TEMP_DIR, `${localUploadId}_ytdl.%(ext)s`);
+          const ytTargetUrl =
+            parsed.platform === 'rednote'
+              ? normalizeRedNoteCanonicalUrl(redNoteResolvedUrl || parsed.normalizedUrl)
+              : parsed.normalizedUrl;
+          const ytArgs = [
+            '--no-playlist',
+            '--no-warnings',
+            '--max-filesize',
+            '250M',
+            ...(parsed.platform === 'rednote'
+              ? ['--add-header', 'Referer:https://www.xiaohongshu.com/']
+              : []),
+            '-f',
+            'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b',
+            '--merge-output-format',
+            'mp4',
+            '--ffmpeg-location',
+            '/usr/bin/ffmpeg',
+            '-o',
+            ytOutTemplate,
+            ytTargetUrl
+          ];
+          await execFileAsync(ytDlpBin, ytArgs, { timeout: 85_000, maxBuffer: 10 * 1024 * 1024 });
+          const downloadedCandidate = path.join(JOBS_TEMP_DIR, `${localUploadId}_ytdl.mp4`);
+          const matchedFile = fs.existsSync(downloadedCandidate)
+            ? downloadedCandidate
+            : fs
+                .readdirSync(JOBS_TEMP_DIR)
+                .map((f) => path.join(JOBS_TEMP_DIR, f))
+                .find((full) => path.basename(full).startsWith(`${localUploadId}_ytdl.`));
+
+          if (matchedFile && fs.existsSync(matchedFile) && fs.statSync(matchedFile).size > 10_000) {
+            if (!matchedFile.endsWith('.mp4')) {
+              await execFileAsync(
+                'ffmpeg',
+                ['-y', '-i', matchedFile, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', destPath],
+                { timeout: 60_000 }
+              );
+              try {
+                fs.unlinkSync(matchedFile);
+              } catch {}
+            } else {
+              fs.renameSync(matchedFile, destPath);
+            }
+          }
+          if (fs.existsSync(destPath)) {
+            if (parsed.platform === 'rednote') {
+              await ensureBrowserCompatibleH264Mp4(destPath);
+            }
+            const meta = await probeVideoDimensions(destPath);
+            if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+              const filename = buildSafeFetchedVideoFilename(resolvedTitle, parsed.platform, localUploadId);
+              return {
+                ok: true,
+                payload: {
+                  ok: true,
+                  localUploadId,
+                  videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+                  filename,
+                  title: resolvedTitle || `${parsed.platform.toUpperCase()} Video`,
+                  durationSec: Math.round(meta.durationSec),
+                  width: meta.width,
+                  height: meta.height,
+                  sizeBytes: fs.statSync(destPath).size,
+                  platform: parsed.platform
+                }
+              };
+            }
+          }
+          cleanupDest();
+        } catch (ytErr) {
+          console.warn('[URL Fetch yt-dlp error]:', ytErr instanceof Error ? ytErr.message : ytErr);
+          cleanupDest();
+        }
+      }
+
+      // Strategy 4: Unknown/generic direct URL content-type probe
+      if (parsed.platform === 'other') {
+        try {
+          onProgress(80, 'Checking direct media stream...');
+          const dl = await downloadStreamToFileWithLimit(parsed.normalizedUrl, destPath);
+          if (dl.ok && fs.existsSync(destPath)) {
+            const meta = await probeVideoDimensions(destPath);
+            if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+              const filename = buildSafeFetchedVideoFilename(resolvedTitle, 'url', localUploadId);
+              return {
+                ok: true,
+                payload: {
+                  ok: true,
+                  localUploadId,
+                  videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+                  filename,
+                  title: filename.replace(/\.mp4$/i, ''),
+                  durationSec: Math.round(meta.durationSec),
+                  width: meta.width,
+                  height: meta.height,
+                  sizeBytes: fs.statSync(destPath).size,
+                  platform: 'direct'
+                }
+              };
+            }
+          }
+          cleanupDest();
+        } catch {
+          cleanupDest();
+        }
+      }
+
+      return {
+        ok: false,
+        statusCode: 422,
+        error:
+          'ထည့်သွင်းထားသော Video URL မှ ဗီဒီယိုကို ဆွဲယူ၍မရပါ (Link မှားနေခြင်း၊ Private ဖြစ်နေခြင်း သို့မဟုတ် Platform က ပိတ်ထားခြင်း ဖြစ်နိုင်ပါသည်)။ ဗီဒီယိုဖိုင်ကို Upload ဖြင့် တိုက်ရိုက်တင်ကြည့်ပါ။',
+        errorEn:
+          'Could not download video from this URL (the post may be private, removed, or blocked by the platform). Please check the link or upload the video file directly.'
+      };
+    } catch (err) {
+      cleanupDest();
+      const msg = err instanceof Error ? err.message : 'Failed to fetch video URL';
+      return {
+        ok: false,
+        statusCode: 500,
+        error: `Video URL ဆွဲယူရာတွင် အမှားဖြစ်ပေါ်နေပါသည်: ${msg}`,
+        errorEn: `Failed to fetch video URL: ${msg}`
+      };
+    }
+  }
+
+  app.post('/api/recap/fetch-url', async (req, res) => {
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url : '';
+    const asyncMode = Boolean(req.body?.asyncMode);
+
+    if (asyncMode) {
+      const parsedCheck = parseAndNormalizeVideoSourceUrl(rawUrl);
+      if (!parsedCheck.valid) {
+        return res.status(400).json({
+          ok: false,
+          error: parsedCheck.errorMy || 'Invalid video URL',
+          error_en: parsedCheck.errorEn || 'Invalid video URL'
+        });
+      }
+      const fetchId = `url_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const initial: UrlFetchJobState = {
+        fetchId,
+        status: 'processing',
+        progress: 15,
+        stageMessage: 'Connecting to video link...',
+        createdAt: Date.now()
+      };
+      urlFetchJobs.set(fetchId, initial);
+
+      // Prune stale fetch jobs >20m
+      const cutoff = Date.now() - 20 * 60 * 1000;
+      for (const [k, v] of urlFetchJobs.entries()) {
+        if (v.createdAt < cutoff) urlFetchJobs.delete(k);
+      }
+
+      void (async () => {
+        const outcome = await executeUrlVideoFetch(rawUrl, (pct, msg) => {
+          const cur = urlFetchJobs.get(fetchId);
+          if (cur && cur.status === 'processing') {
+            cur.progress = pct;
+            cur.stageMessage = msg;
+          }
+        });
+        const cur = urlFetchJobs.get(fetchId);
+        if (!cur) return;
+        if (outcome.ok) {
+          cur.status = 'done';
+          cur.progress = 100;
+          cur.stageMessage = 'Video loaded!';
+          cur.result = outcome.payload;
+        } else {
+          cur.status = 'error';
+          cur.error = outcome.error;
+          cur.errorEn = outcome.errorEn;
+        }
+      })();
+
+      return res.json({
+        ok: true,
+        async: true,
+        fetch_id: fetchId,
+        status: 'processing',
+        progress: 15,
+        stage_message: initial.stageMessage
+      });
+    }
+
+    const outcome = await executeUrlVideoFetch(rawUrl, () => {});
+    if (!outcome.ok) {
+      return res.status(outcome.statusCode).json({
+        ok: false,
+        error: outcome.error,
+        error_en: outcome.errorEn
+      });
+    }
+    return res.json(outcome.payload);
+  });
+
+  app.get('/api/recap/fetch-url-status/:fetchId', (req, res) => {
+    const safeId = (req.params.fetchId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const job = urlFetchJobs.get(safeId);
+    res.setHeader('Cache-Control', 'no-store');
+    if (!job) {
+      return res.status(404).json({ ok: false, error: 'URL fetch job not found' });
+    }
+    return res.json({
+      ok: job.status !== 'error',
+      fetch_id: job.fetchId,
+      status: job.status,
+      progress: job.progress,
+      stage_message: job.stageMessage,
+      result: job.status === 'done' ? job.result : undefined,
+      error: job.error,
+      error_en: job.errorEn
+    });
+  });
+
   // Standalone TTS endpoint for Voice Preview before generating video + regenerating cues
   const ttsPreviewCache = new Map<
     string,
@@ -5498,13 +6204,17 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         voiceGender = 'male',
         targetLanguage = 'my',
         durationSec = 5,
-        ttsEngine
+        ttsEngine,
+        isFreeMode = false,
+        userGeminiApiKey
       } = req.body as {
         text?: string;
         voiceGender?: VoiceGender;
         targetLanguage?: TargetLanguageCode;
         durationSec?: number;
         ttsEngine?: TtsEngineId;
+        isFreeMode?: boolean;
+        userGeminiApiKey?: string;
       };
       const voiceDef = VOICE_OPTIONS.find((v) => v.id === voiceGender) || VOICE_OPTIONS[0];
       const sampleText =
@@ -5512,7 +6222,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           ? text.trim()
           : getVoicePreviewSampleText(voiceGender, targetLanguage);
 
-      const cacheKey = `${voiceGender}:${targetLanguage}:${ttsEngine || 'auto'}:${sampleText}`;
+      const cacheKey = `${isFreeMode ? 'free' : 'pro'}:${voiceGender}:${targetLanguage}:${ttsEngine || 'auto'}:${sampleText}`;
       const cached = ttsPreviewCache.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
         res.json({
@@ -5526,7 +6236,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       }
 
       const useGeminiPreview =
-        voiceDef.tier === 'pro' || ttsEngine === 'gemini-2.5-flash-preview-tts';
+        !isFreeMode && (voiceDef.tier === 'pro' || ttsEngine === 'gemini-2.5-flash-preview-tts');
 
       let wavBuf: Buffer | null = null;
       let providerUsed = voiceDef.ttsEngineId;
@@ -5546,6 +6256,30 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           if (geminiPreviewRun?.result) {
             wavBuf = geminiPreviewRun.result.wavBuffer;
             providerUsed = `gemini-2.5-flash-preview-tts:${voiceDef.geminiVoice}`;
+          }
+        } catch {}
+      } else if (
+        isFreeMode &&
+        typeof userGeminiApiKey === 'string' &&
+        userGeminiApiKey.trim().length >= 12 &&
+        (voiceDef.tier === 'pro' || ttsEngine === 'gemini-2.5-flash-preview-tts')
+      ) {
+        try {
+          const userAi = new GoogleGenAI({
+            apiKey: userGeminiApiKey.trim(),
+            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+          });
+          const userPreview = await synthesizeGeminiProVoiceWavBuffer(
+            userAi,
+            sampleText,
+            voiceDef.geminiVoice,
+            jobId,
+            undefined,
+            false
+          );
+          if (userPreview) {
+            wavBuf = userPreview.wavBuffer;
+            providerUsed = `user-gemini-tts:${voiceDef.geminiVoice}`;
           }
         } catch {}
       }

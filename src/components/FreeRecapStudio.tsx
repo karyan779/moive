@@ -57,6 +57,7 @@ import {
   buildCinematicTranslateSystemPrompt,
   extractJobIdFromVideoUrl,
   resolveEffectiveVideoDurationSec,
+  parseAndNormalizeVideoSourceUrl,
   type RecapMode,
   type TranslateAudioMode,
   type VoiceGender,
@@ -397,6 +398,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [videoTitle, setVideoTitle] = useState<string>('');
   const [sourceUrlInput, setSourceUrlInput] = useState<string>('');
   const [videoDuration, setVideoDuration] = useState<number>(0);
+  const [loadedLocalUploadId, setLoadedLocalUploadId] = useState<string | null>(null);
+  const [isLoadingUrl, setIsLoadingUrl] = useState<boolean>(false);
+  const [urlLoadError, setUrlLoadError] = useState<string | null>(null);
+  const [urlLoadStatusText, setUrlLoadStatusText] = useState<string>('');
 
   // Settings Inspector State
   const [mode, setMode] = useState<RecapMode>('recap');
@@ -497,6 +502,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
   // AI Voice Preview State (Listen to Thiha / Nilar / Pro Voices before generating video)
   const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [settingsSubTab, setSettingsSubTab] = useState<'video' | 'voice' | 'captions' | 'extra'>('video');
   const [isVoicePickerOpen, setIsVoicePickerOpen] = useState<boolean>(false);
   const [previewingVoiceId, setPreviewingVoiceId] = useState<VoiceGender | null>(null);
   const [isLoadingVoicePreview, setIsLoadingVoicePreview] = useState<boolean>(false);
@@ -532,6 +538,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setVoicePreviewSampleLine(sampleText);
 
     try {
+      const freeUserKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
       const res = await fetch('/api/recap/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -539,7 +546,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           voiceGender: voiceToPlay,
           targetLanguage,
           text: sampleText,
-          ttsEngine: loadSavedApiEngineConfig().ttsEngine
+          ttsEngine: isFreeTier ? 'edge-neural' : loadSavedApiEngineConfig().ttsEngine,
+          isFreeMode: isFreeTier,
+          userGeminiApiKey: isFreeTier && freeUserKeys.geminiKey ? freeUserKeys.geminiKey : undefined
         })
       });
       const data = await res.json();
@@ -597,6 +606,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       URL.revokeObjectURL(videoFileUrl);
     }
     uploadedFileRef.current = file;
+    setLoadedLocalUploadId(null);
+    setUrlLoadError(null);
     const objUrl = URL.createObjectURL(file);
     setVideoFileUrl(objUrl);
     setOriginalFilename(file.name);
@@ -626,10 +637,169 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     } catch {}
   };
 
+  // Fetch real video from pasted TikTok / YouTube / Facebook / Instagram / Direct MP4 link
+  const handleLoadVideoUrl = async () => {
+    if (isLoadingUrl) return;
+    const parsedUrl = parseAndNormalizeVideoSourceUrl(sourceUrlInput);
+    if (!parsedUrl.valid) {
+      playUiSound('blocked');
+      setUrlLoadError(
+        uiLang === 'my'
+          ? parsedUrl.errorMy || 'ဗီဒီယို Link မှန်ကန်စွာ ထည့်သွင်းပါ။'
+          : parsedUrl.errorEn || 'Please enter a valid video URL.'
+      );
+      return;
+    }
+
+    playUiSound('tap');
+    setIsLoadingUrl(true);
+    setUrlLoadError(null);
+    setStudioErrorMsg(null);
+    setUrlLoadStatusText(
+      uiLang === 'my' ? 'Video Link မှ ဗီဒီယို ဆွဲယူနေပါသည်...' : 'Fetching video from URL...'
+    );
+
+    try {
+      const startResp = await fetch('/api/recap/fetch-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: parsedUrl.normalizedUrl,
+          asyncMode: true
+        })
+      });
+      const rawStart = await startResp.text();
+      let startData: any = null;
+      if (rawStart && !rawStart.trim().startsWith('<')) {
+        try {
+          startData = JSON.parse(rawStart);
+        } catch {}
+      }
+      if (!startData) {
+        throw new Error(
+          uiLang === 'my'
+            ? 'Server ချိတ်ဆက်မှု အချိန်ကြာသွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'Invalid server response while loading URL.'
+        );
+      }
+
+      let resolvedResult: any = null;
+      if (startData.ok && startData.async && startData.fetch_id) {
+        const fetchId = String(startData.fetch_id);
+        const deadline = Date.now() + 3 * 60 * 1000;
+        let consecutiveErrs = 0;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutiveErrs)));
+          let pollResp: Response;
+          let pollText = '';
+          try {
+            pollResp = await fetch(`/api/recap/fetch-url-status/${encodeURIComponent(fetchId)}`, {
+              cache: 'no-store'
+            });
+            pollText = await pollResp.text();
+          } catch {
+            consecutiveErrs++;
+            if (consecutiveErrs > 12) {
+              throw new Error(
+                uiLang === 'my'
+                  ? 'အင်တာနက် ချိတ်ဆက်မှု ပြတ်တောက်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+                  : 'Network connection interrupted while fetching video URL.'
+              );
+            }
+            continue;
+          }
+
+          if (isTransientPollHttpStatus(pollResp.status) || pollText.trim().startsWith('<')) {
+            consecutiveErrs++;
+            continue;
+          }
+
+          let pollData: any = null;
+          try {
+            pollData = JSON.parse(pollText);
+          } catch {
+            consecutiveErrs++;
+            continue;
+          }
+          consecutiveErrs = 0;
+
+          if (pollData?.status === 'processing') {
+            if (pollData.stage_message) {
+              setUrlLoadStatusText(
+                uiLang === 'my'
+                  ? `Video Link မှ ဆွဲယူနေပါသည် (${pollData.progress || 40}%)...`
+                  : String(pollData.stage_message)
+              );
+            }
+            continue;
+          }
+          if (pollData?.status === 'done' && pollData.result?.ok) {
+            resolvedResult = pollData.result;
+            break;
+          }
+          if (pollData?.status === 'error' || pollData?.ok === false) {
+            throw new Error(
+              (uiLang === 'my' ? pollData.error : pollData.error_en || pollData.error) ||
+                'Could not fetch video from this URL.'
+            );
+          }
+        }
+      } else if (startData.ok && startData.videoUrl) {
+        resolvedResult = startData;
+      } else {
+        throw new Error(
+          (uiLang === 'my' ? startData.error : startData.error_en || startData.error) ||
+            'Could not fetch video from this URL.'
+        );
+      }
+
+      if (!resolvedResult?.videoUrl || !resolvedResult?.localUploadId) {
+        throw new Error(
+          uiLang === 'my'
+            ? 'ဗီဒီယို Link မှ ဖိုင်ဆွဲယူချိန် ကျော်လွန်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+            : 'Timed out while fetching video from URL.'
+        );
+      }
+
+      playUiSound('open');
+      if (videoFileUrl && videoFileUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(videoFileUrl);
+      }
+      uploadedFileRef.current = null;
+      setLoadedLocalUploadId(String(resolvedResult.localUploadId));
+      setVideoFileUrl(String(resolvedResult.videoUrl));
+      setOriginalFilename(String(resolvedResult.filename || 'URL_Video.mp4'));
+      setVideoTitle(String(resolvedResult.title || resolvedResult.filename || parsedUrl.normalizedUrl));
+      setVideoDuration(Math.max(1, Math.round(Number(resolvedResult.durationSec) || 15)));
+      setCues([]);
+      setAudioBase64(undefined);
+      setHasMuxedAudio(false);
+      setDubbedVideoUrl(null);
+      setLastJobId(null);
+      setVoiceoverMp3Url(null);
+      if (dubbedBlobUrl) {
+        URL.revokeObjectURL(dubbedBlobUrl);
+        setDubbedBlobUrl(null);
+      }
+      setIsDone(false);
+      setUrlLoadError(null);
+      setHasLoadedVideo(true);
+    } catch (err) {
+      playUiSound('blocked');
+      const msg = err instanceof Error ? err.message : 'Failed to load video URL.';
+      setUrlLoadError(msg);
+    } finally {
+      setIsLoadingUrl(false);
+      setUrlLoadStatusText('');
+    }
+  };
+
   // Load a saved Recap Job from the History tab (`rI()`)
   const handleSelectHistoryJob = (job: RecapJobRecord) => {
     playUiSound('select');
     uploadedFileRef.current = null;
+    setLoadedLocalUploadId(null);
+    setUrlLoadError(null);
     setOriginalFilename(job.original_filename || job.title);
     setVideoTitle(job.title);
     setVideoDuration(job.durationSec);
@@ -688,7 +858,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         setLimitModalType('duration_limit');
         return;
       }
-      if (uploadedFileRef.current) {
+      if (uploadedFileRef.current || loadedLocalUploadId) {
         const freeUserKeysCheck = loadFreeUserApiKeys();
         if (!freeUserKeysCheck.geminiKey || freeUserKeysCheck.geminiKey.trim().length < 12) {
           playUiSound('blocked');
@@ -753,6 +923,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           console.warn('Direct upload warning:', uploadErr);
           throw uploadErr;
         }
+      } else if (loadedLocalUploadId) {
+        localUploadIdPayload = loadedLocalUploadId;
+        setRenderProgress(35);
+        setRenderMessage('Using loaded URL video...');
       }
 
       const savedEngineCfg = loadSavedApiEngineConfig();
@@ -1258,10 +1432,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const inspectorContent = (
     <div className="flex flex-1 flex-col gap-3.5 overflow-y-auto px-4 py-3 pb-10">
       {rightSidebarTab === 'settings' ? (
-            /* Settings Tab — Grouped into 4 Clear Sections */
+            /* Settings Tab — Clean 4-Tab Sectioned Inspector */
             <>
               {/* Mode & Quota / Credit Info Banner with Smooth Swipe/On-Off Switch */}
-              <div className="flex flex-col gap-2.5 rounded-2xl border border-stone-200/90 bg-[#FAF8F4] px-3.5 py-3 text-[11px] dark:border-slate-800 dark:bg-[#131922]">
+              <div className="flex flex-col gap-2 rounded-xl border border-stone-200/90 bg-white/85 px-3 py-2.5 text-[11px] dark:border-slate-800 dark:bg-[#111720]">
                 <div className="flex items-center justify-between gap-2">
                   {isFreeTier ? (
                     <div className="flex flex-col gap-0.5 min-w-0">
@@ -1353,552 +1527,103 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                 </div>
               </div>
 
-              {/* SECTION 01 · Format, AI Voice & Script */}
-              <div className="flex flex-col gap-3 rounded-2xl border border-stone-200/80 bg-white/80 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]">
-                <div className="flex items-center justify-between border-b border-stone-200/70 pb-2 dark:border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">01</span>
-                    <span className="text-xs font-bold text-stone-900 dark:text-white">
-                      {uiLang === 'my' ? 'ဇာတ်လမ်းပုံစံနှင့် AI အသံ' : 'Story & AI Voice'}
-                    </span>
-                  </div>
-                  <span className="text-[10px] text-stone-400 dark:text-slate-500">
-                    {uiLang === 'my' ? 'အခြေခံ' : 'Core'}
-                  </span>
-                </div>
-
-                {/* What to make */}
-                <div className="flex flex-col gap-1.5">
-                  <DottedTooltipLabel
-                    label={t.whatToMake}
-                    tooltip="Choose Recap for full voiceover, or Translate to keep original audio."
-                  />
-                  <SlidingPillToggle
-                    options={[
-                      { value: 'recap', label: t.recapOption },
-                      { value: 'translate', label: t.translateOption }
-                    ]}
-                    value={mode}
-                    onChange={(val) => {
-                      playUiSound('select');
-                      setMode(val);
-                      if (val === 'translate' && translateAudio === 'captions-only') {
-                        setSubtitleConfig({ ...subtitleConfig, enabled: true });
-                      }
-                    }}
-                  />
-                </div>
-
-                {/* Audio (when Translate is selected) */}
-                {mode === 'translate' && (
-                  <div className="flex flex-col gap-1.5">
-                    <DottedTooltipLabel
-                      label={t.audioMode}
-                      tooltip="Dub translates voices into your language. Captions only keeps original audio and adds subtitles."
-                    />
-                    <SlidingPillToggle
-                      options={[
-                        { value: 'dub', label: t.dubOption },
-                        { value: 'captions-only', label: t.captionsOnlyOption }
-                      ]}
-                      value={translateAudio}
-                      onChange={(val) => {
-                        playUiSound('select');
-                        setTranslateAudio(val);
-                        if (val === 'captions-only') {
-                          setSubtitleConfig({ ...subtitleConfig, enabled: true });
-                        }
-                      }}
-                    />
-                  </div>
-                )}
-
-                {/* Voice Selector (Free Mode = Thiha Male & Nilar Female only; Credit Mode = All 10 Voices) */}
-                {(mode === 'recap' || translateAudio === 'dub') && (
-                  <div className="flex flex-col gap-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-medium text-stone-500 dark:text-slate-400">{t.voiceLabel}</span>
-                      <span className="text-[10px] font-semibold text-teal-600 dark:text-teal-400">
-                        {isFreeTier
-                          ? uiLang === 'my'
-                            ? 'Free: Thiha / Nilar (၂ မျိုး)'
-                            : 'Free: 2 Voices'
-                          : uiLang === 'my'
-                            ? 'Credit Mode: အသံအစုံ (၁၀ မျိုး)'
-                            : 'Credit Mode: All 10 Voices'}
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <button
-                        type="button"
-                        data-testid="voice-selector-select"
-                        onClick={() => {
-                          playUiSound('open');
-                          setIsVoicePickerOpen(true);
-                        }}
-                        className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2.5 rounded-xl border border-stone-200/90 bg-white px-3.5 py-2 text-left text-xs text-stone-900 shadow-2xs transition-colors hover:border-amber-500/60 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white dark:hover:border-amber-400/60"
-                      >
-                      <div className="flex min-w-0 items-center gap-2.5">
-                        <span
-                          className="size-5 shrink-0 rounded-full border border-white/30 shadow-xs"
-                          style={{ background: selectedVoiceObj.orbGradient }}
-                        />
-                        <div className="flex min-w-0 flex-col">
-                          <span className="truncate text-xs font-semibold text-gray-900 dark:text-white">
-                            {selectedVoiceObj.nameEn.split('·')[0].trim()}
-                          </span>
-                          <span className="truncate text-[10px] text-neutral-500 dark:text-neutral-400">
-                            {selectedVoiceObj.genderLabel} · {selectedVoiceObj.tone}
-                          </span>
-                        </div>
-                      </div>
-                      <ChevronDown className="size-4 shrink-0 text-neutral-400" />
-                    </button>
-                  </div>
-
-                  {/* Sleek Custom Voice Picker Modal / Sheet */}
-                  {isVoicePickerOpen && (
-                    <div
-                      data-testid="voice-picker-backdrop"
-                      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/65 backdrop-blur-xs p-0 sm:p-4"
-                      onClick={() => setIsVoicePickerOpen(false)}
-                    >
-                      <div
-                        data-testid="voice-picker-modal"
-                        onClick={(e) => e.stopPropagation()}
-                        className="flex max-h-[82dvh] w-full sm:max-w-md flex-col overflow-hidden rounded-t-3xl sm:rounded-2xl border border-stone-200/90 bg-white shadow-2xl dark:border-slate-800 dark:bg-[#111720]"
-                      >
-                        <div className="flex items-center justify-between border-b border-stone-200/70 px-5 pt-4 pb-3 dark:border-slate-800">
-                          <div>
-                            <h3 className="text-sm font-bold text-stone-900 dark:text-white">
-                              {uiLang === 'my' ? 'AI အသံ ရွေးချယ်ရန်' : 'Select AI Voice'}
-                            </h3>
-                            <p className="text-[11px] text-stone-500 dark:text-slate-400">
-                              {isFreeTier
-                                ? uiLang === 'my'
-                                  ? 'Free Mode · Thiha / Nilar (၂ မျိုး)'
-                                  : 'Free Mode · 2 Voices'
-                                : uiLang === 'my'
-                                  ? 'Credit Mode · အသံအစုံ ၁၀ မျိုး (1 Cr/min)'
-                                  : 'Credit Mode · All 10 Voices (1 Cr/min)'}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setIsVoicePickerOpen(false)}
-                            aria-label="Close Voice Picker"
-                            className="flex size-8 cursor-pointer items-center justify-center rounded-xl text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-white/[0.08] dark:hover:text-white"
-                          >
-                            <X className="size-4" />
-                          </button>
-                        </div>
-
-                        <div className="flex-1 space-y-4 overflow-y-auto px-3 py-3">
-                          {/* Group 1: Standard Burmese Neural */}
-                          <div>
-                            <div className="flex items-center justify-between px-2 pb-1.5 text-[10px] font-semibold tracking-wider text-stone-400 uppercase">
-                              <span>Standard Burmese Neural</span>
-                              <span>1 Cr/min</span>
-                            </div>
-                            <div className="space-y-1">
-                              {freeVoices.map((v) => {
-                                const isSelected = voiceGender === v.id;
-                                const isThisLoading =
-                                  isLoadingVoicePreview && previewingVoiceId === v.id;
-                                const isThisPlaying =
-                                  isPlayingVoicePreview && previewingVoiceId === v.id;
-                                return (
-                                  <div
-                                    key={v.id}
-                                    role="button"
-                                    tabIndex={0}
-                                    data-testid={`voice-option-${v.id}`}
-                                    onClick={() => {
-                                      playUiSound('select');
-                                      setVoiceGender(v.id);
-                                      setIsVoicePickerOpen(false);
-                                    }}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter' || e.key === ' ') {
-                                        e.preventDefault();
-                                        playUiSound('select');
-                                        setVoiceGender(v.id);
-                                        setIsVoicePickerOpen(false);
-                                      }
-                                    }}
-                                    className={`flex min-h-[54px] cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors ${
-                                      isSelected
-                                        ? 'border-amber-500/50 bg-amber-500/10'
-                                        : 'border-transparent hover:bg-stone-100/80 dark:hover:bg-white/[0.04]'
-                                    }`}
-                                  >
-                                    <div className="flex min-w-0 items-center gap-3">
-                                      <span
-                                        className={`size-8 shrink-0 rounded-full border shadow-xs ${
-                                          isSelected
-                                            ? 'border-amber-400 ring-2 ring-amber-500/30'
-                                            : 'border-white/25'
-                                        }`}
-                                        style={{ background: v.orbGradient }}
-                                      />
-                                      <div className="min-w-0">
-                                        <div className="flex items-center gap-1.5">
-                                          <span className="truncate text-xs font-semibold text-stone-900 dark:text-white">
-                                            {v.nameEn.split('·')[0].trim()}
-                                          </span>
-                                          {isSelected && (
-                                            <Check className="size-3.5 shrink-0 text-amber-500" />
-                                          )}
-                                        </div>
-                                        <p className="truncate text-[11px] text-stone-500 dark:text-slate-400">
-                                          {v.genderLabel} · {v.tone}
-                                        </p>
-                                      </div>
-                                    </div>
-                                    <button
-                                      type="button"
-                                      data-testid={`voice-row-preview-${v.id}`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handlePreviewVoice(v.id);
-                                      }}
-                                      aria-label={`Preview ${v.nameEn.split('·')[0].trim()}`}
-                                      className={`flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl border transition-colors ${
-                                        isThisPlaying
-                                          ? 'border-teal-500/50 bg-teal-500/15 text-teal-500'
-                                          : 'border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-200/70 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.1]'
-                                      }`}
-                                    >
-                                      {isThisLoading ? (
-                                        <Loader2 className="size-3.5 animate-spin text-teal-500" />
-                                      ) : isThisPlaying ? (
-                                        <Square className="size-3 fill-current" />
-                                      ) : (
-                                        <Play className="size-3.5 fill-current" />
-                                      )}
-                                    </button>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </div>
-
-                          {/* Group 2: Gemini Studio Pro Voices */}
-                          <div>
-                            <div className="flex items-center justify-between px-2 pb-1.5 text-[10px] font-semibold tracking-wider text-neutral-400 uppercase">
-                              <span>Gemini Studio Pro Voices</span>
-                            <span className={isFreeTier ? 'text-amber-500' : 'text-teal-500'}>
-                              {isFreeTier ? 'Credit Mode Only' : '1 Cr/min'}
-                            </span>
-                          </div>
-                          <div className="space-y-1">
-                            {proVoices.map((v) => {
-                              const isLocked = isFreeTier && !isVoiceAllowedInMode(v.id, true);
-                              const isSelected = voiceGender === v.id;
-                              const isThisLoading =
-                                isLoadingVoicePreview && previewingVoiceId === v.id;
-                              const isThisPlaying =
-                                isPlayingVoicePreview && previewingVoiceId === v.id;
-                              return (
-                                <div
-                                  key={v.id}
-                                  role="button"
-                                  tabIndex={0}
-                                  data-testid={`voice-option-${v.id}`}
-                                  onClick={() => {
-                                    if (isLocked) {
-                                      playUiSound('blocked');
-                                      return;
-                                    }
-                                    playUiSound('select');
-                                    setVoiceGender(v.id);
-                                    setIsVoicePickerOpen(false);
-                                  }}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter' || e.key === ' ') {
-                                      e.preventDefault();
-                                      if (isLocked) {
-                                        playUiSound('blocked');
-                                        return;
-                                      }
-                                      playUiSound('select');
-                                      setVoiceGender(v.id);
-                                      setIsVoicePickerOpen(false);
-                                    }
-                                  }}
-                                  className={`flex min-h-[54px] cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors ${
-                                    isSelected
-                                      ? 'border-amber-500/50 bg-amber-500/10'
-                                      : isLocked
-                                        ? 'border-transparent opacity-65 hover:bg-stone-100/60 dark:hover:bg-white/[0.03]'
-                                        : 'border-transparent hover:bg-stone-100/80 dark:hover:bg-white/[0.04]'
-                                  }`}
-                                >
-                                  <div className="flex min-w-0 items-center gap-3">
-                                    <span
-                                      className={`size-8 shrink-0 rounded-full border shadow-xs ${
-                                        isSelected
-                                          ? 'border-amber-400 ring-2 ring-amber-500/30'
-                                          : 'border-white/25'
-                                      }`}
-                                      style={{ background: v.orbGradient }}
-                                    />
-                                    <div className="min-w-0">
-                                      <div className="flex items-center gap-1.5">
-                                        <span className="truncate text-xs font-semibold text-stone-900 dark:text-white">
-                                          {v.nameEn.split('·')[0].trim()}
-                                        </span>
-                                        {isSelected && (
-                                          <Check className="size-3.5 shrink-0 text-amber-500" />
-                                        )}
-                                        {isLocked && (
-                                          <Lock className="size-3 shrink-0 text-stone-400" />
-                                        )}
-                                      </div>
-                                      <p className="truncate text-[11px] text-stone-500 dark:text-slate-400">
-                                        {v.genderLabel} · {v.tone}
-                                      </p>
-                                    </div>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    data-testid={`voice-row-preview-${v.id}`}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handlePreviewVoice(v.id);
-                                    }}
-                                    aria-label={`Preview ${v.nameEn.split('·')[0].trim()}`}
-                                    className={`flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl border transition-colors ${
-                                      isThisPlaying
-                                        ? 'border-teal-500/50 bg-teal-500/15 text-teal-500'
-                                        : 'border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-200/70 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.1]'
-                                    }`}
-                                  >
-                                    {isThisLoading ? (
-                                      <Loader2 className="size-3.5 animate-spin text-teal-500" />
-                                    ) : isThisPlaying ? (
-                                      <Square className="size-3 fill-current" />
-                                    ) : (
-                                      <Play className="size-3.5 fill-current" />
-                                    )}
-                                  </button>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      </div>
-
-                      {isFreeTier && onNavigateToProStudio && (
-                        <div className="border-t border-stone-200/70 px-4 py-3 dark:border-white/[0.07]">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              playUiSound('tap');
-                              setIsVoicePickerOpen(false);
-                              onNavigateToProStudio();
-                            }}
-                            className="h-10 w-full cursor-pointer rounded-xl bg-amber-500 hover:bg-amber-400 text-xs font-bold text-slate-950 shadow-xs transition-all"
-                          >
-                            {uiLang === 'my'
-                              ? 'Credit Mode သို့ပြောင်းပြီး အသံ ၁၀ မျိုးလုံး ဖွင့်မည်'
-                              : 'Switch to Credit Mode to Unlock All 10 Voices'}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                  {/* Interactive AI Voice Preview Button */}
-                  <div className="flex flex-col gap-1.5 pt-0.5">
+              {/* 4-Tab Section Bar (VIDEO SIZE · Voice · Captions · Copyright Effects) */}
+              <div
+                role="tablist"
+                aria-label="Edit setting sections"
+                className="flex items-center justify-between gap-1 rounded-xl border border-stone-200/90 bg-[#EFECE5] p-1 shrink-0 dark:border-slate-800 dark:bg-[#141B24]"
+              >
+                {(
+                  [
+                    {
+                      id: 'video',
+                      label: 'VIDEO SIZE'
+                    },
+                    {
+                      id: 'voice',
+                      label: 'Voice'
+                    },
+                    {
+                      id: 'captions',
+                      label: 'Captions'
+                    },
+                    {
+                      id: 'extra',
+                      label: 'Copyright Effects'
+                    }
+                  ] as const
+                ).map((sub) => {
+                  const active = settingsSubTab === sub.id;
+                  return (
                     <button
+                      key={sub.id}
                       type="button"
-                      data-testid="preview-voice-btn"
-                      onClick={() => handlePreviewVoice()}
-                      disabled={isLoadingVoicePreview}
-                      className={`inline-flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-xl border px-3.5 text-xs font-semibold transition-all active:scale-98 disabled:opacity-50 ${
-                        isPlayingVoicePreview
-                          ? 'border-teal-500/60 bg-teal-500/15 text-teal-700 dark:text-teal-300'
-                          : 'border-stone-200/90 bg-stone-50 text-stone-800 hover:bg-stone-100 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]'
+                      role="tab"
+                      aria-selected={active}
+                      data-testid={`settings-subtab-${sub.id}`}
+                      onClick={() => {
+                        playUiSound('select');
+                        setSettingsSubTab(sub.id);
+                      }}
+                      className={`flex min-h-[36px] flex-1 cursor-pointer items-center justify-center rounded-lg px-2 text-[10.5px] tracking-tight whitespace-nowrap shrink-0 transition-all ${
+                        active
+                          ? 'bg-white font-bold text-stone-900 shadow-xs ring-1 ring-black/[0.04] dark:bg-[#1E293B] dark:text-amber-300 dark:ring-amber-400/20'
+                          : 'font-medium text-stone-500 hover:text-stone-900 dark:text-slate-400 dark:hover:text-slate-200'
                       }`}
                     >
-                      {isLoadingVoicePreview ? (
-                        <>
-                          <Loader2 className="size-3.5 animate-spin text-teal-500" />
-                          <span>Synthesizing AI Voice Sample…</span>
-                        </>
-                      ) : isPlayingVoicePreview ? (
-                        <>
-                          <Square className="size-3.5 fill-current text-teal-500" />
-                          <span>
-                            {uiLang === 'my'
-                              ? `အသံရပ်မည် (${selectedVoiceObj.nameEn.split('·')[0].trim()})`
-                              : `Stop Sample (${selectedVoiceObj.nameEn.split('·')[0].trim()})`}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <Volume2 className="size-3.5 text-amber-500" />
-                          <span>
-                            {uiLang === 'my'
-                              ? `အသံစမ်းနားထောင်မည် · Preview (${selectedVoiceObj.nameEn.split('·')[0].trim()})`
-                              : `Preview AI Voice (${selectedVoiceObj.nameEn.split('·')[0].trim()})`}
-                          </span>
-                        </>
-                      )}
+                      <span>{sub.label}</span>
                     </button>
+                  );
+                })}
+              </div>
 
-                    {(isPlayingVoicePreview || voicePreviewSampleLine) && (
-                      <div
-                        data-testid="voice-preview-sample-banner"
-                        className="rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-3 py-1.5 text-[11px] text-amber-800 dark:text-amber-300"
-                      >
-                        <span className="font-semibold">
-                          {isPlayingVoicePreview ? '🔊 Playing: ' : 'Sample: '}
-                        </span>
-                        <span>“{voicePreviewSampleLine}”</span>
-                      </div>
-                    )}
-                  </div>
-
-                  {isFreeTier && (
-                    <p className="text-[11px] text-stone-500 dark:text-slate-400">
-                      {uiLang === 'my'
-                        ? 'Free Mode တွင် Thiha (Male) နှင့် Nilar (Female) ၂ မျိုးသာ သုံးနိုင်ပါသည်။'
-                        : 'Free Mode includes Thiha (Male) & Nilar (Female).'}
-                    </p>
-                  )}
-                </div>
-              )}
-
-              {/* Script style (Recap only) or Cinematic Translation info (Translate) + Language */}
-              <div className="grid grid-cols-1 gap-2.5 pt-1">
-                {mode === 'recap' ? (
+              {/* TAB 1: VIDEO SIZE · Framing, Fit Mode, Zoom, Blur Watermark & Subtitle Cover Band */}
+              {settingsSubTab === 'video' && (
+                <div
+                  data-testid="settings-panel-video"
+                  className="flex flex-col gap-3.5 rounded-2xl border border-stone-200/80 bg-white/85 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]"
+                >
+                  {/* Aspect Ratio */}
                   <div className="flex flex-col gap-1.5">
-                    <DottedTooltipLabel
-                      label={t.scriptStyleLabel}
-                      tooltip="Choose the tone and pacing for your narration."
-                    />
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                        Aspect Ratio
+                      </span>
+                      <span className="font-mono text-[10px] font-semibold text-stone-400 dark:text-slate-500">
+                        {aspectRatio === 'original' ? 'Auto' : aspectRatio}
+                      </span>
+                    </div>
                     <select
-                      value={scriptStyle}
+                      data-testid="aspect-ratio-select"
+                      value={aspectRatio}
                       onChange={(e) => {
                         playUiSound('select');
-                        setScriptStyle(e.target.value as ScriptStyleId);
+                        setAspectRatio(e.target.value as AspectRatioMode);
                       }}
                       className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                     >
-                      <option value="narrator">Fast Recap</option>
-                      <option value="drama">Storytelling</option>
-                      <option value="casual">Gen Z</option>
-                      <option value="news">News</option>
-                      <option value="none">Documentary</option>
+                      <option value="original">Auto</option>
+                      <option value="9:16">9:16 (Portrait / TikTok)</option>
+                      <option value="4:5">4:5 (Instagram / FB Portrait)</option>
+                      <option value="1:1">1:1 (Square)</option>
+                      <option value="16:9">16:9 (Landscape / YouTube)</option>
                     </select>
                   </div>
-                ) : (
-                  <div
-                    data-testid="translate-dialogue-hint"
-                    className="rounded-xl border border-teal-500/30 bg-teal-500/8 px-3 py-2 text-[11px] leading-relaxed text-teal-800 dark:border-teal-500/25 dark:bg-teal-500/10 dark:text-teal-200"
-                  >
-                    <span className="font-bold block">
-                      {translateAudio === 'captions-only'
-                        ? uiLang === 'my'
-                          ? 'Captions Only · မူရင်းအသံ + ရုပ်ရှင်စာတန်းထိုး'
-                          : 'Captions Only · Original Audio + Movie Subtitles'
-                        : uiLang === 'my'
-                          ? 'Translate & Dub · ရုပ်ရှင်စကားပြော ဘာသာပြန်အသံသွင်း'
-                          : 'Translate & Dub · Natural Movie Dialogue Dubbing'}
-                    </span>
-                    <span className="text-[10px] opacity-85">
-                      {uiLang === 'my'
-                        ? 'Recap ပုံစံမဟုတ်ဘဲ မူရင်းဇာတ်ကောင်များ စကားပြောသည့်အတိုင်း သဘာဝကျကျ ဘာသာပြန်ပေးပါမည်။'
-                        : 'Translates natural spoken character dialogue line-by-line rather than summarizing like a recap.'}
-                    </span>
-                  </div>
-                )}
 
-                {/* Language */}
-                <div className="flex flex-col gap-1.5">
-                  <span className="text-xs font-medium text-stone-500 dark:text-slate-400">{t.languageLabel}</span>
-                  <div className="flex h-10.5 w-full items-center gap-2 rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white">
-                    <span className="text-sm">
-                      {TARGET_LANGUAGES.find((l) => l.code === targetLanguage)?.flag || '🇲🇲'}
-                    </span>
-                    <select
-                      value={targetLanguage}
-                      onChange={(e) => {
-                        playUiSound('select');
-                        setTargetLanguage(e.target.value as TargetLanguageCode);
-                      }}
-                      className="w-full bg-transparent text-xs font-medium text-stone-900 dark:text-white outline-none cursor-pointer"
-                    >
-                      {TARGET_LANGUAGES.map((l) => (
-                        <option
-                          key={l.code}
-                          value={l.code}
-                          className="bg-white dark:bg-[#151C26] text-stone-900 dark:text-white"
-                        >
-                          {l.labelEn}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-              </div>
-              </div>{/* End Section 01 */}
-
-              {/* SECTION 02 · Frame & Subtitles */}
-              <div className="flex flex-col gap-3 rounded-2xl border border-stone-200/80 bg-white/80 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]">
-                <div className="flex items-center justify-between border-b border-stone-200/70 pb-2 dark:border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">02</span>
-                    <span className="text-xs font-bold text-stone-900 dark:text-white">
-                      {uiLang === 'my' ? 'ဘောင်အရွယ်နှင့် စာတန်းထိုး' : 'Frame & Subtitles'}
-                    </span>
-                  </div>
-                  <span className="text-[10px] text-stone-400 dark:text-slate-500">
-                    {aspectRatio === 'original' ? 'Auto' : aspectRatio}
-                  </span>
-                </div>
-
-                {/* Aspect & DeepRecap Framing Controls */}
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs font-medium text-stone-500 dark:text-slate-400">{t.aspectLabel}</span>
-                  <select
-                    data-testid="aspect-ratio-select"
-                    value={aspectRatio}
-                    onChange={(e) => {
-                      playUiSound('select');
-                      setAspectRatio(e.target.value as AspectRatioMode);
-                    }}
-                    className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
-                  >
-                    <option value="original">Auto</option>
-                    <option value="9:16">9:16 (Portrait / TikTok)</option>
-                    <option value="4:5">4:5 (Instagram / FB Portrait)</option>
-                    <option value="1:1">1:1 (Square)</option>
-                    <option value="16:9">16:9 (Landscape / YouTube)</option>
-                  </select>
-
-                  {/* Clean Framing Panel */}
+                  {/* Fit Mode, Position, Focus & Frame Zoom */}
                   <div
                     data-testid="aspect-framing-card"
-                    className="flex flex-col gap-2.5 rounded-xl border border-stone-200/80 bg-[#FAF8F4] p-3 dark:border-slate-800 dark:bg-[#0D1117]"
+                    className="flex flex-col gap-2.5 border-t border-stone-200/70 pt-3 dark:border-slate-800"
                   >
-                    {/* Always-accessible Fit Mode ON/OFF toggle switch */}
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex flex-col">
-                        <span className="text-[11px] font-semibold text-stone-700 dark:text-slate-200">
-                          {uiLang === 'my' ? 'ဘောင်အနေအထား (Fit Mode)' : 'Fit Mode'}
+                        <span className="text-xs font-semibold text-stone-800 dark:text-slate-200">
+                          Fit Mode
                         </span>
                         <span className="text-[10px] text-stone-400 dark:text-slate-500">
                           {editConfig.fitMode === 'pad'
-                            ? uiLang === 'my'
-                              ? 'ON · ဗီဒီယိုအပြည့် (Blur နောက်ခံ)'
-                              : 'ON · Full Frame (Blur BG)'
-                            : uiLang === 'my'
-                              ? 'OFF · ဘောင်အပြည့် (Crop ဖြည့်)'
-                              : 'OFF · Fill Frame (Crop)'}
+                            ? 'ON · Full Frame (Blur BG)'
+                            : 'OFF · Fill Frame (Crop)'}
                         </span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
@@ -1934,7 +1659,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                         </span>
                         <StreamWaveSwitch
                           testId="fit-mode-switch"
-                          ariaLabel={uiLang === 'my' ? 'ဘောင်အနေအထား (Fit Mode)' : 'Fit Mode'}
+                          ariaLabel="Fit Mode"
                           checked={editConfig.fitMode === 'pad'}
                           onCheckedChange={(checked) => {
                             setEditConfig((prev) => ({
@@ -1949,633 +1674,211 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     {aspectRatio !== 'original' && (
                       <>
                         {editConfig.fitMode === 'pad' ? (
-                        <div className="flex flex-col gap-2 pt-0.5">
-                          <div className="flex flex-col gap-1">
-                            <div className="flex items-center justify-between text-[11px]">
-                              <span className="text-stone-500 dark:text-slate-400">
-                                {uiLang === 'my' ? 'ပုံအရွယ် (Picture Size)' : 'Picture size'}
-                              </span>
-                              <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                {editConfig.padSize.toFixed(2)}×
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              data-testid="pad-size-slider"
-                              min={1}
-                              max={1.6}
-                              step={0.05}
-                              value={editConfig.padSize}
-                              onChange={(e) =>
-                                setEditConfig((prev) => ({
-                                  ...prev,
-                                  padSize: Number(e.target.value)
-                                }))
-                              }
-                              className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                            />
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-2.5">
+                          <div className="flex flex-col gap-2 pt-0.5">
                             <div className="flex flex-col gap-1">
                               <div className="flex items-center justify-between text-[11px]">
                                 <span className="text-stone-500 dark:text-slate-400">
-                                  {uiLang === 'my' ? 'ဘယ် / ညာ' : 'Move L/R'}
+                                  Picture size
                                 </span>
                                 <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                  {editConfig.padX > 0 ? `+${editConfig.padX}` : editConfig.padX}
+                                  {editConfig.padSize.toFixed(2)}×
                                 </span>
                               </div>
                               <input
                                 type="range"
-                                data-testid="pad-x-slider"
-                                min={-100}
-                                max={100}
-                                step={5}
-                                value={editConfig.padX}
+                                data-testid="pad-size-slider"
+                                min={1}
+                                max={1.6}
+                                step={0.05}
+                                value={editConfig.padSize}
                                 onChange={(e) =>
                                   setEditConfig((prev) => ({
                                     ...prev,
-                                    padX: Number(e.target.value)
+                                    padSize: Number(e.target.value)
                                   }))
                                 }
                                 className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
                               />
                             </div>
 
-                            <div className="flex flex-col gap-1">
-                              <div className="flex items-center justify-between text-[11px]">
-                                <span className="text-stone-500 dark:text-slate-400">
-                                  {uiLang === 'my' ? 'အပေါ် / အောက်' : 'Move U/D'}
-                                </span>
-                                <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                  {editConfig.padY > 0 ? `+${editConfig.padY}` : editConfig.padY}
-                                </span>
+                            <div className="grid grid-cols-2 gap-2.5">
+                              <div className="flex flex-col gap-1">
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-stone-500 dark:text-slate-400">
+                                    Move L/R
+                                  </span>
+                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                    {editConfig.padX > 0 ? `+${editConfig.padX}` : editConfig.padX}
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  data-testid="pad-x-slider"
+                                  min={-100}
+                                  max={100}
+                                  step={5}
+                                  value={editConfig.padX}
+                                  onChange={(e) =>
+                                    setEditConfig((prev) => ({
+                                      ...prev,
+                                      padX: Number(e.target.value)
+                                    }))
+                                  }
+                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                />
                               </div>
-                              <input
-                                type="range"
-                                data-testid="pad-y-slider"
-                                min={-100}
-                                max={100}
-                                step={5}
-                                value={editConfig.padY}
-                                onChange={(e) =>
-                                  setEditConfig((prev) => ({
-                                    ...prev,
-                                    padY: Number(e.target.value)
-                                  }))
-                                }
-                                className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                              />
+
+                              <div className="flex flex-col gap-1">
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-stone-500 dark:text-slate-400">
+                                    Move U/D
+                                  </span>
+                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                    {editConfig.padY > 0 ? `+${editConfig.padY}` : editConfig.padY}
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  data-testid="pad-y-slider"
+                                  min={-100}
+                                  max={100}
+                                  step={5}
+                                  value={editConfig.padY}
+                                  onChange={(e) =>
+                                    setEditConfig((prev) => ({
+                                      ...prev,
+                                      padY: Number(e.target.value)
+                                    }))
+                                  }
+                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                />
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      ) : (
-                        <div className="flex items-center justify-between gap-2 pt-0.5">
-                          <span className="text-[11px] text-stone-500 dark:text-slate-400">
-                            {uiLang === 'my' ? 'အာရုံစိုက်နေရာ' : 'Focus'}
-                          </span>
-                          <div className="inline-flex rounded-xl border border-stone-200/80 bg-white p-0.5 dark:border-slate-700/80 dark:bg-[#151C26]">
-                            {(
-                              [
-                                { id: 'top', label: uiLang === 'my' ? 'အပေါ်' : 'Top' },
-                                { id: 'center', label: uiLang === 'my' ? 'အလယ်' : 'Center' },
-                                { id: 'bottom', label: uiLang === 'my' ? 'အောက်' : 'Bottom' }
-                              ] as { id: FocusAnchor; label: string }[]
-                            ).map((opt) => (
-                              <button
-                                key={opt.id}
-                                type="button"
-                                onClick={() => {
-                                  playUiSound('select');
-                                  setEditConfig((prev) => ({ ...prev, focus: opt.id }));
-                                }}
-                                className={`cursor-pointer rounded-lg px-2.5 py-1 text-[10px] font-semibold transition-colors ${
-                                  editConfig.focus === opt.id
-                                    ? 'bg-amber-500 text-slate-950'
-                                    : 'text-stone-500 hover:text-stone-900 dark:text-slate-400 dark:hover:text-white'
-                                }`}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
+                        ) : (
+                          <div className="flex items-center justify-between gap-2 pt-0.5">
+                            <span className="text-[11px] text-stone-500 dark:text-slate-400">
+                              Focus
+                            </span>
+                            <div className="inline-flex rounded-xl border border-stone-200/80 bg-[#FAF8F4] p-0.5 dark:border-slate-700/80 dark:bg-[#151C26]">
+                              {(
+                                [
+                                  { id: 'top', label: 'Top' },
+                                  { id: 'center', label: 'Center' },
+                                  { id: 'bottom', label: 'Bottom' }
+                                ] as { id: FocusAnchor; label: string }[]
+                              ).map((opt) => (
+                                <button
+                                  key={opt.id}
+                                  type="button"
+                                  onClick={() => {
+                                    playUiSound('select');
+                                    setEditConfig((prev) => ({ ...prev, focus: opt.id }));
+                                  }}
+                                  className={`cursor-pointer rounded-lg px-2.5 py-1 text-[10px] font-semibold transition-colors ${
+                                    editConfig.focus === opt.id
+                                      ? 'bg-amber-500 text-slate-950'
+                                      : 'text-stone-500 hover:text-stone-900 dark:text-slate-400 dark:hover:text-white'
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      )}
-                    </>
-                  )}
+                        )}
+                      </>
+                    )}
 
-                  {/* Frame Zoom (100% - 130%) */}
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center justify-between text-[11px]">
-                      <span className="text-stone-500 dark:text-slate-400">
-                        {uiLang === 'my' ? 'ဗီဒီယို Zoom ချိန်ညှိ' : 'Frame Zoom'}
-                      </span>
-                      <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                        {editConfig.frameZoom}%
-                      </span>
+                    {/* Frame Zoom (100% - 130%) */}
+                    <div className="flex flex-col gap-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-stone-500 dark:text-slate-400">
+                          Frame Zoom
+                        </span>
+                        <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                          {editConfig.frameZoom}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        data-testid="frame-zoom-slider"
+                        min={100}
+                        max={130}
+                        step={5}
+                        value={editConfig.frameZoom}
+                        onChange={(e) =>
+                          setEditConfig((prev) => ({
+                            ...prev,
+                            frameZoom: Number(e.target.value)
+                          }))
+                        }
+                        className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                      />
                     </div>
-                    <input
-                      type="range"
-                      data-testid="frame-zoom-slider"
-                      min={100}
-                      max={130}
-                      step={5}
-                      value={editConfig.frameZoom}
-                      onChange={(e) =>
-                        setEditConfig((prev) => ({
-                          ...prev,
-                          frameZoom: Number(e.target.value)
-                        }))
-                      }
-                      className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                    />
                   </div>
-                </div>
-              </div>
 
-              {/* Captions */}
-              <div className="flex flex-col gap-2.5 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-stone-900 dark:text-white">
-                    {t.captionsLabel}
-                  </span>
-                  <StreamWaveSwitch
-                    checked={subtitleConfig.enabled}
-                    onCheckedChange={(checked) => {
-                      setSubtitleConfig({ ...subtitleConfig, enabled: checked });
-                      if (!checked && mode === 'translate' && translateAudio === 'captions-only') {
-                        setTranslateAudio('dub');
-                      }
-                    }}
-                  />
-                </div>
-
-                {subtitleConfig.enabled && (
-                  <SlidingPillToggle
-                    options={[
-                      { value: 'outline_black', label: t.outlineStyle },
-                      { value: 'box_black', label: t.highlightStyle }
-                    ]}
-                    value={subtitleConfig.style}
-                    onChange={(val) =>
-                      setSubtitleConfig({ ...subtitleConfig, style: val })
-                    }
-                  />
-                )}
-              </div>
-
-              {subtitleConfig.enabled && (
-                <div className="flex flex-col gap-3 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
-                  {/* Subtitle Display Language Selector (Voice stays Burmese while Captions can switch to English, Korean, Thai, etc.) */}
-                  <div className="flex flex-col gap-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
-                        {uiLang === 'my'
-                          ? 'စာတန်းထိုး ဘာသာစကား · Subtitle Language'
-                          : 'Subtitle Display Language'}
-                      </span>
-                      <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">
-                        {isTranslatingSubtitles
-                          ? uiLang === 'my'
-                            ? 'ဘာသာပြန်နေသည်...'
-                            : 'Translating...'
-                          : (subtitleConfig.subtitleLanguage || 'my') === 'my'
-                            ? 'MYANMAR SUB'
-                            : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · MY VOICE`}
-                      </span>
+                  {/* Blur Watermark + Adjust */}
+                  <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                    <div className="flex items-center justify-between">
+                      <DottedTooltipLabel
+                        label="Blur watermark"
+                        tooltip="Hides watermarks, channel logos, or captions with blur."
+                      />
+                      {blurEnabled && (
+                        <button
+                          type="button"
+                          data-testid="blur-adjust-btn"
+                          onClick={() => {
+                            playUiSound('tap');
+                            const nextEdit = !isOverlayEditMode;
+                            setIsOverlayEditMode(nextEdit);
+                            if (nextEdit) {
+                              setMobileDrawerOpen(false);
+                            }
+                          }}
+                          className="cursor-pointer rounded-lg bg-amber-500/15 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700 transition-colors hover:bg-amber-500/25 dark:text-amber-300"
+                        >
+                          {isOverlayEditMode ? 'Done' : 'Adjust'}
+                        </button>
+                      )}
                     </div>
 
                     <select
-                      data-testid="subtitle-language-select"
-                      aria-label="Subtitle display language"
-                      value={subtitleConfig.subtitleLanguage || 'my'}
-                      disabled={isTranslatingSubtitles}
-                      onChange={async (e) => {
+                      data-testid="blur-mode-select"
+                      value={blurMode}
+                      onChange={(e) => {
                         playUiSound('select');
-                        const nextSubLang = e.target.value as TargetLanguageCode;
-                        setSubtitleConfig((prev) => ({
-                          ...prev,
-                          subtitleLanguage: nextSubLang
-                        }));
-                        if (cues.length > 0) {
-                          setIsTranslatingSubtitles(true);
-                          try {
-                            const resp = await fetch('/api/recap/translate-subtitles', {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({
-                                cues,
-                                subtitleLanguage: nextSubLang,
-                                isFreeMode: isFreeTier
-                              })
-                            });
-                            const data = await resp.json();
-                            if (data?.ok && Array.isArray(data.cues)) {
-                              setCues(data.cues);
+                        const next = e.target.value as BlurDropdownMode;
+                        setBlurMode(next);
+                        if (next !== 'off' && blurRegions.length === 0) {
+                          setBlurRegions([
+                            {
+                              id: `blur-${Date.now()}`,
+                              x: 4,
+                              y: 72,
+                              width: 92,
+                              height: 10,
+                              blurStrength: 24
                             }
-                          } catch {}
-                          setIsTranslatingSubtitles(false);
+                          ]);
+                          setIsOverlayEditMode(true);
                         }
                       }}
-                      className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                      className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                     >
-                      {TARGET_LANGUAGES.map((langOpt) => (
-                        <option key={langOpt.code} value={langOpt.code}>
-                          {langOpt.flag} {langOpt.labelMy} —{' '}
-                          {langOpt.code === 'my'
-                            ? 'မူရင်း မြန်မာစာတန်း'
-                            : `${langOpt.labelEn} စာတန်းထိုး (Voice မြန်မာအသံ)`}
-                        </option>
-                      ))}
+                      <option value="off">Off (No Blur)</option>
+                      <option value="auto">Auto (Device Optimized)</option>
+                      <option value="frosted">Frosted Glass (iOS & Desktop)</option>
+                      <option value="simple">Simple Blur (Fast for Mobile)</option>
                     </select>
-
-                    {/* Quick Language Pills for Burmese, English, Korean, Thai, Chinese, Japanese */}
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {TARGET_LANGUAGES.map((langOpt) => {
-                        const activeSubLang = subtitleConfig.subtitleLanguage || 'my';
-                        const isSelected = activeSubLang === langOpt.code;
-                        return (
-                          <button
-                            key={langOpt.code}
-                            type="button"
-                            data-testid={`subtitle-lang-chip-${langOpt.code}`}
-                            disabled={isTranslatingSubtitles}
-                            onClick={async () => {
-                              playUiSound('select');
-                              const nextSubLang = langOpt.code;
-                              setSubtitleConfig((prev) => ({
-                                ...prev,
-                                subtitleLanguage: nextSubLang
-                              }));
-                              if (cues.length > 0) {
-                                setIsTranslatingSubtitles(true);
-                                try {
-                                  const resp = await fetch('/api/recap/translate-subtitles', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({
-                                      cues,
-                                      subtitleLanguage: nextSubLang,
-                                      isFreeMode: isFreeTier
-                                    })
-                                  });
-                                  const data = await resp.json();
-                                  if (data?.ok && Array.isArray(data.cues)) {
-                                    setCues(data.cues);
-                                  }
-                                } catch {}
-                                setIsTranslatingSubtitles(false);
-                              }
-                            }}
-                            className={`flex items-center justify-center gap-1.5 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
-                              isSelected
-                                ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
-                                : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
-                            }`}
-                          >
-                            <span>{langOpt.flag}</span>
-                            <span className="truncate">{langOpt.labelEn}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    {(subtitleConfig.subtitleLanguage || 'my') !== 'my' && (
-                      <p className="text-[11px] leading-relaxed text-teal-700 dark:text-teal-400">
-                        ✓ Voice Script နှင့် နောက်ခံစကားပြောအသံမှာ မြန်မာလိုသာ ထွက်ရှိမည်ဖြစ်ပြီး၊ Video ပေါ်ရှိ စာတန်းထိုး (Subtitle) ကိုသာ{' '}
-                        {TARGET_LANGUAGES.find((l) => l.code === subtitleConfig.subtitleLanguage)?.labelMy ||
-                          subtitleConfig.subtitleLanguage}{' '}
-                        ဖြင့် ဘာသာပြန်ထိုးပေးပါမည်။
-                      </p>
-                    )}
                   </div>
-
-                  {(subtitleConfig.subtitleLanguage || 'my') === 'my' && targetLanguage === 'my' && (
-                    <div className="flex flex-col gap-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
-                          {t.fontLabel} · မြန်မာ Font အလှများ
-                        </span>
-                        <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-teal-600 dark:text-teal-400">
-                          {resolveBurmeseFontMeta(subtitleConfig.fontStyle).badge}
-                        </span>
-                      </div>
-                      <select
-                        data-testid="burmese-font-select"
-                        value={subtitleConfig.fontStyle}
-                        onChange={(e) => {
-                          playUiSound('select');
-                          setSubtitleConfig({
-                            ...subtitleConfig,
-                            fontStyle: e.target.value as BurmeseFontStyle
-                          });
-                        }}
-                        style={{
-                          fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily
-                        }}
-                        className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
-                      >
-                        {BURMESE_FONT_STYLES.map((fontOpt) => (
-                          <option key={fontOpt.id} value={fontOpt.id}>
-                            {fontOpt.label}
-                          </option>
-                        ))}
-                      </select>
-
-                      {/* Visual Myanmar Font Style Quick Chips */}
-                      <div className="grid grid-cols-2 gap-1.5 pt-0.5">
-                        {BURMESE_FONT_STYLES.slice(0, 6).map((fontOpt) => {
-                          const isSelected = subtitleConfig.fontStyle === fontOpt.id;
-                          return (
-                            <button
-                              key={fontOpt.id}
-                              type="button"
-                              data-testid={`burmese-font-chip-${fontOpt.id}`}
-                              onClick={() => {
-                                playUiSound('select');
-                                setSubtitleConfig({
-                                  ...subtitleConfig,
-                                  fontStyle: fontOpt.id
-                                });
-                              }}
-                              style={{
-                                fontFamily: fontOpt.cssFontFamily,
-                                fontWeight: fontOpt.fontWeight,
-                                letterSpacing: fontOpt.letterSpacing
-                              }}
-                              className={`flex flex-col items-start rounded-xl border px-2.5 py-2 text-left transition-all cursor-pointer ${
-                                isSelected
-                                  ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
-                                  : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
-                              }`}
-                            >
-                              <span className="text-[11px] font-bold leading-snug w-full">
-                                {fontOpt.shortName}
-                              </span>
-                              <span className="text-[10px] opacity-80 leading-relaxed w-full mt-0.5">
-                                စာတန်းထိုး နမူနာအလှ
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Preview Sample Text Header + Light/Dark Switch */}
-                  <div className="flex items-center justify-between pt-1">
-                    <span className="text-xs font-medium text-stone-900 dark:text-white">
-                      {t.previewSampleText}
-                    </span>
-                    <div className="inline-flex items-center rounded-xl border border-stone-200/80 bg-[#F2EFE9] p-0.5 dark:border-slate-700/80 dark:bg-[#151C26]">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setSubtitleConfig({ ...subtitleConfig, samplePreviewLight: true })
-                        }
-                        aria-label="Light preview"
-                        className={`cursor-pointer rounded-lg p-1.5 transition-all ${
-                          subtitleConfig.samplePreviewLight
-                            ? 'bg-white text-stone-900 shadow-2xs dark:bg-amber-500 dark:text-slate-950'
-                            : 'text-stone-400 hover:text-stone-700 dark:hover:text-slate-200'
-                        }`}
-                      >
-                        <Sun className="size-3" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setSubtitleConfig({ ...subtitleConfig, samplePreviewLight: false })
-                        }
-                        aria-label="Dark preview"
-                        className={`cursor-pointer rounded-lg p-1.5 transition-all ${
-                          !subtitleConfig.samplePreviewLight
-                            ? 'bg-white text-stone-900 shadow-2xs dark:bg-amber-500 dark:text-slate-950'
-                            : 'text-stone-400 hover:text-stone-700 dark:hover:text-slate-200'
-                        }`}
-                      >
-                        <Moon className="size-3" />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Preview Box */}
-                  <div
-                    className={`flex min-h-[120px] w-full items-center justify-center rounded-xl border p-5 text-center shadow-xs transition-colors ${
-                      !subtitleConfig.samplePreviewLight
-                        ? 'border-slate-800 bg-[#090C10] text-white'
-                        : 'border-stone-200/90 bg-[#F7F6F2] text-stone-900'
-                    }`}
-                  >
-                    <span
-                      data-testid="sample-caption-preview-text"
-                      style={{
-                        fontFamily: resolveSubtitleFontMeta(
-                          subtitleConfig.fontStyle,
-                          subtitleConfig.subtitleLanguage
-                        ).cssFontFamily,
-                        fontWeight: resolveSubtitleFontMeta(
-                          subtitleConfig.fontStyle,
-                          subtitleConfig.subtitleLanguage
-                        ).fontWeight,
-                        letterSpacing: resolveSubtitleFontMeta(
-                          subtitleConfig.fontStyle,
-                          subtitleConfig.subtitleLanguage
-                        ).letterSpacing,
-                        fontSize: `${Math.max(7, Math.round(0.4 * subtitleConfig.fontSize))}px`,
-                        color:
-                          editConfig.captionTextColor ||
-                          (subtitleConfig.style === 'box_black'
-                            ? '#FDE047'
-                            : !subtitleConfig.samplePreviewLight
-                              ? '#FFFFFF'
-                              : '#171717')
-                      }}
-                      className={`max-w-full overflow-hidden px-2 leading-relaxed font-medium text-ellipsis whitespace-nowrap transition-all select-none ${
-                        subtitleConfig.style === 'box_black'
-                          ? 'rounded-lg bg-black/90 px-3.5 py-1.5'
-                          : !subtitleConfig.samplePreviewLight
-                            ? '[text-shadow:0_1.5px_3px_black]'
-                            : '[text-shadow:0_1px_2px_rgba(255,255,255,0.8)]'
-                      }`}
-                    >
-                      {TARGET_LANGUAGES.find(
-                        (l) => l.code === (subtitleConfig.subtitleLanguage || 'my')
-                      )?.sampleCaption || 'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်'}
-                    </span>
-                  </div>
-
-                  {/* Caption Color Presets & Outline Width */}
-                  <div className="flex flex-col gap-2 pt-0.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-stone-500 dark:text-slate-400">
-                        {uiLang === 'my' ? 'စာတန်းအရောင်' : 'Caption color'}
-                      </span>
-                      <div className="flex items-center gap-1.5">
-                        {CAPTION_COLOR_PRESETS.map((preset) => {
-                          const isSelected = editConfig.captionTextColor === preset.hex;
-                          return (
-                            <button
-                              key={preset.id}
-                              type="button"
-                              data-testid={`caption-color-${preset.id}`}
-                              title={preset.label}
-                              onClick={() => {
-                                playUiSound('select');
-                                setEditConfig((prev) => ({
-                                  ...prev,
-                                  captionTextColor: preset.hex
-                                }));
-                              }}
-                              className={`flex size-5 cursor-pointer items-center justify-center rounded-full border transition-transform active:scale-90 ${
-                                isSelected
-                                  ? 'scale-110 border-amber-500 ring-2 ring-amber-500/35'
-                                  : 'border-stone-300 dark:border-slate-700'
-                              }`}
-                              style={{
-                                background:
-                                  preset.hex ||
-                                  'linear-gradient(135deg, #FFFFFF 50%, #FFE600 50%)'
-                              }}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {subtitleConfig.style === 'outline_black' && (
-                      <div className="flex flex-col gap-1">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="text-stone-500 dark:text-slate-400">
-                            {uiLang === 'my' ? 'စာလုံးအနားသတ် (Outline)' : 'Outline thickness'}
-                          </span>
-                          <span className="font-mono text-[11px] font-semibold text-stone-900 dark:text-white">
-                            {editConfig.captionOutlineWidth}px
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={8}
-                          step={1}
-                          value={editConfig.captionOutlineWidth}
-                          onChange={(e) =>
-                            setEditConfig((prev) => ({
-                              ...prev,
-                              captionOutlineWidth: Number(e.target.value)
-                            }))
-                          }
-                          className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                        />
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Scale Slider */}
-                  <div className="flex flex-col gap-1.5 pt-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-stone-500 dark:text-slate-400">{t.scaleLabel}</span>
-                      <span className="font-mono text-[11px] font-semibold text-stone-900 dark:text-white">
-                        {scalePercent}%
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      data-testid="subtitle-scale-slider"
-                      min={12}
-                      max={68}
-                      step={2}
-                      value={subtitleConfig.fontSize}
-                      onChange={(e) =>
-                        setSubtitleConfig({
-                          ...subtitleConfig,
-                          fontSize: Number(e.target.value)
-                        })
-                      }
-                      className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                    />
-                  </div>
-                </div>
-              )}
-              </div>{/* End Section 02 */}
-
-              {/* SECTION 03 · Blur Watermark & Brand Overlay */}
-              <div className="flex flex-col gap-3 rounded-2xl border border-stone-200/80 bg-white/80 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]">
-                <div className="flex items-center justify-between border-b border-stone-200/70 pb-2 dark:border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">03</span>
-                    <span className="text-xs font-bold text-stone-900 dark:text-white">
-                      {uiLang === 'my' ? 'Watermark ဖျောက်ရန်နှင့် Logo' : 'Watermark Blur & Brand'}
-                    </span>
-                  </div>
-                  <span className="text-[10px] text-stone-400 dark:text-slate-500">
-                    {blurEnabled ? 'Blur On' : 'Clean'}
-                  </span>
-                </div>
-
-                {/* Blur watermark */}
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between">
-                    <DottedTooltipLabel
-                      label={t.blurWatermark}
-                      tooltip="Hides watermarks, channel logos, or captions with blur."
-                    />
-                    {blurEnabled && (
-                      <button
-                        type="button"
-                        data-testid="blur-adjust-btn"
-                        onClick={() => {
-                          playUiSound('tap');
-                          const nextEdit = !isOverlayEditMode;
-                          setIsOverlayEditMode(nextEdit);
-                          if (nextEdit) {
-                            setMobileDrawerOpen(false);
-                          }
-                        }}
-                        className="cursor-pointer rounded-lg bg-amber-500/15 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700 transition-colors hover:bg-amber-500/25 dark:text-amber-300"
-                      >
-                        {isOverlayEditMode ? 'Done' : 'Adjust'}
-                      </button>
-                    )}
-                  </div>
-
-                  <select
-                    data-testid="blur-mode-select"
-                    value={blurMode}
-                    onChange={(e) => {
-                      playUiSound('select');
-                      const next = e.target.value as BlurDropdownMode;
-                      setBlurMode(next);
-                      if (next !== 'off' && blurRegions.length === 0) {
-                        setBlurRegions([
-                          {
-                            id: `blur-${Date.now()}`,
-                            x: 4,
-                            y: 72,
-                            width: 92,
-                            height: 10,
-                            blurStrength: 24
-                          }
-                        ]);
-                        setIsOverlayEditMode(true);
-                      }
-                    }}
-                    className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
-                  >
-                    <option value="off">Off (No Blur)</option>
-                    <option value="auto">Auto (Device Optimized)</option>
-                    <option value="frosted">Frosted Glass (iOS & Desktop)</option>
-                    <option value="simple">Simple Blur (Fast for Mobile)</option>
-                  </select>
 
                   {/* Full-Width Original Subtitle Cover Band */}
-                  <div className="mt-1 flex flex-col gap-2 rounded-xl border border-stone-200/80 bg-[#FAF8F4] px-3 py-2.5 dark:border-slate-800 dark:bg-[#0D1117]">
+                  <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-3 dark:border-slate-800">
                     <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-medium text-stone-900 dark:text-slate-200">
-                        {uiLang === 'my'
-                          ? 'မူရင်းစာတန်း ဖုံးရန် Band'
-                          : 'Full-width subtitle cover band'}
+                      <span className="text-xs font-medium text-stone-800 dark:text-slate-200">
+                        Subtitle Cover Band
                       </span>
                       <StreamWaveSwitch
                         checked={editConfig.coverSubtitleBand.enabled}
@@ -2593,9 +1896,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       <div className="grid grid-cols-3 gap-2 pt-0.5">
                         <div className="flex flex-col gap-1">
                           <div className="flex items-center justify-between text-[10px]">
-                            <span className="text-stone-500 dark:text-slate-400">
-                              {uiLang === 'my' ? 'အမြင့်' : 'Height'}
-                            </span>
+                            <span className="text-stone-500 dark:text-slate-400">Height</span>
                             <span className="font-mono font-semibold text-stone-900 dark:text-white">
                               {editConfig.coverSubtitleBand.heightPct}%
                             </span>
@@ -2622,9 +1923,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
                         <div className="flex flex-col gap-1">
                           <div className="flex items-center justify-between text-[10px]">
-                            <span className="text-stone-500 dark:text-slate-400">
-                              {uiLang === 'my' ? 'အောက်ခြေ' : 'Bottom'}
-                            </span>
+                            <span className="text-stone-500 dark:text-slate-400">Bottom</span>
                             <span className="font-mono font-semibold text-stone-900 dark:text-white">
                               {editConfig.coverSubtitleBand.bottomPct}%
                             </span>
@@ -2679,466 +1978,1097 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     )}
                   </div>
                 </div>
+              )}
 
-                {/* Brand Overlay (Channel Watermark Text + Circular Logo — Credit Mode Only) */}
-                <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
-                  <button
-                    type="button"
-                    data-testid="brand-overlay-accordion-btn"
-                    onClick={() => {
-                      playUiSound('tap');
-                      setIsBrandCardOpen((o) => !o);
-                    }}
-                    className="flex w-full cursor-pointer items-center justify-between rounded-xl border border-stone-200/80 bg-[#FAF8F4] px-3 py-2.5 text-left transition-colors hover:bg-stone-100/80 dark:border-slate-800 dark:bg-[#0D1117] dark:hover:bg-[#151C26]"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <SlidersHorizontal className="size-3.5 text-amber-500 shrink-0" />
-                      <span className="text-xs font-semibold text-stone-900 dark:text-white truncate">
-                        {uiLang === 'my' ? 'Channel Watermark & Logo' : 'Brand Watermark & Logo'}
-                      </span>
-                      {isFreeTier ? (
-                        <span
-                          data-testid="brand-overlay-credit-lock-badge"
-                          className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
-                        >
-                          <Lock className="size-2.5 shrink-0" />
-                          Credit Mode Only
-                        </span>
-                      ) : (
-                        (editConfig.watermarkText.enabled || editConfig.brandLogo.enabled) && (
-                          <span className="rounded-md bg-teal-500/15 px-2 py-0.5 text-[10px] font-bold text-teal-600 dark:text-teal-400">
-                            Active
-                          </span>
-                        )
-                      )}
-                    </div>
-                    <ChevronDown
-                      className={`size-4 text-stone-400 shrink-0 transition-transform ${
-                        isBrandCardOpen ? 'rotate-180' : ''
-                      }`}
+              {/* TAB 2: VOICE · Mode (Recap/Translate), AI Voice, Script Style & Language */}
+              {settingsSubTab === 'voice' && (
+                <div
+                  data-testid="settings-panel-voice"
+                  className="flex flex-col gap-3.5 rounded-2xl border border-stone-200/80 bg-white/85 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]"
+                >
+                  {/* What to make */}
+                  <div className="flex flex-col gap-1.5">
+                    <DottedTooltipLabel
+                      label="What to make"
+                      tooltip="Choose Recap for full voiceover, or Translate to keep original audio."
                     />
-                  </button>
+                    <SlidingPillToggle
+                      options={[
+                        { value: 'recap', label: 'Recap' },
+                        { value: 'translate', label: 'Translate' }
+                      ]}
+                      value={mode}
+                      onChange={(val) => {
+                        playUiSound('select');
+                        setMode(val);
+                        if (val === 'translate' && translateAudio === 'captions-only') {
+                          setSubtitleConfig({ ...subtitleConfig, enabled: true });
+                        }
+                      }}
+                    />
+                  </div>
 
-                  {isBrandCardOpen && (
-                    <div className="flex flex-col gap-3 rounded-xl border border-stone-200/80 bg-[#FAF8F4] p-3 dark:border-slate-800 dark:bg-[#0D1117]">
-                      {isFreeTier && (
-                        <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-700 dark:text-amber-300">
-                          <span className="font-medium leading-snug">
-                            {uiLang === 'my'
-                              ? 'Free Mode တွင် Channel Watermark နှင့် Logo သုံးခွင့်မရှိပါ။ Credit Mode တွင်သာ သုံးနိုင်ပါသည်။'
-                              : 'Channel Watermark & Logo is exclusive to Credit Mode.'}
-                          </span>
-                          {onNavigateToProStudio && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                playUiSound('tap');
-                                onNavigateToProStudio();
-                              }}
-                              className="shrink-0 cursor-pointer rounded-lg bg-amber-500 hover:bg-amber-400 px-2.5 py-1 text-[10px] font-bold text-slate-950"
-                            >
-                              Credit Mode
-                            </button>
-                          )}
-                        </div>
-                      )}
+                  {/* Audio (when Translate is selected) */}
+                  {mode === 'translate' && (
+                    <div className="flex flex-col gap-1.5 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                      <DottedTooltipLabel
+                        label="Audio mode"
+                        tooltip="Dub translates voices into your language. Captions only keeps original audio and adds subtitles."
+                      />
+                      <SlidingPillToggle
+                        options={[
+                          { value: 'dub', label: 'Dub' },
+                          { value: 'captions-only', label: 'Captions only' }
+                        ]}
+                        value={translateAudio}
+                        onChange={(val) => {
+                          playUiSound('select');
+                          setTranslateAudio(val);
+                          if (val === 'captions-only') {
+                            setSubtitleConfig({ ...subtitleConfig, enabled: true });
+                          }
+                        }}
+                      />
+                    </div>
+                  )}
 
-                      {/* Channel Watermark Text */}
-                      <div className="flex flex-col gap-2">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <Type className="size-3.5 text-stone-500 dark:text-slate-400" />
-                            <span className="text-[11px] font-semibold text-stone-900 dark:text-white">
-                              {uiLang === 'my' ? 'Watermark စာသား' : 'Watermark Text'}
+                  {/* Voice Selector (Free Mode = Thiha & Nilar; Credit Mode = All 10 Voices) */}
+                  {(mode === 'recap' || translateAudio === 'dub') && (
+                    <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                          Voice
+                        </span>
+                        <span className="text-[10px] font-semibold text-teal-600 dark:text-teal-400">
+                          {isFreeTier ? 'Free: 2 Voices' : 'Credit Mode: All 10 Voices'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="voice-selector-select"
+                        onClick={() => {
+                          playUiSound('open');
+                          setIsVoicePickerOpen(true);
+                        }}
+                        className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2.5 rounded-xl border border-stone-200/90 bg-white px-3.5 py-2 text-left text-xs text-stone-900 shadow-2xs transition-colors hover:border-amber-500/60 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white dark:hover:border-amber-400/60"
+                      >
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <span
+                            className="size-5 shrink-0 rounded-full border border-white/30 shadow-xs"
+                            style={{ background: selectedVoiceObj.orbGradient }}
+                          />
+                          <div className="flex min-w-0 flex-col">
+                            <span className="truncate text-xs font-semibold text-gray-900 dark:text-white">
+                              {selectedVoiceObj.nameEn.split('·')[0].trim()}
+                            </span>
+                            <span className="truncate text-[10px] text-neutral-500 dark:text-neutral-400">
+                              {selectedVoiceObj.genderLabel} · {selectedVoiceObj.tone}
                             </span>
                           </div>
-                          <StreamWaveSwitch
-                            checked={!isFreeTier && editConfig.watermarkText.enabled}
-                            disabled={isFreeTier}
-                            locked={isFreeTier}
-                            onCheckedChange={(checked) => {
-                              if (isFreeTier) return;
-                              playUiSound('select');
-                              setEditConfig((prev) => ({
-                                ...prev,
-                                watermarkText: { ...prev.watermarkText, enabled: checked }
-                              }));
-                            }}
-                          />
                         </div>
+                        <ChevronDown className="size-4 shrink-0 text-neutral-400" />
+                      </button>
 
-                        {!isFreeTier && editConfig.watermarkText.enabled && (
-                          <div className="flex flex-col gap-2 pt-0.5">
-                            <input
-                              type="text"
-                              data-testid="watermark-text-input"
-                              maxLength={60}
-                              placeholder="@ChannelName"
-                              value={editConfig.watermarkText.text}
-                              onChange={(e) =>
-                                setEditConfig((prev) => ({
-                                  ...prev,
-                                  watermarkText: {
-                                    ...prev.watermarkText,
-                                    text: e.target.value
-                                  }
-                                }))
-                              }
-                              className="h-9 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs text-stone-900 outline-none focus:border-amber-500 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
-                            />
+                      {/* Interactive AI Voice Preview Button */}
+                      <div className="flex flex-col gap-1.5 pt-0.5">
+                        <button
+                          type="button"
+                          data-testid="preview-voice-btn"
+                          onClick={() => handlePreviewVoice()}
+                          disabled={isLoadingVoicePreview}
+                          className={`inline-flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-xl border px-3.5 text-xs font-semibold transition-all active:scale-98 disabled:opacity-50 ${
+                            isPlayingVoicePreview
+                              ? 'border-teal-500/60 bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                              : 'border-stone-200/90 bg-[#FAF8F4] text-stone-800 hover:bg-stone-100 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]'
+                          }`}
+                        >
+                          {isLoadingVoicePreview ? (
+                            <>
+                              <Loader2 className="size-3.5 animate-spin text-teal-500" />
+                              <span>Synthesizing AI Voice Sample…</span>
+                            </>
+                          ) : isPlayingVoicePreview ? (
+                            <>
+                              <Square className="size-3.5 fill-current text-teal-500" />
+                              <span>
+                                Stop Sample ({selectedVoiceObj.nameEn.split('·')[0].trim()})
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <Volume2 className="size-3.5 text-amber-500" />
+                              <span>
+                                Preview AI Voice ({selectedVoiceObj.nameEn.split('·')[0].trim()})
+                              </span>
+                            </>
+                          )}
+                        </button>
 
-                            <div className="grid grid-cols-2 gap-2.5">
-                              <div className="flex flex-col gap-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-stone-500 dark:text-slate-400">Size</span>
-                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                    {editConfig.watermarkText.sizePx}px
-                                  </span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min={10}
-                                  max={40}
-                                  step={1}
-                                  value={editConfig.watermarkText.sizePx}
-                                  onChange={(e) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      watermarkText: {
-                                        ...prev.watermarkText,
-                                        sizePx: Number(e.target.value)
-                                      }
-                                    }))
-                                  }
-                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                                />
-                              </div>
-
-                              <div className="flex flex-col gap-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-stone-500 dark:text-slate-400">Opacity</span>
-                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                    {editConfig.watermarkText.opacity}%
-                                  </span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min={10}
-                                  max={100}
-                                  step={5}
-                                  value={editConfig.watermarkText.opacity}
-                                  onChange={(e) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      watermarkText: {
-                                        ...prev.watermarkText,
-                                        opacity: Number(e.target.value)
-                                      }
-                                    }))
-                                  }
-                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                                />
-                              </div>
-                            </div>
-
-                            <div className="flex items-center justify-between pt-0.5">
-                              <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-stone-500 dark:text-slate-400">
-                                  {uiLang === 'my' ? 'တည်နေရာ' : 'Position'}
-                                </span>
-                                <CompactNineGridPicker
-                                  value={editConfig.watermarkText.pos}
-                                  onChange={(pos) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      watermarkText: { ...prev.watermarkText, pos, moving: false }
-                                    }))
-                                  }
-                                />
-                              </div>
-
-                              <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-medium text-stone-600 dark:text-slate-300">
-                                <input
-                                  type="checkbox"
-                                  checked={editConfig.watermarkText.moving}
-                                  onChange={(e) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      watermarkText: {
-                                        ...prev.watermarkText,
-                                        moving: e.target.checked
-                                      }
-                                    }))
-                                  }
-                                  className="accent-amber-500"
-                                />
-                                <span>{uiLang === 'my' ? 'ရွေ့လျားမည်' : 'Moving'}</span>
-                              </label>
-                            </div>
+                        {(isPlayingVoicePreview || voicePreviewSampleLine) && (
+                          <div
+                            data-testid="voice-preview-sample-banner"
+                            className="rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-3 py-1.5 text-[11px] text-amber-800 dark:text-amber-300"
+                          >
+                            <span className="font-semibold">
+                              {isPlayingVoicePreview ? '🔊 Playing: ' : 'Sample: '}
+                            </span>
+                            <span>“{voicePreviewSampleLine}”</span>
                           </div>
                         )}
                       </div>
 
-                      {/* Circular Brand Logo */}
-                      <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <ImageIcon className="size-3.5 text-stone-500 dark:text-slate-400" />
-                            <span className="text-[11px] font-semibold text-stone-900 dark:text-white">
-                              {uiLang === 'my' ? 'အဝိုင်း Logo ထည့်ရန်' : 'Circular Brand Logo'}
-                            </span>
-                          </div>
-                          <StreamWaveSwitch
-                            checked={!isFreeTier && editConfig.brandLogo.enabled}
-                            disabled={isFreeTier}
-                            locked={isFreeTier}
-                            onCheckedChange={(checked) => {
-                              if (isFreeTier) return;
-                              playUiSound('select');
-                              setEditConfig((prev) => ({
-                                ...prev,
-                                brandLogo: { ...prev.brandLogo, enabled: checked }
-                              }));
-                            }}
-                          />
+                      {isFreeTier && (
+                        <p className="text-[11px] text-stone-500 dark:text-slate-400">
+                          Free Mode includes Thiha (Male) & Nilar (Female).
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Script style (Recap only) or Cinematic Translation info (Translate) + Language */}
+                  <div className="flex flex-col gap-3 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                    {mode === 'recap' ? (
+                      <div className="flex flex-col gap-1.5">
+                        <DottedTooltipLabel
+                          label="Script style"
+                          tooltip="Choose the tone and pacing for your narration."
+                        />
+                        <select
+                          value={scriptStyle}
+                          onChange={(e) => {
+                            playUiSound('select');
+                            setScriptStyle(e.target.value as ScriptStyleId);
+                          }}
+                          className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                        >
+                          <option value="narrator">Fast Recap</option>
+                          <option value="drama">Storytelling</option>
+                          <option value="casual">Gen Z</option>
+                          <option value="news">News</option>
+                          <option value="none">Documentary</option>
+                        </select>
+                      </div>
+                    ) : (
+                      <div
+                        data-testid="translate-dialogue-hint"
+                        className="rounded-xl border border-teal-500/30 bg-teal-500/8 px-3 py-2 text-[11px] leading-relaxed text-teal-800 dark:border-teal-500/25 dark:bg-teal-500/10 dark:text-teal-200"
+                      >
+                        <span className="font-bold block">
+                          {translateAudio === 'captions-only'
+                            ? 'Captions Only · Original Audio + Movie Subtitles'
+                            : 'Translate & Dub · Natural Movie Dialogue Dubbing'}
+                        </span>
+                        <span className="text-[10px] opacity-85">
+                          Translates natural spoken character dialogue line-by-line rather than summarizing like a recap.
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Language */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                        Language
+                      </span>
+                      <div className="flex h-10.5 w-full items-center gap-2 rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white">
+                        <span className="text-sm">
+                          {TARGET_LANGUAGES.find((l) => l.code === targetLanguage)?.flag || '🇲🇲'}
+                        </span>
+                        <select
+                          value={targetLanguage}
+                          onChange={(e) => {
+                            playUiSound('select');
+                            setTargetLanguage(e.target.value as TargetLanguageCode);
+                          }}
+                          className="w-full bg-transparent text-xs font-medium text-stone-900 dark:text-white outline-none cursor-pointer"
+                        >
+                          {TARGET_LANGUAGES.map((l) => (
+                            <option
+                              key={l.code}
+                              value={l.code}
+                              className="bg-white dark:bg-[#151C26] text-stone-900 dark:text-white"
+                            >
+                              {l.labelEn}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 3: CAPTIONS · Toggle, Style, Subtitle Language, Burmese Fonts, Colors & Scale */}
+              {settingsSubTab === 'captions' && (
+                <div
+                  data-testid="settings-panel-captions"
+                  className="flex flex-col gap-3 rounded-2xl border border-stone-200/80 bg-white/85 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]"
+                >
+                  {/* Captions Toggle + Style */}
+                  <div className="flex flex-col gap-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-stone-900 dark:text-white">
+                        Captions
+                      </span>
+                      <StreamWaveSwitch
+                        checked={subtitleConfig.enabled}
+                        onCheckedChange={(checked) => {
+                          setSubtitleConfig({ ...subtitleConfig, enabled: checked });
+                          if (!checked && mode === 'translate' && translateAudio === 'captions-only') {
+                            setTranslateAudio('dub');
+                          }
+                        }}
+                      />
+                    </div>
+
+                    {subtitleConfig.enabled && (
+                      <SlidingPillToggle
+                        options={[
+                          { value: 'outline_black', label: 'Outline' },
+                          { value: 'box_black', label: 'Highlight' }
+                        ]}
+                        value={subtitleConfig.style}
+                        onChange={(val) =>
+                          setSubtitleConfig({ ...subtitleConfig, style: val })
+                        }
+                      />
+                    )}
+                  </div>
+
+                  {!subtitleConfig.enabled && (
+                    <p className="border-t border-stone-200/70 pt-3 text-[11px] text-stone-500 dark:border-slate-800 dark:text-slate-400">
+                      Captions are turned off. Turn on Captions to customize language, fonts, colors, and size.
+                    </p>
+                  )}
+
+                  {subtitleConfig.enabled && (
+                    <div className="flex flex-col gap-3 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                      {/* Subtitle Display Language Selector */}
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                            Subtitle Language
+                          </span>
+                          <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                            {isTranslatingSubtitles
+                              ? 'Translating...'
+                              : (subtitleConfig.subtitleLanguage || 'my') === 'my'
+                                ? 'MYANMAR SUB'
+                                : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · MY VOICE`}
+                          </span>
                         </div>
 
-                        {!isFreeTier && editConfig.brandLogo.enabled && (
-                          <div className="flex flex-col gap-2 pt-0.5">
-                            <input
-                              ref={logoFileInputRef}
-                              type="file"
-                              accept="image/png,image/jpeg,image/webp"
-                              className="hidden"
-                              onChange={async (e) => {
-                                const file = e.target.files?.[0];
-                                e.target.value = '';
-                                if (!file) return;
-                                try {
-                                  const dataUrl = await processLogoFileToSquarePng(file);
-                                  setEditConfig((prev) => ({
-                                    ...prev,
-                                    brandLogo: { ...prev.brandLogo, dataUrl }
-                                  }));
-                                } catch {}
-                              }}
-                            />
-                            <div className="flex items-center gap-2">
-                              {editConfig.brandLogo.dataUrl && (
-                                <img
-                                  src={editConfig.brandLogo.dataUrl}
-                                  alt="Brand logo preview"
-                                  className="size-9 shrink-0 rounded-full border border-stone-300 object-cover dark:border-slate-700"
-                                />
-                              )}
-                              <button
-                                type="button"
-                                data-testid="upload-brand-logo-btn"
-                                onClick={() => logoFileInputRef.current?.click()}
-                                className="h-9 flex-1 cursor-pointer rounded-xl border border-stone-200/90 bg-white px-3 text-[11px] font-semibold text-stone-800 hover:bg-stone-50 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]"
-                              >
-                                {editConfig.brandLogo.dataUrl
-                                  ? uiLang === 'my'
-                                    ? 'Logo ပြောင်းမည်'
-                                    : 'Change Logo'
-                                  : uiLang === 'my'
-                                    ? 'Logo ပုံရွေးမည် (PNG/JPG)'
-                                    : 'Upload Logo (PNG/JPG)'}
-                              </button>
-                              {editConfig.brandLogo.dataUrl && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      brandLogo: { ...prev.brandLogo, dataUrl: undefined }
-                                    }))
-                                  }
-                                  className="flex size-9 cursor-pointer items-center justify-center rounded-xl border border-stone-200/80 text-stone-400 hover:text-red-500 dark:border-slate-700/80"
-                                  title="Remove logo"
-                                >
-                                  <Trash2 className="size-3.5" />
-                                </button>
-                              )}
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-2.5">
-                              <div className="flex flex-col gap-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-stone-500 dark:text-slate-400">Size</span>
-                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                    {editConfig.brandLogo.sizePx}px
-                                  </span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min={24}
-                                  max={120}
-                                  step={4}
-                                  value={editConfig.brandLogo.sizePx}
-                                  onChange={(e) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      brandLogo: {
-                                        ...prev.brandLogo,
-                                        sizePx: Number(e.target.value)
-                                      }
-                                    }))
-                                  }
-                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                                />
-                              </div>
-
-                              <div className="flex flex-col gap-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-stone-500 dark:text-slate-400">Opacity</span>
-                                  <span className="font-mono font-semibold text-stone-900 dark:text-white">
-                                    {editConfig.brandLogo.opacity}%
-                                  </span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min={10}
-                                  max={100}
-                                  step={5}
-                                  value={editConfig.brandLogo.opacity}
-                                  onChange={(e) =>
-                                    setEditConfig((prev) => ({
-                                      ...prev,
-                                      brandLogo: {
-                                        ...prev.brandLogo,
-                                        opacity: Number(e.target.value)
-                                      }
-                                    }))
-                                  }
-                                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
-                                />
-                              </div>
-                            </div>
-
-                            <div className="flex items-center justify-between pt-0.5">
-                              <span className="text-[10px] text-stone-500 dark:text-slate-400">
-                                {uiLang === 'my' ? 'Logo တည်နေရာ' : 'Logo Position'}
-                              </span>
-                              <CompactNineGridPicker
-                                value={editConfig.brandLogo.pos}
-                                onChange={(pos) =>
-                                  setEditConfig((prev) => ({
-                                    ...prev,
-                                    brandLogo: { ...prev.brandLogo, pos }
-                                  }))
+                        <select
+                          data-testid="subtitle-language-select"
+                          aria-label="Subtitle display language"
+                          value={subtitleConfig.subtitleLanguage || 'my'}
+                          disabled={isTranslatingSubtitles}
+                          onChange={async (e) => {
+                            playUiSound('select');
+                            const nextSubLang = e.target.value as TargetLanguageCode;
+                            setSubtitleConfig((prev) => ({
+                              ...prev,
+                              subtitleLanguage: nextSubLang
+                            }));
+                            if (cues.length > 0) {
+                              setIsTranslatingSubtitles(true);
+                              try {
+                                const resp = await fetch('/api/recap/translate-subtitles', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({
+                                    cues,
+                                    subtitleLanguage: nextSubLang,
+                                    isFreeMode: isFreeTier
+                                  })
+                                });
+                                const data = await resp.json();
+                                if (data?.ok && Array.isArray(data.cues)) {
+                                  setCues(data.cues);
                                 }
-                              />
+                              } catch {}
+                              setIsTranslatingSubtitles(false);
+                            }
+                          }}
+                          className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                        >
+                          {TARGET_LANGUAGES.map((langOpt) => (
+                            <option key={langOpt.code} value={langOpt.code}>
+                              {langOpt.flag} {langOpt.labelEn}{' '}
+                              {langOpt.code === 'my'
+                                ? '(Default Burmese Sub)'
+                                : '(Translated Sub · Burmese Voice)'}
+                            </option>
+                          ))}
+                        </select>
+
+                        {/* Quick Language Chips */}
+                        <div className="grid grid-cols-3 gap-1.5">
+                          {TARGET_LANGUAGES.map((langOpt) => {
+                            const activeSubLang = subtitleConfig.subtitleLanguage || 'my';
+                            const isSelected = activeSubLang === langOpt.code;
+                            return (
+                              <button
+                                key={langOpt.code}
+                                type="button"
+                                data-testid={`subtitle-lang-chip-${langOpt.code}`}
+                                disabled={isTranslatingSubtitles}
+                                onClick={async () => {
+                                  playUiSound('select');
+                                  const nextSubLang = langOpt.code;
+                                  setSubtitleConfig((prev) => ({
+                                    ...prev,
+                                    subtitleLanguage: nextSubLang
+                                  }));
+                                  if (cues.length > 0) {
+                                    setIsTranslatingSubtitles(true);
+                                    try {
+                                      const resp = await fetch('/api/recap/translate-subtitles', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                          cues,
+                                          subtitleLanguage: nextSubLang,
+                                          isFreeMode: isFreeTier
+                                        })
+                                      });
+                                      const data = await resp.json();
+                                      if (data?.ok && Array.isArray(data.cues)) {
+                                        setCues(data.cues);
+                                      }
+                                    } catch {}
+                                    setIsTranslatingSubtitles(false);
+                                  }
+                                }}
+                                className={`flex items-center justify-center gap-1.5 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
+                                  isSelected
+                                    ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
+                                    : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
+                                }`}
+                              >
+                                <span>{langOpt.flag}</span>
+                                <span className="truncate">{langOpt.labelEn}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {(subtitleConfig.subtitleLanguage || 'my') !== 'my' && (
+                          <p className="text-[11px] leading-relaxed text-teal-700 dark:text-teal-400">
+                            ✓ Voiceover audio stays Burmese while on-screen subtitles translate to{' '}
+                            {TARGET_LANGUAGES.find((l) => l.code === subtitleConfig.subtitleLanguage)?.labelEn ||
+                              subtitleConfig.subtitleLanguage}
+                            .
+                          </p>
+                        )}
+                      </div>
+
+                      {(subtitleConfig.subtitleLanguage || 'my') === 'my' && targetLanguage === 'my' && (
+                        <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
+                              Font Style
+                            </span>
+                            <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-teal-600 dark:text-teal-400">
+                              {resolveBurmeseFontMeta(subtitleConfig.fontStyle).badge}
+                            </span>
+                          </div>
+                          <select
+                            data-testid="burmese-font-select"
+                            value={subtitleConfig.fontStyle}
+                            onChange={(e) => {
+                              playUiSound('select');
+                              setSubtitleConfig({
+                                ...subtitleConfig,
+                                fontStyle: e.target.value as BurmeseFontStyle
+                              });
+                            }}
+                            style={{
+                              fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily
+                            }}
+                            className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                          >
+                            {BURMESE_FONT_STYLES.map((fontOpt) => (
+                              <option key={fontOpt.id} value={fontOpt.id}>
+                                {fontOpt.label}
+                              </option>
+                            ))}
+                          </select>
+
+                          {/* Visual Myanmar Font Style Quick Chips */}
+                          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                            {BURMESE_FONT_STYLES.slice(0, 6).map((fontOpt) => {
+                              const isSelected = subtitleConfig.fontStyle === fontOpt.id;
+                              return (
+                                <button
+                                  key={fontOpt.id}
+                                  type="button"
+                                  data-testid={`burmese-font-chip-${fontOpt.id}`}
+                                  onClick={() => {
+                                    playUiSound('select');
+                                    setSubtitleConfig({
+                                      ...subtitleConfig,
+                                      fontStyle: fontOpt.id
+                                    });
+                                  }}
+                                  style={{
+                                    fontFamily: fontOpt.cssFontFamily,
+                                    fontWeight: fontOpt.fontWeight,
+                                    letterSpacing: fontOpt.letterSpacing
+                                  }}
+                                  className={`flex flex-col items-start rounded-xl border px-2.5 py-2 text-left transition-all cursor-pointer ${
+                                    isSelected
+                                      ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
+                                      : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
+                                  }`}
+                                >
+                                  <span className="text-[11px] font-bold leading-snug w-full">
+                                    {fontOpt.shortName}
+                                  </span>
+                                  <span className="text-[10px] opacity-80 leading-relaxed w-full mt-0.5">
+                                    စာတန်းထိုး နမူနာအလှ
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Preview Sample Text Header + Light/Dark Switch */}
+                      <div className="flex items-center justify-between border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                        <span className="text-xs font-medium text-stone-900 dark:text-white">
+                          Preview sample text
+                        </span>
+                        <div className="inline-flex items-center rounded-xl border border-stone-200/80 bg-[#F2EFE9] p-0.5 dark:border-slate-700/80 dark:bg-[#151C26]">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSubtitleConfig({ ...subtitleConfig, samplePreviewLight: true })
+                            }
+                            aria-label="Light preview"
+                            className={`cursor-pointer rounded-lg p-1.5 transition-all ${
+                              subtitleConfig.samplePreviewLight
+                                ? 'bg-white text-stone-900 shadow-2xs dark:bg-amber-500 dark:text-slate-950'
+                                : 'text-stone-400 hover:text-stone-700 dark:hover:text-slate-200'
+                            }`}
+                          >
+                            <Sun className="size-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSubtitleConfig({ ...subtitleConfig, samplePreviewLight: false })
+                            }
+                            aria-label="Dark preview"
+                            className={`cursor-pointer rounded-lg p-1.5 transition-all ${
+                              !subtitleConfig.samplePreviewLight
+                                ? 'bg-white text-stone-900 shadow-2xs dark:bg-amber-500 dark:text-slate-950'
+                                : 'text-stone-400 hover:text-stone-700 dark:hover:text-slate-200'
+                            }`}
+                          >
+                            <Moon className="size-3" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Preview Box */}
+                      <div
+                        className={`flex min-h-[104px] w-full items-center justify-center rounded-xl border p-4 text-center shadow-xs transition-colors ${
+                          !subtitleConfig.samplePreviewLight
+                            ? 'border-slate-800 bg-[#090C10] text-white'
+                            : 'border-stone-200/90 bg-[#F7F6F2] text-stone-900'
+                        }`}
+                      >
+                        <span
+                          data-testid="sample-caption-preview-text"
+                          style={{
+                            fontFamily: resolveSubtitleFontMeta(
+                              subtitleConfig.fontStyle,
+                              subtitleConfig.subtitleLanguage
+                            ).cssFontFamily,
+                            fontWeight: resolveSubtitleFontMeta(
+                              subtitleConfig.fontStyle,
+                              subtitleConfig.subtitleLanguage
+                            ).fontWeight,
+                            letterSpacing: resolveSubtitleFontMeta(
+                              subtitleConfig.fontStyle,
+                              subtitleConfig.subtitleLanguage
+                            ).letterSpacing,
+                            fontSize: `${Math.max(7, Math.round(0.4 * subtitleConfig.fontSize))}px`,
+                            color:
+                              editConfig.captionTextColor ||
+                              (subtitleConfig.style === 'box_black'
+                                ? '#FDE047'
+                                : !subtitleConfig.samplePreviewLight
+                                  ? '#FFFFFF'
+                                  : '#171717')
+                          }}
+                          className={`max-w-full overflow-hidden px-2 leading-relaxed font-medium text-ellipsis whitespace-nowrap transition-all select-none ${
+                            subtitleConfig.style === 'box_black'
+                              ? 'rounded-lg bg-black/90 px-3.5 py-1.5'
+                              : !subtitleConfig.samplePreviewLight
+                                ? '[text-shadow:0_1.5px_3px_black]'
+                                : '[text-shadow:0_1px_2px_rgba(255,255,255,0.8)]'
+                          }`}
+                        >
+                          {TARGET_LANGUAGES.find(
+                            (l) => l.code === (subtitleConfig.subtitleLanguage || 'my')
+                          )?.sampleCaption || 'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်'}
+                        </span>
+                      </div>
+
+                      {/* Caption Color Presets & Outline Width */}
+                      <div className="flex flex-col gap-2 pt-0.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-stone-500 dark:text-slate-400">
+                            Caption color
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            {CAPTION_COLOR_PRESETS.map((preset) => {
+                              const isSelected = editConfig.captionTextColor === preset.hex;
+                              return (
+                                <button
+                                  key={preset.id}
+                                  type="button"
+                                  data-testid={`caption-color-${preset.id}`}
+                                  title={preset.label}
+                                  onClick={() => {
+                                    playUiSound('select');
+                                    setEditConfig((prev) => ({
+                                      ...prev,
+                                      captionTextColor: preset.hex
+                                    }));
+                                  }}
+                                  className={`flex size-5 cursor-pointer items-center justify-center rounded-full border transition-transform active:scale-90 ${
+                                    isSelected
+                                      ? 'scale-110 border-amber-500 ring-2 ring-amber-500/35'
+                                      : 'border-stone-300 dark:border-slate-700'
+                                  }`}
+                                  style={{
+                                    background:
+                                      preset.hex ||
+                                      'linear-gradient(135deg, #FFFFFF 50%, #FFE600 50%)'
+                                  }}
+                                />
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        {subtitleConfig.style === 'outline_black' && (
+                          <div className="flex flex-col gap-1">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-stone-500 dark:text-slate-400">
+                                Outline thickness
+                              </span>
+                              <span className="font-mono text-[11px] font-semibold text-stone-900 dark:text-white">
+                                {editConfig.captionOutlineWidth}px
+                              </span>
                             </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={8}
+                              step={1}
+                              value={editConfig.captionOutlineWidth}
+                              onChange={(e) =>
+                                setEditConfig((prev) => ({
+                                  ...prev,
+                                  captionOutlineWidth: Number(e.target.value)
+                                }))
+                              }
+                              className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                            />
                           </div>
                         )}
+                      </div>
+
+                      {/* Scale Slider */}
+                      <div className="flex flex-col gap-1.5 pt-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-stone-500 dark:text-slate-400">Scale</span>
+                          <span className="font-mono text-[11px] font-semibold text-stone-900 dark:text-white">
+                            {scalePercent}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          data-testid="subtitle-scale-slider"
+                          min={12}
+                          max={68}
+                          step={2}
+                          value={subtitleConfig.fontSize}
+                          onChange={(e) =>
+                            setSubtitleConfig({
+                              ...subtitleConfig,
+                              fontSize: Number(e.target.value)
+                            })
+                          }
+                          className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                        />
                       </div>
                     </div>
                   )}
                 </div>
-              </div>{/* End Section 03 */}
+              )}
 
-              {/* SECTION 04 · Anti-Copyright Effects */}
-              <div className="flex flex-col gap-1 rounded-2xl border border-stone-200/80 bg-white/80 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]">
-                <div className="flex items-center justify-between border-b border-stone-200/70 pb-2 mb-1 dark:border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">04</span>
-                    <span className="text-xs font-bold text-stone-900 dark:text-white">
-                      {uiLang === 'my' ? 'Copyright ကာကွယ်မှု Effects' : t.effectsLabel}
-                    </span>
+              {/* TAB 4: COPYRIGHT EFFECTS · Brand Watermark & Logo (Pro) + Anti-Copyright Effects */}
+              {settingsSubTab === 'extra' && (
+                <div
+                  data-testid="settings-panel-extra"
+                  className="flex flex-col gap-3.5 rounded-2xl border border-stone-200/80 bg-white/85 p-3.5 dark:border-slate-800/90 dark:bg-[#111720]"
+                >
+                  {/* Brand Overlay (Channel Watermark Text + Circular Logo — Credit Mode Only) */}
+                  <div className="flex flex-col gap-2">
+                    <button
+                      type="button"
+                      data-testid="brand-overlay-accordion-btn"
+                      onClick={() => {
+                        playUiSound('tap');
+                        setIsBrandCardOpen((o) => !o);
+                      }}
+                      className="flex w-full cursor-pointer items-center justify-between rounded-xl border border-stone-200/80 bg-[#FAF8F4] px-3 py-2.5 text-left transition-colors hover:bg-stone-100/80 dark:border-slate-800 dark:bg-[#0D1117] dark:hover:bg-[#151C26]"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <SlidersHorizontal className="size-3.5 text-amber-500 shrink-0" />
+                        <span className="text-xs font-semibold text-stone-900 dark:text-white truncate">
+                          Brand Watermark & Logo
+                        </span>
+                        {isFreeTier ? (
+                          <span
+                            data-testid="brand-overlay-credit-lock-badge"
+                            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
+                          >
+                            <Lock className="size-2.5 shrink-0" />
+                            Credit Mode Only
+                          </span>
+                        ) : (
+                          (editConfig.watermarkText.enabled || editConfig.brandLogo.enabled) && (
+                            <span className="rounded-md bg-teal-500/15 px-2 py-0.5 text-[10px] font-bold text-teal-600 dark:text-teal-400">
+                              Active
+                            </span>
+                          )
+                        )}
+                      </div>
+                      <ChevronDown
+                        className={`size-4 text-stone-400 shrink-0 transition-transform ${
+                          isBrandCardOpen ? 'rotate-180' : ''
+                        }`}
+                      />
+                    </button>
+
+                    {isBrandCardOpen && (
+                      <div className="flex flex-col gap-3 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
+                        {isFreeTier && (
+                          <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-700 dark:text-amber-300">
+                            <span className="font-medium leading-snug">
+                              Brand Watermark & Logo is exclusive to Credit Mode.
+                            </span>
+                            {onNavigateToProStudio && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  playUiSound('tap');
+                                  onNavigateToProStudio();
+                                }}
+                                className="shrink-0 cursor-pointer rounded-lg bg-amber-500 hover:bg-amber-400 px-2.5 py-1 text-[10px] font-bold text-slate-950"
+                              >
+                                Credit Mode
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Channel Watermark Text */}
+                        <div className="flex flex-col gap-2">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-1.5">
+                              <Type className="size-3.5 text-stone-500 dark:text-slate-400" />
+                              <span className="text-[11px] font-semibold text-stone-900 dark:text-white">
+                                Watermark Text
+                              </span>
+                            </div>
+                            <StreamWaveSwitch
+                              checked={!isFreeTier && editConfig.watermarkText.enabled}
+                              disabled={isFreeTier}
+                              locked={isFreeTier}
+                              onCheckedChange={(checked) => {
+                                if (isFreeTier) return;
+                                playUiSound('select');
+                                setEditConfig((prev) => ({
+                                  ...prev,
+                                  watermarkText: { ...prev.watermarkText, enabled: checked }
+                                }));
+                              }}
+                            />
+                          </div>
+
+                          {!isFreeTier && editConfig.watermarkText.enabled && (
+                            <div className="flex flex-col gap-2 pt-0.5">
+                              <input
+                                type="text"
+                                data-testid="watermark-text-input"
+                                maxLength={60}
+                                placeholder="@ChannelName"
+                                value={editConfig.watermarkText.text}
+                                onChange={(e) =>
+                                  setEditConfig((prev) => ({
+                                    ...prev,
+                                    watermarkText: {
+                                      ...prev.watermarkText,
+                                      text: e.target.value
+                                    }
+                                  }))
+                                }
+                                className="h-9 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs text-stone-900 outline-none focus:border-amber-500 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
+                              />
+
+                              <div className="grid grid-cols-2 gap-2.5">
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between text-[10px]">
+                                    <span className="text-stone-500 dark:text-slate-400">Size</span>
+                                    <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                      {editConfig.watermarkText.sizePx}px
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={10}
+                                    max={40}
+                                    step={1}
+                                    value={editConfig.watermarkText.sizePx}
+                                    onChange={(e) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        watermarkText: {
+                                          ...prev.watermarkText,
+                                          sizePx: Number(e.target.value)
+                                        }
+                                      }))
+                                    }
+                                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                  />
+                                </div>
+
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between text-[10px]">
+                                    <span className="text-stone-500 dark:text-slate-400">Opacity</span>
+                                    <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                      {editConfig.watermarkText.opacity}%
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={10}
+                                    max={100}
+                                    step={5}
+                                    value={editConfig.watermarkText.opacity}
+                                    onChange={(e) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        watermarkText: {
+                                          ...prev.watermarkText,
+                                          opacity: Number(e.target.value)
+                                        }
+                                      }))
+                                    }
+                                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between pt-0.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] text-stone-500 dark:text-slate-400">
+                                    Position
+                                  </span>
+                                  <CompactNineGridPicker
+                                    value={editConfig.watermarkText.pos}
+                                    onChange={(pos) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        watermarkText: { ...prev.watermarkText, pos, moving: false }
+                                      }))
+                                    }
+                                  />
+                                </div>
+
+                                <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-medium text-stone-600 dark:text-slate-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={editConfig.watermarkText.moving}
+                                    onChange={(e) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        watermarkText: {
+                                          ...prev.watermarkText,
+                                          moving: e.target.checked
+                                        }
+                                      }))
+                                    }
+                                    className="accent-amber-500"
+                                  />
+                                  <span>Moving</span>
+                                </label>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Circular Brand Logo */}
+                        <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-2.5 dark:border-slate-800">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-1.5">
+                              <ImageIcon className="size-3.5 text-stone-500 dark:text-slate-400" />
+                              <span className="text-[11px] font-semibold text-stone-900 dark:text-white">
+                                Circular Brand Logo
+                              </span>
+                            </div>
+                            <StreamWaveSwitch
+                              checked={!isFreeTier && editConfig.brandLogo.enabled}
+                              disabled={isFreeTier}
+                              locked={isFreeTier}
+                              onCheckedChange={(checked) => {
+                                if (isFreeTier) return;
+                                playUiSound('select');
+                                setEditConfig((prev) => ({
+                                  ...prev,
+                                  brandLogo: { ...prev.brandLogo, enabled: checked }
+                                }));
+                              }}
+                            />
+                          </div>
+
+                          {!isFreeTier && editConfig.brandLogo.enabled && (
+                            <div className="flex flex-col gap-2 pt-0.5">
+                              <input
+                                ref={logoFileInputRef}
+                                type="file"
+                                accept="image/png,image/jpeg,image/webp"
+                                className="hidden"
+                                onChange={async (e) => {
+                                  const file = e.target.files?.[0];
+                                  e.target.value = '';
+                                  if (!file) return;
+                                  try {
+                                    const dataUrl = await processLogoFileToSquarePng(file);
+                                    setEditConfig((prev) => ({
+                                      ...prev,
+                                      brandLogo: { ...prev.brandLogo, dataUrl }
+                                    }));
+                                  } catch {}
+                                }}
+                              />
+                              <div className="flex items-center gap-2">
+                                {editConfig.brandLogo.dataUrl && (
+                                  <img
+                                    src={editConfig.brandLogo.dataUrl}
+                                    alt="Brand logo preview"
+                                    className="size-9 shrink-0 rounded-full border border-stone-300 object-cover dark:border-slate-700"
+                                  />
+                                )}
+                                <button
+                                  type="button"
+                                  data-testid="upload-brand-logo-btn"
+                                  onClick={() => logoFileInputRef.current?.click()}
+                                  className="h-9 flex-1 cursor-pointer rounded-xl border border-stone-200/90 bg-white px-3 text-[11px] font-semibold text-stone-800 hover:bg-stone-50 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]"
+                                >
+                                  {editConfig.brandLogo.dataUrl
+                                    ? 'Change Logo'
+                                    : 'Upload Logo (PNG/JPG)'}
+                                </button>
+                                {editConfig.brandLogo.dataUrl && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        brandLogo: { ...prev.brandLogo, dataUrl: undefined }
+                                      }))
+                                    }
+                                    className="flex size-9 cursor-pointer items-center justify-center rounded-xl border border-stone-200/80 text-stone-400 hover:text-red-500 dark:border-slate-700/80"
+                                    title="Remove logo"
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </button>
+                                )}
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-2.5">
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between text-[10px]">
+                                    <span className="text-stone-500 dark:text-slate-400">Size</span>
+                                    <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                      {editConfig.brandLogo.sizePx}px
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={24}
+                                    max={120}
+                                    step={4}
+                                    value={editConfig.brandLogo.sizePx}
+                                    onChange={(e) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        brandLogo: {
+                                          ...prev.brandLogo,
+                                          sizePx: Number(e.target.value)
+                                        }
+                                      }))
+                                    }
+                                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                  />
+                                </div>
+
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between text-[10px]">
+                                    <span className="text-stone-500 dark:text-slate-400">Opacity</span>
+                                    <span className="font-mono font-semibold text-stone-900 dark:text-white">
+                                      {editConfig.brandLogo.opacity}%
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={10}
+                                    max={100}
+                                    step={5}
+                                    value={editConfig.brandLogo.opacity}
+                                    onChange={(e) =>
+                                      setEditConfig((prev) => ({
+                                        ...prev,
+                                        brandLogo: {
+                                          ...prev.brandLogo,
+                                          opacity: Number(e.target.value)
+                                        }
+                                      }))
+                                    }
+                                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-stone-200 accent-amber-500 dark:bg-slate-800"
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between pt-0.5">
+                                <span className="text-[10px] text-stone-500 dark:text-slate-400">
+                                  Logo Position
+                                </span>
+                                <CompactNineGridPicker
+                                  value={editConfig.brandLogo.pos}
+                                  onChange={(pos) =>
+                                    setEditConfig((prev) => ({
+                                      ...prev,
+                                      brandLogo: { ...prev.brandLogo, pos }
+                                    }))
+                                  }
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <ShieldCheck className="size-3.5 text-teal-500" />
-                </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="FHD 1080p"
-                    tooltip={
-                      isFreeTier
-                        ? 'Pro feature — Free plan renders at 720p. Upgrade to unlock 1080p.'
-                        : 'Render output at up to 1920×1080. Off = 720p.'
-                    }
-                  />
-                  <StreamWaveSwitch
-                    checked={!isFreeTier && effects.outputHD}
-                    disabled={isFreeTier}
-                    locked={isFreeTier}
-                    onCheckedChange={(v) => setEffects({ ...effects, outputHD: v })}
-                  />
-                </div>
+                  {/* Anti-Copyright Effects Header & Toggles */}
+                  <div className="flex flex-col gap-1 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                    <div className="flex items-center justify-between pb-1">
+                      <span className="text-xs font-bold text-stone-900 dark:text-white">
+                        Copyright Effects
+                      </span>
+                      <ShieldCheck className="size-3.5 text-teal-500" />
+                    </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="Dynamic zoom"
-                    tooltip={
-                      isFreeTier
-                        ? 'Pro feature — Upgrade to unlock dynamic zoom.'
-                        : 'Adds subtle zooms to keep viewers engaged.'
-                    }
-                  />
-                  <StreamWaveSwitch
-                    checked={!isFreeTier && effects.zoom}
-                    disabled={isFreeTier}
-                    locked={isFreeTier}
-                    onCheckedChange={(v) => setEffects({ ...effects, zoom: v })}
-                  />
-                </div>
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="FHD 1080p"
+                        tooltip={
+                          isFreeTier
+                            ? 'Pro feature — Free plan renders at 720p. Upgrade to unlock 1080p.'
+                            : 'Render output at up to 1920×1080. Off = 720p.'
+                        }
+                      />
+                      <StreamWaveSwitch
+                        checked={!isFreeTier && effects.outputHD}
+                        disabled={isFreeTier}
+                        locked={isFreeTier}
+                        onCheckedChange={(v) => setEffects({ ...effects, outputHD: v })}
+                      />
+                    </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="Mirror flip"
-                    tooltip="Flips the video horizontally to help prevent copyright strikes."
-                  />
-                  <StreamWaveSwitch
-                    checked={effects.mirror}
-                    onCheckedChange={(v) => setEffects({ ...effects, mirror: v })}
-                  />
-                </div>
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="Dynamic zoom"
+                        tooltip={
+                          isFreeTier
+                            ? 'Pro feature — Upgrade to unlock dynamic zoom.'
+                            : 'Adds subtle zooms to keep viewers engaged.'
+                        }
+                      />
+                      <StreamWaveSwitch
+                        checked={!isFreeTier && effects.zoom}
+                        disabled={isFreeTier}
+                        locked={isFreeTier}
+                        onCheckedChange={(v) => setEffects({ ...effects, zoom: v })}
+                      />
+                    </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="Color shift"
-                    tooltip="Subtly shifts tones for a fresh visual look."
-                  />
-                  <StreamWaveSwitch
-                    checked={effects.colorShift}
-                    onCheckedChange={(v) => setEffects({ ...effects, colorShift: v })}
-                  />
-                </div>
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="Mirror flip"
+                        tooltip="Flips the video horizontally to help prevent copyright strikes."
+                      />
+                      <StreamWaveSwitch
+                        checked={effects.mirror}
+                        onCheckedChange={(v) => setEffects({ ...effects, mirror: v })}
+                      />
+                    </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="Slight crop"
-                    tooltip="Trims 4% of edges to help pass automated content checks."
-                  />
-                  <StreamWaveSwitch
-                    checked={effects.crop}
-                    onCheckedChange={(v) => setEffects({ ...effects, crop: v })}
-                  />
-                </div>
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="Color shift"
+                        tooltip="Subtly shifts tones for a fresh visual look."
+                      />
+                      <StreamWaveSwitch
+                        checked={effects.colorShift}
+                        onCheckedChange={(v) => setEffects({ ...effects, colorShift: v })}
+                      />
+                    </div>
 
-                <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                  <DottedTooltipLabel
-                    label="Film grain"
-                    tooltip="Adds light cinematic texture to frames."
-                  />
-                  <StreamWaveSwitch
-                    checked={effects.grain}
-                    onCheckedChange={(v) => setEffects({ ...effects, grain: v })}
-                  />
-                </div>
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="Slight crop"
+                        tooltip="Trims 4% of edges to help pass automated content checks."
+                      />
+                      <StreamWaveSwitch
+                        checked={effects.crop}
+                        onCheckedChange={(v) => setEffects({ ...effects, crop: v })}
+                      />
+                    </div>
 
-                <div className="flex items-center justify-between pt-2 pb-0.5">
-                  <DottedTooltipLabel
-                    label="Audio pitch"
-                    tooltip="Shifts voice pitch by +5% to avoid automated sound matches."
-                  />
-                  <StreamWaveSwitch
-                    checked={effects.pitchShift}
-                    onCheckedChange={(v) => setEffects({ ...effects, pitchShift: v })}
-                  />
+                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <DottedTooltipLabel
+                        label="Film grain"
+                        tooltip="Adds light cinematic texture to frames."
+                      />
+                      <StreamWaveSwitch
+                        checked={effects.grain}
+                        onCheckedChange={(v) => setEffects({ ...effects, grain: v })}
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2 pb-0.5">
+                      <DottedTooltipLabel
+                        label="Audio pitch"
+                        tooltip="Shifts voice pitch by +5% to avoid automated sound matches."
+                      />
+                      <StreamWaveSwitch
+                        checked={effects.pitchShift}
+                        onCheckedChange={(v) => setEffects({ ...effects, pitchShift: v })}
+                      />
+                    </div>
+                  </div>
                 </div>
-              </div>{/* End Section 04 */}
+              )}
             </>
           ) : (
             /* History Tab (?tab=history) */
@@ -3442,7 +3372,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               hasMuxedAudio={
                 hasMuxedAudio ||
                 Boolean(
-                  uploadedFileRef.current &&
+                  (uploadedFileRef.current || loadedLocalUploadId) &&
                     mode === 'translate' &&
                     translateAudio === 'captions-only'
                 )
@@ -3452,6 +3382,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               onRemoveVideo={() => {
                 playUiSound('close');
                 uploadedFileRef.current = null;
+                setLoadedLocalUploadId(null);
+                setUrlLoadError(null);
                 setHasLoadedVideo(false);
                 setVideoFileUrl(null);
                 setDubbedVideoUrl(null);
@@ -3537,29 +3469,53 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                 <div className="my-1 flex min-h-[165px] w-full flex-1 flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300/90 bg-[#FAF8F4] p-5 sm:my-1.5 sm:min-h-[200px] sm:p-6 dark:border-slate-700/80 dark:bg-[#151C26]">
                   <input
                     type="url"
-                    placeholder="https://tiktok.com/... or https://youtube.com/..."
+                    aria-label="Paste video URL"
+                    placeholder="TikTok · RedNote (xhslink) · YouTube · FB Link..."
                     value={sourceUrlInput}
-                    onChange={(e) => setSourceUrlInput(e.target.value)}
-                    className="w-full border-none bg-transparent text-center text-sm font-normal text-stone-900 dark:text-white outline-none placeholder:text-stone-400/80 focus:ring-0 md:text-base"
+                    disabled={isLoadingUrl}
+                    onChange={(e) => {
+                      setSourceUrlInput(e.target.value);
+                      if (urlLoadError) setUrlLoadError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && sourceUrlInput.trim() && !isLoadingUrl) {
+                        e.preventDefault();
+                        void handleLoadVideoUrl();
+                      }
+                    }}
+                    className="w-full border-none bg-transparent text-center text-sm font-normal text-stone-900 dark:text-white outline-none placeholder:text-stone-400/80 focus:ring-0 md:text-base disabled:opacity-60"
                   />
+                  {!urlLoadError && !isLoadingUrl && (
+                    <p className="mt-2 text-center text-[11px] font-medium text-stone-400 dark:text-slate-500">
+                      {uiLang === 'my'
+                        ? 'TikTok & RedNote (Watermark မပါ) · YouTube · FB · IG · Direct MP4'
+                        : 'TikTok & RedNote (No Watermark) · YouTube · FB · IG · Direct MP4'}
+                    </p>
+                  )}
+                  {urlLoadError && (
+                    <div
+                      role="alert"
+                      className="mt-3 flex max-w-md items-start gap-2 rounded-xl border border-red-500/35 bg-red-500/10 px-3 py-2 text-left text-[11px] font-medium text-red-700 dark:text-red-300"
+                    >
+                      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                      <span>{urlLoadError}</span>
+                    </div>
+                  )}
                   {sourceUrlInput.trim() && (
                     <button
                       type="button"
-                      onClick={() => {
-                        playUiSound('open');
-                        uploadedFileRef.current = null;
-                        setVideoFileUrl('/api/demo-video?scene=cyberpunk');
-                        setOriginalFilename('TikTok_Fetched_Clip.mp4');
-                        setVideoTitle(sourceUrlInput.trim());
-                        setVideoDuration(18);
-                        setHasLoadedVideo(true);
-                        setHasMuxedAudio(false);
-                        setDubbedVideoUrl(null);
-                        setIsDone(false);
-                      }}
-                      className="mt-4 rounded-xl bg-amber-500 hover:bg-amber-400 px-5 py-2.5 text-xs font-bold text-slate-950 shadow-sm cursor-pointer transition-colors"
+                      disabled={isLoadingUrl}
+                      onClick={() => void handleLoadVideoUrl()}
+                      className="mt-4 inline-flex items-center gap-2 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-75 px-5 py-2.5 text-xs font-bold text-slate-950 shadow-sm cursor-pointer transition-colors"
                     >
-                      Load Video URL
+                      {isLoadingUrl ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          <span>{urlLoadStatusText || 'Loading Video...'}</span>
+                        </>
+                      ) : (
+                        <span>Load Video URL</span>
+                      )}
                     </button>
                   )}
                 </div>
@@ -3649,6 +3605,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     onClick={() => {
                       playUiSound('tap');
                       uploadedFileRef.current = null;
+                      setLoadedLocalUploadId(null);
+                      setUrlLoadError(null);
                       setHasLoadedVideo(false);
                       setVideoFileUrl(null);
                       setDubbedVideoUrl(null);
@@ -3819,6 +3777,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   onClick={() => {
                     playUiSound('tap');
                     uploadedFileRef.current = null;
+                    setLoadedLocalUploadId(null);
+                    setUrlLoadError(null);
                     setHasLoadedVideo(false);
                     setVideoFileUrl(null);
                     setDubbedVideoUrl(null);
@@ -3936,6 +3896,260 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               </button>
             </div>
             {inspectorContent}
+          </div>
+        </div>
+      )}
+
+      {/* Sleek Custom Voice Picker Modal / Sheet */}
+      {isVoicePickerOpen && (
+        <div
+          data-testid="voice-picker-backdrop"
+          className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center bg-black/65 backdrop-blur-xs p-0 sm:p-4"
+          onClick={() => setIsVoicePickerOpen(false)}
+        >
+          <div
+            data-testid="voice-picker-modal"
+            onClick={(e) => e.stopPropagation()}
+            className="flex max-h-[82dvh] w-full sm:max-w-md flex-col overflow-hidden rounded-t-3xl sm:rounded-2xl border border-stone-200/90 bg-white shadow-2xl dark:border-slate-800 dark:bg-[#111720]"
+          >
+            <div className="flex items-center justify-between border-b border-stone-200/70 px-5 pt-4 pb-3 dark:border-slate-800">
+              <div>
+                <h3 className="text-sm font-bold text-stone-900 dark:text-white">
+                  {uiLang === 'my' ? 'AI အသံ ရွေးချယ်ရန်' : 'Select AI Voice'}
+                </h3>
+                <p className="text-[11px] text-stone-500 dark:text-slate-400">
+                  {isFreeTier
+                    ? uiLang === 'my'
+                      ? 'Free Mode · Thiha / Nilar (၂ မျိုး)'
+                      : 'Free Mode · 2 Voices'
+                    : uiLang === 'my'
+                      ? 'Credit Mode · အသံအစုံ ၁၀ မျိုး (1 Cr/min)'
+                      : 'Credit Mode · All 10 Voices (1 Cr/min)'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsVoicePickerOpen(false)}
+                aria-label="Close Voice Picker"
+                className="flex size-8 cursor-pointer items-center justify-center rounded-xl text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-white/[0.08] dark:hover:text-white"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-4 overflow-y-auto px-3 py-3">
+              {/* Group 1: Standard Burmese Neural */}
+              <div>
+                <div className="flex items-center justify-between px-2 pb-1.5 text-[10px] font-semibold tracking-wider text-stone-400 uppercase">
+                  <span>Standard Burmese Neural</span>
+                  <span>1 Cr/min</span>
+                </div>
+                <div className="space-y-1">
+                  {freeVoices.map((v) => {
+                    const isSelected = voiceGender === v.id;
+                    const isThisLoading =
+                      isLoadingVoicePreview && previewingVoiceId === v.id;
+                    const isThisPlaying =
+                      isPlayingVoicePreview && previewingVoiceId === v.id;
+                    return (
+                      <div
+                        key={v.id}
+                        role="button"
+                        tabIndex={0}
+                        data-testid={`voice-option-${v.id}`}
+                        onClick={() => {
+                          playUiSound('select');
+                          setVoiceGender(v.id);
+                          setIsVoicePickerOpen(false);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            playUiSound('select');
+                            setVoiceGender(v.id);
+                            setIsVoicePickerOpen(false);
+                          }
+                        }}
+                        className={`flex min-h-[54px] cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                          isSelected
+                            ? 'border-amber-500/50 bg-amber-500/10'
+                            : 'border-transparent hover:bg-stone-100/80 dark:hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        <div className="flex min-w-0 items-center gap-3">
+                          <span
+                            className={`size-8 shrink-0 rounded-full border shadow-xs ${
+                              isSelected
+                                ? 'border-amber-400 ring-2 ring-amber-500/30'
+                                : 'border-white/25'
+                            }`}
+                            style={{ background: v.orbGradient }}
+                          />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate text-xs font-semibold text-stone-900 dark:text-white">
+                                {v.nameEn.split('·')[0].trim()}
+                              </span>
+                              {isSelected && (
+                                <Check className="size-3.5 shrink-0 text-amber-500" />
+                              )}
+                            </div>
+                            <p className="truncate text-[11px] text-stone-500 dark:text-slate-400">
+                              {v.genderLabel} · {v.tone}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          data-testid={`voice-row-preview-${v.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handlePreviewVoice(v.id);
+                          }}
+                          aria-label={`Preview ${v.nameEn.split('·')[0].trim()}`}
+                          className={`flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl border transition-colors ${
+                            isThisPlaying
+                              ? 'border-teal-500/50 bg-teal-500/15 text-teal-500'
+                              : 'border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-200/70 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.1]'
+                          }`}
+                        >
+                          {isThisLoading ? (
+                            <Loader2 className="size-3.5 animate-spin text-teal-500" />
+                          ) : isThisPlaying ? (
+                            <Square className="size-3 fill-current" />
+                          ) : (
+                            <Play className="size-3.5 fill-current" />
+                          )}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Group 2: Gemini Studio Pro Voices */}
+              <div>
+                <div className="flex items-center justify-between px-2 pb-1.5 text-[10px] font-semibold tracking-wider text-neutral-400 uppercase">
+                  <span>Gemini Studio Pro Voices</span>
+                  <span className={isFreeTier ? 'text-amber-500' : 'text-teal-500'}>
+                    {isFreeTier ? 'Credit Mode Only' : '1 Cr/min'}
+                  </span>
+                </div>
+                <div className="space-y-1">
+                  {proVoices.map((v) => {
+                    const isLocked = isFreeTier && !isVoiceAllowedInMode(v.id, true);
+                    const isSelected = voiceGender === v.id;
+                    const isThisLoading =
+                      isLoadingVoicePreview && previewingVoiceId === v.id;
+                    const isThisPlaying =
+                      isPlayingVoicePreview && previewingVoiceId === v.id;
+                    return (
+                      <div
+                        key={v.id}
+                        role="button"
+                        tabIndex={0}
+                        data-testid={`voice-option-${v.id}`}
+                        onClick={() => {
+                          if (isLocked) {
+                            playUiSound('blocked');
+                            return;
+                          }
+                          playUiSound('select');
+                          setVoiceGender(v.id);
+                          setIsVoicePickerOpen(false);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            if (isLocked) {
+                              playUiSound('blocked');
+                              return;
+                            }
+                            playUiSound('select');
+                            setVoiceGender(v.id);
+                            setIsVoicePickerOpen(false);
+                          }
+                        }}
+                        className={`flex min-h-[54px] cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                          isSelected
+                            ? 'border-amber-500/50 bg-amber-500/10'
+                            : isLocked
+                              ? 'border-transparent opacity-65 hover:bg-stone-100/60 dark:hover:bg-white/[0.03]'
+                              : 'border-transparent hover:bg-stone-100/80 dark:hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        <div className="flex min-w-0 items-center gap-3">
+                          <span
+                            className={`size-8 shrink-0 rounded-full border shadow-xs ${
+                              isSelected
+                                ? 'border-amber-400 ring-2 ring-amber-500/30'
+                                : 'border-white/25'
+                            }`}
+                            style={{ background: v.orbGradient }}
+                          />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate text-xs font-semibold text-stone-900 dark:text-white">
+                                {v.nameEn.split('·')[0].trim()}
+                              </span>
+                              {isSelected && (
+                                <Check className="size-3.5 shrink-0 text-amber-500" />
+                              )}
+                              {isLocked && (
+                                <Lock className="size-3 shrink-0 text-stone-400" />
+                              )}
+                            </div>
+                            <p className="truncate text-[11px] text-stone-500 dark:text-slate-400">
+                              {v.genderLabel} · {v.tone}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          data-testid={`voice-row-preview-${v.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handlePreviewVoice(v.id);
+                          }}
+                          aria-label={`Preview ${v.nameEn.split('·')[0].trim()}`}
+                          className={`flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl border transition-colors ${
+                            isThisPlaying
+                              ? 'border-teal-500/50 bg-teal-500/15 text-teal-500'
+                              : 'border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-200/70 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.1]'
+                          }`}
+                        >
+                          {isThisLoading ? (
+                            <Loader2 className="size-3.5 animate-spin text-teal-500" />
+                          ) : isThisPlaying ? (
+                            <Square className="size-3 fill-current" />
+                          ) : (
+                            <Play className="size-3.5 fill-current" />
+                          )}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {isFreeTier && onNavigateToProStudio && (
+              <div className="border-t border-stone-200/70 px-4 py-3 dark:border-white/[0.07]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    playUiSound('tap');
+                    setIsVoicePickerOpen(false);
+                    onNavigateToProStudio();
+                  }}
+                  className="h-10 w-full cursor-pointer rounded-xl bg-amber-500 hover:bg-amber-400 text-xs font-bold text-slate-950 shadow-xs transition-all"
+                >
+                  {uiLang === 'my'
+                    ? 'Credit Mode သို့ပြောင်းပြီး အသံ ၁၀ မျိုးလုံး ဖွင့်မည်'
+                    : 'Switch to Credit Mode to Unlock All 10 Voices'}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

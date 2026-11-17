@@ -3241,10 +3241,53 @@ export function isApiKeyQuotaOrLimitError(err: unknown): {
     };
   }
 
+  const isExplicitDailyLimit =
+    lower.includes('requests per day') ||
+    lower.includes('requestsperday') ||
+    lower.includes('requests_per_day') ||
+    lower.includes('daily limit');
+
+  const isExplicitPerMinuteLimit =
+    !isExplicitDailyLimit &&
+    (lower.includes('per minute') ||
+      lower.includes('requestsperminute') ||
+      lower.includes('tokensperminute') ||
+      lower.includes('requests_per_minute') ||
+      lower.includes('tokens_per_minute') ||
+      lower.includes('tokens per minute') ||
+      lower.includes('requests per minute'));
+
+  const isHardDailyOrBillingQuota =
+    !isExplicitPerMinuteLimit &&
+    (isExplicitDailyLimit ||
+      lower.includes('exceeded your current quota') ||
+      lower.includes('resource_exhausted') ||
+      lower.includes('quota_exceeded') ||
+      lower.includes('billing') ||
+      lower.includes('quota'));
+
+  const isTransientRpmBurst =
+    isExplicitPerMinuteLimit ||
+    (!isHardDailyOrBillingQuota &&
+      (lower.includes('429') ||
+        lower.includes('rate limit') ||
+        lower.includes('rate_limit') ||
+        lower.includes('too many requests') ||
+        lower.includes('retry in')));
+
+  if (isTransientRpmBurst) {
+    return {
+      shouldRotate: true,
+      isQuotaLimit: true,
+      isInvalidKey: false,
+      cooldownMs: 90_000,
+      reason: 'Temporary RPM/TPM rate limit (90s short rest)'
+    };
+  }
+
   const isQuotaLimit =
+    isHardDailyOrBillingQuota ||
     lower.includes('429') ||
-    lower.includes('resource_exhausted') ||
-    lower.includes('quota') ||
     lower.includes('rate limit') ||
     lower.includes('rate_limit') ||
     lower.includes('too many requests') ||
@@ -4231,5 +4274,240 @@ export function parseFfmpegShowinfoPtsTimes(
   return results;
 }
 
+export type VideoUrlPlatform =
+  | 'tiktok'
+  | 'douyin'
+  | 'rednote'
+  | 'youtube'
+  | 'facebook'
+  | 'instagram'
+  | 'direct'
+  | 'other';
 
+export interface ParsedVideoSourceUrl {
+  valid: boolean;
+  normalizedUrl: string;
+  platform: VideoUrlPlatform;
+  errorMy?: string;
+  errorEn?: string;
+}
 
+const PRIVATE_OR_LOCAL_HOST_REGEX =
+  /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|0\.0\.0\.0|\[::1\]|::1)$/i;
+
+/**
+ * Extracts, validates, and classifies a user-pasted video URL or mobile share message
+ * (e.g. "Check out this clip https://vt.tiktok.com/ZSptXq56x/" or RedNote share text "xhslink.com/a/abc123")
+ * without breaking on surrounding text.
+ */
+export function parseAndNormalizeVideoSourceUrl(
+  rawInput: string | undefined | null
+): ParsedVideoSourceUrl {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      platform: 'other',
+      errorMy: 'ဗီဒီယို Link (URL) ထည့်သွင်းပေးပါ။',
+      errorEn: 'Please paste a video URL first.'
+    };
+  }
+
+  // Extract first http(s) URL, or protocol-less RedNote/TikTok/Douyin share link from mobile share snippets
+  const urlMatch = trimmed.match(/https?:\/\/[^\s"'<>`]+/i);
+  const bareSocialMatch = !urlMatch
+    ? trimmed.match(
+        /(?:www\.|vt\.|vm\.|m\.)?(?:xhslink\.com|xiaohongshu\.com|rednote\.com|tiktok\.com|douyin\.com|youtu\.be|youtube\.com|fb\.watch)\/[^\s"'<>`！。，、）】」]+/i
+      )
+    : null;
+  const candidate = (
+    urlMatch ? urlMatch[0] : bareSocialMatch ? `https://${bareSocialMatch[0]}` : trimmed
+  )
+    .replace(/[),.;!?！。，、）】」]+$/, '')
+    .replace(/×/g, 'x');
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      platform: 'other',
+      errorMy: 'ထည့်သွင်းထားသော Video URL ပုံစံ မမှန်ကန်ပါ (https://... ဖြင့် စရပါမည်)။',
+      errorEn: 'Invalid video URL format (must start with https:// or http://).'
+    };
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      platform: 'other',
+      errorMy: 'http:// သို့မဟုတ် https:// Video Link များသာ အသုံးပြုနိုင်ပါသည်။',
+      errorEn: 'Only http:// or https:// video links are supported.'
+    };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (!host || PRIVATE_OR_LOCAL_HOST_REGEX.test(host) || host.endsWith('.local') || host.endsWith('.internal')) {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      platform: 'other',
+      errorMy: 'Private သို့မဟုတ် Local Server URL များကို ခွင့်မပြုပါ။',
+      errorEn: 'Private or local network URLs are not allowed.'
+    };
+  }
+
+  let platform: VideoUrlPlatform = 'other';
+  if (host.includes('tiktok.com')) {
+    platform = 'tiktok';
+  } else if (host.includes('douyin.com') || host.includes('iesdouyin.com')) {
+    platform = 'douyin';
+  } else if (
+    host.includes('xiaohongshu.com') ||
+    host.includes('xhslink.com') ||
+    host.includes('rednote.com') ||
+    host.includes('rednoteapp.com')
+  ) {
+    platform = 'rednote';
+  } else if (host.includes('youtube.com') || host === 'youtu.be' || host.endsWith('.youtu.be')) {
+    platform = 'youtube';
+  } else if (host.includes('facebook.com') || host === 'fb.watch' || host.endsWith('.fb.watch')) {
+    platform = 'facebook';
+  } else if (host.includes('instagram.com') || host.includes('instagr.am')) {
+    platform = 'instagram';
+  } else if (/\.(mp4|mov|webm|mkv|m4v)(\?|#|$)/i.test(parsed.pathname)) {
+    platform = 'direct';
+  }
+
+  return {
+    valid: true,
+    normalizedUrl: parsed.toString(),
+    platform
+  };
+}
+
+export interface RedNoteExtractedMedia {
+  videoUrls: string[];
+  title: string;
+  durationSec: number;
+}
+
+/**
+ * Extracts clean, watermark-free MP4 stream URLs from RedNote (Xiaohongshu) HTML / __INITIAL_STATE__ payloads.
+ * Prefers `originVideoKey` (raw no-watermark CDN asset) and `stream.h264` master URLs, filtering out watermarked streams.
+ */
+export function extractRedNoteVideoInfoFromHtml(html: string | undefined | null): RedNoteExtractedMedia {
+  if (!html || typeof html !== 'string') {
+    return { videoUrls: [], title: '', durationSec: 0 };
+  }
+  const normalized = html
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&');
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const addUrl = (raw: string | undefined | null) => {
+    if (!raw) return;
+    let clean = raw.trim().replace(/^http:\/\//i, 'https://');
+    if (!clean.startsWith('https://')) return;
+    // Skip explicit watermarked endpoints
+    if (/watermark=1|\/wm_|_wm\.mp4/i.test(clean)) return;
+    if (!seen.has(clean)) {
+      seen.add(clean);
+      urls.push(clean);
+    }
+  };
+
+  // 1) Highest priority: raw no-watermark originVideoKey (e.g. "originVideoKey":"pre_post/..." or "stream/...")
+  const originKeyMatches = normalized.matchAll(/"originVideoKey"\s*:\s*"([^"\\]+)"/g);
+  for (const m of originKeyMatches) {
+    const key = (m[1] || '').replace(/^\/+/, '').trim();
+    if (key && key.length >= 6 && !key.startsWith('http')) {
+      addUrl(`https://sns-video-bd.xhscdn.com/${key}`);
+      addUrl(`https://sns-video-hw.xhscdn.com/${key}`);
+      addUrl(`https://sns-video-qc.xhscdn.com/${key}`);
+    } else if (key.startsWith('http')) {
+      addUrl(key);
+    }
+  }
+
+  // 2) H264 stream masterUrl / backupUrls from __INITIAL_STATE__ (browser-native MP4 without watermark)
+  const masterUrlMatches = normalized.matchAll(
+    /"(?:masterUrl|url)"\s*:\s*"((?:https?:)?\/\/sns-video-[^"\\]+\.(?:xhscdn\.com|xiaohongshu\.com)[^"\\]+)"/gi
+  );
+  for (const m of masterUrlMatches) {
+    const candidate = m[1].startsWith('//') ? `https:${m[1]}` : m[1];
+    addUrl(candidate);
+  }
+
+  // 3) backupUrls array items on xhscdn
+  const backupMatches = normalized.matchAll(
+    /"((?:https?:)?\/\/sns-video-[^"\\]+\.xhscdn\.com\/[^"\\]+\.mp4[^"\\]*)"/gi
+  );
+  for (const m of backupMatches) {
+    const candidate = m[1].startsWith('//') ? `https:${m[1]}` : m[1];
+    addUrl(candidate);
+  }
+
+  // 4) OpenGraph og:video meta fallback
+  const ogVideoMatch = normalized.match(
+    /<meta\s+(?:property|name)=["']og:video(?::url)?["']\s+content=["']([^"']+)["']/i
+  );
+  if (ogVideoMatch?.[1]) {
+    addUrl(ogVideoMatch[1]);
+  }
+
+  // Title & duration extraction
+  let title = '';
+  const jsonTitleMatch = normalized.match(/"title"\s*:\s*"([^"\\]{2,140})"/);
+  const ogTitleMatch = normalized.match(
+    /<meta\s+(?:property|name)=["']og:title["']\s+content=["']([^"']+)["']/i
+  );
+  title = (jsonTitleMatch?.[1] || ogTitleMatch?.[1] || '')
+    .replace(/\s*-\s*小红书\s*$/i, '')
+    .replace(/\s*-\s*RedNote\s*$/i, '')
+    .trim();
+
+  let durationSec = 0;
+  const durMatch = normalized.match(/"duration"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
+  if (durMatch?.[1]) {
+    const d = Number(durMatch[1]);
+    if (Number.isFinite(d) && d > 0) {
+      durationSec = d > 1000 ? Math.round(d / 1000) : Math.round(d);
+    }
+  }
+
+  return { videoUrls: urls, title, durationSec };
+}
+
+/**
+ * Maps rednote.com links to xiaohongshu.com canonical host so extractors (yt-dlp & page scrapers) handle both uniformly.
+ */
+export function normalizeRedNoteCanonicalUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.toLowerCase().includes('rednote.com')) {
+      u.hostname = 'www.xiaohongshu.com';
+      return u.toString();
+    }
+  } catch {}
+  return rawUrl;
+}
+
+/**
+ * Generates an ASCII-safe .mp4 filename for URL-fetched videos so FFmpeg & download headers stay reliable.
+ */
+export function buildSafeFetchedVideoFilename(
+  rawTitle: string | undefined | null,
+  platform: VideoUrlPlatform | string,
+  localUploadId: string
+): string {
+  const cleanTag = String(platform || 'video').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'video';
+  const safeBase = sanitizeMp4DownloadName(rawTitle || '', `${cleanTag}_${localUploadId.slice(-6)}`);
+  return safeBase;
+}
