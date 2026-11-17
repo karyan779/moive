@@ -688,6 +688,21 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         setLimitModalType('duration_limit');
         return;
       }
+      if (uploadedFileRef.current) {
+        const freeUserKeysCheck = loadFreeUserApiKeys();
+        if (!freeUserKeysCheck.geminiKey || freeUserKeysCheck.geminiKey.trim().length < 12) {
+          playUiSound('blocked');
+          setStudioErrorMsg(
+            uiLang === 'my'
+              ? 'Free Mode တွင် Admin ၏ Credit Mode API Key များကို အသုံးပြုခွင့် ပိတ်ထားပါသည်။ ထိပ်ဆုံးရှိ Settings ခလုတ် (/settings) ကိုနှိပ်၍ သင့်ကိုယ်ပိုင် Gemini API Key ထည့်သွင်းပါ (သို့မဟုတ် Credit Mode သို့ ပြောင်းသုံးပါ)။'
+              : 'Admin Credit Mode API keys are disabled in Free Mode. Please open Settings (/settings) at the top bar and enter your own Gemini API Key, or switch to Credit Mode.'
+          );
+          setTimeout(() => {
+            studioErrorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 60);
+          return;
+        }
+      }
     } else {
       if (proCredits < creditCost) {
         playUiSound('blocked');
@@ -2151,7 +2166,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                               headers: { 'Content-Type': 'application/json' },
                               body: JSON.stringify({
                                 cues,
-                                subtitleLanguage: nextSubLang
+                                subtitleLanguage: nextSubLang,
+                                isFreeMode: isFreeTier
                               })
                             });
                             const data = await resp.json();
@@ -2200,7 +2216,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({
                                       cues,
-                                      subtitleLanguage: nextSubLang
+                                      subtitleLanguage: nextSubLang,
+                                      isFreeMode: isFreeTier
                                     })
                                   });
                                   const data = await resp.json();

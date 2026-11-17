@@ -15,6 +15,7 @@ import {
 import {
   formatDuration,
   findActiveCue,
+  findDisplayCueAtTime,
   clampBlurRegion,
   computeAspectCanvasLayout,
   resolveBurmeseFontMeta,
@@ -278,6 +279,51 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   );
 
   const [companionBlobUrl, setCompanionBlobUrl] = useState<string | null>(null);
+  const [stageVideoBlobUrl, setStageVideoBlobUrl] = useState<string | null>(null);
+  const preserveStageTimeOnSrcSwapRef = useRef<number | null>(null);
+  const lastAudioSessionKeyRef = useRef<string>('');
+  const lastUserSeekAtRef = useRef<number>(0);
+
+  // Upgrade server-streamed `/api/recap/video/...` URLs into in-memory Blob URLs so seeking/scrubbing works instantaneously without proxy Range resets
+  useEffect(() => {
+    let revokedVideoUrl: string | null = null;
+    let cancelled = false;
+
+    if (!videoFileUrl || videoFileUrl.startsWith('blob:') || videoFileUrl.startsWith('/api/demo-video')) {
+      setStageVideoBlobUrl(null);
+      return;
+    }
+
+    if (videoFileUrl.startsWith('/api/recap/video/')) {
+      fetch(videoFileUrl, { credentials: 'same-origin' })
+        .then((r) => (r.ok ? r.blob() : null))
+        .then((b) => {
+          if (!cancelled && b && b.size > 1024) {
+            revokedVideoUrl = URL.createObjectURL(
+              b.type && b.type.includes('video') ? b : new Blob([b], { type: 'video/mp4' })
+            );
+            if (videoRef.current && videoRef.current.currentTime > 0.25) {
+              preserveStageTimeOnSrcSwapRef.current = videoRef.current.currentTime;
+            }
+            setStageVideoBlobUrl(revokedVideoUrl);
+          }
+        })
+        .catch(() => {});
+    } else {
+      setStageVideoBlobUrl(null);
+    }
+
+    return () => {
+      cancelled = true;
+      if (revokedVideoUrl) {
+        try {
+          URL.revokeObjectURL(revokedVideoUrl);
+        } catch {}
+      }
+    };
+  }, [videoFileUrl]);
+
+  const effectiveStageVideoSrc = stageVideoBlobUrl || videoFileUrl || undefined;
 
   useEffect(() => {
     if (hasMuxedAudio) {
@@ -535,19 +581,29 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     });
   }, []);
 
-  // Automatically unmute AI voiceover and mute original foreign speech when new Recap audio arrives
+  // Automatically unmute AI voiceover and mute original foreign speech when a genuinely new Recap audio session arrives
+  // (Never reset currentTime to 0 when companionBlobUrl upgrades from HTTP URL to in-memory blob: URL!)
   useEffect(() => {
-    if (companionAudioSrc || hasMuxedAudio) {
-      setIsMuted(false);
-      setIsPlaying(true);
-      if (videoRef.current) {
-        videoRef.current.currentTime = 0;
-        videoRef.current.muted = !hasMuxedAudio && Boolean(companionAudioSrc);
-        videoRef.current.volume = hasMuxedAudio ? 1.0 : 0.0;
-        videoRef.current.play().catch(() => {});
-      }
+    const sessionKey = `${hasMuxedAudio ? 'mux' : 'sep'}:${voiceoverAudioUrl || ''}:${audioBase64 ? audioBase64.slice(0, 32) : ''}`;
+    if (!companionAudioSrc && !hasMuxedAudio) {
+      lastAudioSessionKeyRef.current = '';
+      return;
     }
-  }, [companionAudioSrc, hasMuxedAudio]);
+    const isNewAudioSession = lastAudioSessionKeyRef.current !== sessionKey;
+    lastAudioSessionKeyRef.current = sessionKey;
+
+    setIsMuted(false);
+    setIsPlaying(true);
+    if (videoRef.current) {
+      if (isNewAudioSession) {
+        videoRef.current.currentTime = 0;
+        setCurrentTime(0);
+      }
+      videoRef.current.muted = !hasMuxedAudio && Boolean(companionAudioSrc);
+      videoRef.current.volume = hasMuxedAudio ? 1.0 : 0.0;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [companionAudioSrc, hasMuxedAudio, voiceoverAudioUrl, audioBase64]);
 
   // Sync synthesized voiceover audio element when audioBase64 or voiceoverAudioUrl updates (used when hasMuxedAudio is false)
   useEffect(() => {
@@ -568,11 +624,13 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     audioRef.current.volume = 1.0;
     audioRef.current.muted = isMuted;
     audioRef.current.playbackRate = 1.0;
-    if (isPlaying) {
-      const targetTime = videoRef.current?.currentTime || 0;
-      const aDur = audioRef.current.duration;
-      if (!Number.isFinite(aDur) || aDur <= 0 || targetTime < aDur - 0.25) {
+    const targetTime = videoRef.current?.currentTime || currentTime || 0;
+    const aDur = audioRef.current.duration;
+    if (!Number.isFinite(aDur) || aDur <= 0 || targetTime < aDur - 0.25) {
+      try {
         audioRef.current.currentTime = targetTime;
+      } catch {}
+      if (isPlaying) {
         audioRef.current.play().catch(() => {});
       }
     }
@@ -616,7 +674,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         bgVideoRef.current.pause();
       }
     }
-  }, [isProceduralDemo, isPlaying, isMuted, companionAudioSrc, hasMuxedAudio, videoFileUrl]);
+  }, [isProceduralDemo, isPlaying, isMuted, companionAudioSrc, hasMuxedAudio, effectiveStageVideoSrc]);
 
   // Procedural demo scene loop (when a demo preset is active)
   useEffect(() => {
@@ -627,7 +685,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     const tick = (now: number) => {
       const dt = (now - lastTs) / 1000;
       lastTs = now;
-      if (isPlaying) {
+      if (isPlaying && !timelineScrubRef.current) {
         setCurrentTime((prev) => {
           const next = prev + dt;
           if (next >= (videoDuration || 15)) {
@@ -653,7 +711,49 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [isProceduralDemo, isPlaying, currentTime, demoScene, videoDuration, companionAudioSrc, hasMuxedAudio]);
 
-  // Seek helper for timeline bar
+  // Direct seek to an exact second on video, backdrop video, and companion voiceover audio
+  const seekToSecond = useCallback(
+    (rawSec: number) => {
+      const v = videoRef.current;
+      const effectiveDur =
+        v?.duration && Number.isFinite(v.duration) && v.duration > 0.5
+          ? v.duration
+          : videoDuration || 15;
+      const targetSec = Math.max(0, Math.min(effectiveDur, rawSec));
+      lastUserSeekAtRef.current = performance.now();
+      setCurrentTime(targetSec);
+
+      if (!isProceduralDemo && v) {
+        try {
+          if (typeof v.fastSeek === 'function' && timelineScrubRef.current) {
+            v.fastSeek(targetSec);
+          } else {
+            v.currentTime = targetSec;
+          }
+        } catch {
+          try {
+            v.currentTime = targetSec;
+          } catch {}
+        }
+      }
+      if (!isProceduralDemo && bgVideoRef.current) {
+        try {
+          bgVideoRef.current.currentTime = targetSec;
+        } catch {}
+      }
+      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
+        try {
+          const aDur = audioRef.current.duration;
+          if (!Number.isFinite(aDur) || aDur <= 0.5 || targetSec < aDur - 0.1) {
+            audioRef.current.currentTime = targetSec;
+          }
+        } catch {}
+      }
+    },
+    [isProceduralDemo, videoDuration, companionAudioSrc, hasMuxedAudio]
+  );
+
+  // Seek helper for timeline bar pointer/touch clientX
   const seekFromPointer = useCallback(
     (clientX: number) => {
       const bar = timelineRef.current;
@@ -661,20 +761,39 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
       const rect = bar.getBoundingClientRect();
       if (rect.width === 0) return;
       const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      const targetSec = ratio * (videoRef.current?.duration || videoDuration || 15);
-      if (!isProceduralDemo && videoRef.current) {
-        videoRef.current.currentTime = targetSec;
-      }
-      if (!isProceduralDemo && bgVideoRef.current) {
-        bgVideoRef.current.currentTime = targetSec;
-      }
-      if (audioRef.current && companionAudioSrc && !hasMuxedAudio) {
-        audioRef.current.currentTime = targetSec;
-      }
-      setCurrentTime(targetSec);
+      const effectiveDur =
+        videoRef.current?.duration &&
+        Number.isFinite(videoRef.current.duration) &&
+        videoRef.current.duration > 0.5
+          ? videoRef.current.duration
+          : videoDuration || 15;
+      seekToSecond(ratio * effectiveDur);
     },
-    [isProceduralDemo, videoDuration, companionAudioSrc, hasMuxedAudio]
+    [videoDuration, seekToSecond]
   );
+
+  const seekFromPointerRef = useRef(seekFromPointer);
+  seekFromPointerRef.current = seekFromPointer;
+
+  useEffect(() => {
+    const onScrubMove = (e: PointerEvent) => {
+      if (timelineScrubRef.current) {
+        seekFromPointerRef.current(e.clientX);
+      }
+    };
+    const onScrubTouchMove = (e: TouchEvent) => {
+      if (timelineScrubRef.current && e.touches.length > 0) {
+        e.preventDefault();
+        seekFromPointerRef.current(e.touches[0].clientX);
+      }
+    };
+    window.addEventListener('pointermove', onScrubMove);
+    window.addEventListener('touchmove', onScrubTouchMove, { passive: false });
+    return () => {
+      window.removeEventListener('pointermove', onScrubMove);
+      window.removeEventListener('touchmove', onScrubTouchMove);
+    };
+  }, []);
 
   // Add new blur box (matches rd() in submit_form_only.js which also calls eL(true) to enable blur)
   const handleAddBlur = () => {
@@ -765,15 +884,18 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         ? 'center bottom'
         : 'center center';
 
-  // Active subtitle cue at current playback time, or fallback sample
+  // Active subtitle cue at current playback time, or held cue during short breath pauses (never flash cues[0] mid-video!)
   const activeCue = findActiveCue(cues, currentTime * 1000);
+  const displayCue = findDisplayCueAtTime(cues, currentTime * 1000, 1800);
   const activeSubLang = subtitleConfig.subtitleLanguage || targetLanguage;
   const langSample =
     TARGET_LANGUAGES.find((l) => l.code === activeSubLang)?.sampleCaption ||
     'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်';
   const displayedSubtitleText = isOverlayEditMode
-    ? activeCue?.text || cues[0]?.text || langSample
-    : activeCue?.text || cues[0]?.text || langSample;
+    ? activeCue?.text || displayCue?.text || cues[0]?.text || langSample
+    : cues.length > 0
+      ? displayCue?.text || ''
+      : langSample;
 
   const flipX = effects.mirror ? -1 : 1;
 
@@ -860,7 +982,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                   <video
                     ref={bgVideoRef}
                     data-testid="stage-blurred-backdrop-video"
-                    src={videoFileUrl || undefined}
+                    src={effectiveStageVideoSrc}
                     aria-hidden="true"
                     tabIndex={-1}
                     disablePictureInPicture
@@ -880,8 +1002,14 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                   <video
                     ref={videoRef}
                     data-testid="stage-video-element"
-                    src={videoFileUrl || undefined}
+                    src={effectiveStageVideoSrc}
                     onTimeUpdate={(e) => {
+                      if (
+                        timelineScrubRef.current ||
+                        performance.now() - lastUserSeekAtRef.current < 350
+                      ) {
+                        return;
+                      }
                       const t = e.currentTarget.currentTime;
                       setCurrentTime(t);
                       if (
@@ -918,6 +1046,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                     }}
                     onSeeked={(e) => {
                       const t = e.currentTarget.currentTime;
+                      setCurrentTime(t);
                       if (bgVideoRef.current && !bgVideoRef.current.seeking) {
                         bgVideoRef.current.currentTime = t;
                       }
@@ -985,6 +1114,17 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                       }
                       if (v.duration && Number.isFinite(v.duration)) {
                         onDurationLoaded(v.duration);
+                      }
+                      if (
+                        preserveStageTimeOnSrcSwapRef.current !== null &&
+                        preserveStageTimeOnSrcSwapRef.current > 0.25
+                      ) {
+                        const restoreT = preserveStageTimeOnSrcSwapRef.current;
+                        preserveStageTimeOnSrcSwapRef.current = null;
+                        try {
+                          v.currentTime = restoreT;
+                          setCurrentTime(restoreT);
+                        } catch {}
                       }
                       if (bgVideoRef.current) {
                         bgVideoRef.current.currentTime = v.currentTime;
@@ -1351,7 +1491,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
             ))}
 
           {/* Interactive Draggable & Resizable Subtitle Box */}
-          {subtitleConfig.enabled && (
+          {subtitleConfig.enabled && (isOverlayEditMode || displayedSubtitleText.trim().length > 0) && (
             <div
               data-testid="subtitle-overlay-box"
               onPointerDown={(e) => {
@@ -1513,9 +1653,10 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                 )}
               </button>
 
-              {/* Pointer-Captured Scrubber Timeline */}
+              {/* Pointer-Captured & Native Range Scrubber Timeline */}
               <div
                 ref={timelineRef}
+                data-testid="stage-timeline-scrubber"
                 onPointerDown={(e) => {
                   e.stopPropagation();
                   timelineScrubRef.current = true;
@@ -1536,8 +1677,37 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                     e.currentTarget.releasePointerCapture(e.pointerId);
                   } catch {}
                 }}
-                className="group/timeline relative mx-1 flex h-6 flex-1 cursor-pointer touch-none items-center select-none"
+                onTouchStart={(e) => {
+                  if (e.touches.length > 0) {
+                    e.stopPropagation();
+                    timelineScrubRef.current = true;
+                    seekFromPointer(e.touches[0].clientX);
+                  }
+                }}
+                onTouchMove={(e) => {
+                  if (timelineScrubRef.current && e.touches.length > 0) {
+                    e.stopPropagation();
+                    seekFromPointer(e.touches[0].clientX);
+                  }
+                }}
+                onTouchEnd={() => {
+                  timelineScrubRef.current = false;
+                }}
+                className="group/timeline relative mx-1 flex h-7 flex-1 cursor-pointer touch-none items-center select-none"
               >
+                <input
+                  type="range"
+                  aria-label="Seek video timeline"
+                  min={0}
+                  max={Math.max(1, videoDuration || 15)}
+                  step={0.1}
+                  value={Math.min(Math.max(0, currentTime), Math.max(1, videoDuration || 15))}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    seekToSecond(Number(e.target.value));
+                  }}
+                  className="absolute inset-0 z-20 h-full w-full cursor-pointer opacity-0"
+                />
                 <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/20 transition-all group-hover/timeline:h-2">
                   <div
                     className="pointer-events-none h-full rounded-full bg-amber-400"
@@ -1547,7 +1717,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                   />
                 </div>
                 <div
-                  className="pointer-events-none absolute size-3 -translate-x-1/2 rounded-full bg-amber-400 shadow-md ring-2 ring-slate-950/60 transition-opacity"
+                  className="pointer-events-none absolute size-3.5 -translate-x-1/2 rounded-full bg-amber-400 shadow-md ring-2 ring-slate-950/60 transition-opacity"
                   style={{
                     left: `${videoDuration > 0 ? Math.min(100, (currentTime / videoDuration) * 100) : 0}%`
                   }}

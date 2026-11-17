@@ -494,9 +494,9 @@ test('Cloudflare Workers AI Whisper-Large-V3-Turbo helpers route Credit Mode onl
   );
   assert.equal(parseWorkersAiWhisperResult(null), '');
 
-  // Free Mode must NEVER invoke Cloudflare Workers AI
+  // Free Mode must NEVER invoke Cloudflare Workers AI or Admin's Groq Key Pool
   assert.deepEqual(resolveSttStrategyForMode(true, true, true), ['user_groq']);
-  assert.deepEqual(resolveSttStrategyForMode(true, false, true), ['groq_pool']);
+  assert.deepEqual(resolveSttStrategyForMode(true, false, true), []);
 
   // Credit Mode uses Cloudflare Workers AI first when configured, with Groq pool failover
   assert.deepEqual(resolveSttStrategyForMode(false, false, true), ['workers_ai', 'groq_pool']);
@@ -982,6 +982,8 @@ test('alignCuesWithAudioSync keeps 123.67s 44-cue movie recap locked to video sc
 import {
   resolveSubtitleFontMeta,
   buildChronologicalSceneLockGuide,
+  computeAudioScriptWindows,
+  sliceTimedTranscriptForWindow,
   decodeSignedTokenPayload,
   parsePersistedAuthUser,
   encodeAuthUserCacheHeader,
@@ -1013,6 +1015,33 @@ test('buildChronologicalSceneLockGuide and Documentary preset enforce 1:1 scene-
   assert.ok(guide.includes('[00:00 - 00:20] (start_ms: 0ms .. 20000ms)'));
   assert.ok(guide.includes('[02:00 - 02:27] (start_ms: 120000ms .. 147000ms)'));
   assert.ok(guide.includes('The doctor at the hospital finds nothing medically wrong'));
+});
+
+test('computeAudioScriptWindows and sliceTimedTranscriptForWindow isolate 1:08+ (68s+) scenes into dedicated windows', () => {
+  assert.equal(computeAudioScriptWindows(58, 64).length, 1);
+
+  const windows125 = computeAudioScriptWindows(125, 64);
+  assert.equal(windows125.length, 2);
+  assert.equal(windows125[0].startSec, 0);
+  assert.equal(windows125[0].endSec, 63);
+  assert.equal(windows125[1].startSec, 63);
+  assert.equal(windows125[1].endSec, 125);
+
+  const sampleTranscript = [
+    '[00:00 - 00:20] Opening confrontation in the hall',
+    '[00:21 - 00:58] Guard discovers the hidden key',
+    '[01:08 - 01:32] Secret vault opens and alarm rings',
+    '[01:35 - 02:04] Hero escapes on the rooftop'
+  ].join('\n');
+
+  const win1Slice = sliceTimedTranscriptForWindow(sampleTranscript, 0, 63);
+  assert.ok(win1Slice.includes('Opening confrontation in the hall'));
+  assert.ok(!win1Slice.includes('Secret vault opens and alarm rings'));
+
+  const win2Slice = sliceTimedTranscriptForWindow(sampleTranscript, 63, 125);
+  assert.ok(!win2Slice.includes('Opening confrontation in the hall'));
+  assert.ok(win2Slice.includes('[00:05 - 00:29] Secret vault opens and alarm rings'));
+  assert.ok(win2Slice.includes('[00:32 - 01:01] Hero escapes on the rooftop'));
 });
 
 test('parsePersistedAuthUser, decodeSignedTokenPayload, and shouldAutoRedirectAuthenticatedRoot preserve login across page reloads on custom domains', () => {
@@ -1048,3 +1077,34 @@ test('parsePersistedAuthUser, decodeSignedTokenPayload, and shouldAutoRedirectAu
   assert.equal(shouldAutoRedirectAuthenticatedRoot('/wallet', true), false);
 });
 
+import { findDisplayCueAtTime } from './recapEngine.ts';
+
+test('findDisplayCueAtTime holds previous cue during mid-video breath pauses (e.g. 1:10 / 70.8s) instead of falling back to cue-1', () => {
+  const sampleCues = [
+    {
+      id: 'cue-1',
+      start_ms: 60,
+      end_ms: 2800,
+      text: 'တစ်ကျောင်းလုံးကြောက်ရတဲ့ ကျောင်းအုပ်ကြီး ရောက်လာတဲ့အခါမှာတော့'
+    },
+    {
+      id: 'cue-24',
+      start_ms: 68545,
+      end_ms: 70713,
+      text: 'နံရံမှာ ချိတ်ထားတဲ့ ပန်းချီကားထဲက အနီရောင် အမြစ်တွေကလည်း စတင်လှုပ်ရှားလာပါတယ်'
+    },
+    {
+      id: 'cue-25',
+      start_ms: 71299,
+      end_ms: 73619,
+      text: 'ကျောင်းအုပ်ကြီးကတော့ ဆရာတွေကို လစာပေးထားရကျိုးမနပ်ဘူးဆိုပြီး ဒေါသတကြီး အော်ဟစ်နေပါတယ်'
+    }
+  ];
+
+  // At 1:10.8 (70800ms), between cue-24 (ends 70713ms) and cue-25 (starts 71299ms):
+  // Must hold cue-24 and NEVER fall back to cue-1!
+  const heldAt70s = findDisplayCueAtTime(sampleCues, 70800, 1800);
+  assert.ok(heldAt70s);
+  assert.equal(heldAt70s?.id, 'cue-24');
+  assert.notEqual(heldAt70s?.id, 'cue-1');
+});

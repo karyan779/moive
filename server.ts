@@ -54,6 +54,8 @@ import {
   formatTimedSttSegments,
   normalizeRecapTimelineCues,
   buildChronologicalSceneLockGuide,
+  computeAudioScriptWindows,
+  sliceTimedTranscriptForWindow,
   normalizeDialogueSubtitleCues,
   parseTimedSttTranscriptToCues,
   buildCinematicTranslateSystemPrompt,
@@ -1959,6 +1961,10 @@ async function muxVideoWithMixedAudio(
           'veryfast',
           '-threads',
           '2',
+          '-g',
+          '30',
+          '-keyint_min',
+          '15',
           '-crf',
           targetCrf,
           '-maxrate',
@@ -2030,6 +2036,10 @@ async function muxVideoWithMixedAudio(
           'veryfast',
           '-threads',
           '2',
+          '-g',
+          '30',
+          '-keyint_min',
+          '15',
           '-crf',
           targetCrf,
           '-maxrate',
@@ -2198,6 +2208,10 @@ async function generateStandaloneRecapMp4(
       'ultrafast',
       '-threads',
       '2',
+      '-g',
+      '30',
+      '-keyint_min',
+      '15',
       '-crf',
       isOutputHD ? '19' : '21',
       '-pix_fmt',
@@ -2606,6 +2620,7 @@ async function transcribeWithDirectGroqKey(
   form.append('file', blob, 'audio.mp3');
   form.append('model', sttModel === 'whisper-large-v3' ? 'whisper-large-v3' : 'whisper-large-v3-turbo');
   form.append('response_format', 'verbose_json');
+  form.append('temperature', '0');
   form.append('timestamp_granularities[]', 'segment');
 
   const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -2995,7 +3010,7 @@ async function startServer() {
     }
   });
 
-  // Serve generated/muxed recap MP4 videos with inline playback by default and attachment only for downloads (?dl=1 or ?name=)
+  // Serve generated/muxed recap MP4 videos with inline playback & explicit HTTP 206 Range seeking support
   app.get('/api/recap/video/:filename', (req, res) => {
     const safeName = path.basename(req.params.filename);
     const filePath = path.join(JOBS_TEMP_DIR, safeName);
@@ -3004,6 +3019,14 @@ async function startServer() {
       res.status(404).json({ ok: false, error: 'Rendered video not found' });
       return;
     }
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      res.status(404).json({ ok: false, error: 'Rendered video not readable' });
+      return;
+    }
+    const fileSize = stat.size;
     const disp = resolveMediaContentDisposition(
       safeName,
       typeof req.query.name === 'string' ? req.query.name : undefined,
@@ -3022,11 +3045,43 @@ async function startServer() {
       'Cache-Control',
       disp.mode === 'attachment' ? 'no-store' : 'private, max-age=3600'
     );
-    res.sendFile(filePath, (err) => {
-      if (err && !res.headersSent) {
+
+    const range = req.headers.range;
+    if (range && fileSize > 0) {
+      const match = /bytes=(\d*)-(\d*)/.exec(range);
+      if (match) {
+        const start = match[1] ? parseInt(match[1], 10) : 0;
+        const end = match[2] ? Math.min(fileSize - 1, parseInt(match[2], 10)) : fileSize - 1;
+        if (start >= 0 && start < fileSize && start <= end) {
+          const chunkSize = end - start + 1;
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+          res.setHeader('Content-Length', String(chunkSize));
+          const stream = fs.createReadStream(filePath, { start, end });
+          stream.on('error', () => {
+            if (!res.headersSent) res.status(500).end();
+            else res.destroy();
+          });
+          stream.pipe(res);
+          return;
+        }
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        res.end();
+        return;
+      }
+    }
+
+    res.setHeader('Content-Length', String(fileSize));
+    const fullStream = fs.createReadStream(filePath);
+    fullStream.on('error', () => {
+      if (!res.headersSent) {
         res.status(404).json({ ok: false, error: 'Failed to stream rendered MP4' });
+      } else {
+        res.destroy();
       }
     });
+    fullStream.pipe(res);
   });
 
   // StreamWaveAI-compatible video download resolver:
@@ -3163,7 +3218,7 @@ async function startServer() {
     }
   });
 
-  // Serve standalone MP3 voiceover audio files with inline playback by default and attachment on ?dl=1 / ?name=
+  // Serve standalone MP3 voiceover audio files with inline playback and explicit HTTP 206 Range seeking support
   app.get('/api/recap/audio/:filename', (req, res) => {
     const safeName = path.basename(req.params.filename);
     const filePath = path.join(JOBS_TEMP_DIR, safeName);
@@ -3172,6 +3227,14 @@ async function startServer() {
       res.status(404).json({ ok: false, error: 'Audio file not found' });
       return;
     }
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      res.status(404).json({ ok: false, error: 'Audio file not readable' });
+      return;
+    }
+    const fileSize = stat.size;
     const disp = resolveMediaContentDisposition(
       safeName,
       typeof req.query.name === 'string' ? req.query.name : undefined,
@@ -3186,7 +3249,40 @@ async function startServer() {
       'Cache-Control',
       disp.mode === 'attachment' ? 'no-store' : 'private, max-age=3600'
     );
-    res.sendFile(filePath);
+
+    const range = req.headers.range;
+    if (range && fileSize > 0) {
+      const match = /bytes=(\d*)-(\d*)/.exec(range);
+      if (match) {
+        const start = match[1] ? parseInt(match[1], 10) : 0;
+        const end = match[2] ? Math.min(fileSize - 1, parseInt(match[2], 10)) : fileSize - 1;
+        if (start >= 0 && start < fileSize && start <= end) {
+          const chunkSize = end - start + 1;
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+          res.setHeader('Content-Length', String(chunkSize));
+          const stream = fs.createReadStream(filePath, { start, end });
+          stream.on('error', () => {
+            if (!res.headersSent) res.status(500).end();
+            else res.destroy();
+          });
+          stream.pipe(res);
+          return;
+        }
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        res.end();
+        return;
+      }
+    }
+
+    res.setHeader('Content-Length', String(fileSize));
+    const fullStream = fs.createReadStream(filePath);
+    fullStream.on('error', () => {
+      if (!res.headersSent) res.status(404).end();
+      else res.destroy();
+    });
+    fullStream.pipe(res);
   });
 
   // Convert WAV base64 to standalone MP3 on demand (for History jobs or direct MP3 export)
@@ -3312,7 +3408,8 @@ async function startServer() {
 
   async function translateSubtitleCuesToLanguage(
     cues: SubtitleCue[],
-    targetSubtitleLang?: TargetLanguageCode
+    targetSubtitleLang?: TargetLanguageCode,
+    allowOwnerGeminiPool = true
   ): Promise<SubtitleCue[]> {
     if (!Array.isArray(cues) || cues.length === 0) return [];
     const withBurmeseSaved = cues.map((c) => ({
@@ -3335,8 +3432,63 @@ async function startServer() {
       zh: 'zh-CN',
       ja: 'ja'
     };
+    const langFullNameMap: Record<TargetLanguageCode, string> = {
+      my: 'Burmese',
+      en: 'English',
+      ko: 'Korean',
+      th: 'Thai',
+      zh: 'Simplified Chinese',
+      ja: 'Japanese'
+    };
     const tl = tlMap[lang] || 'en';
     const translatedCues: SubtitleCue[] = [...withBurmeseSaved];
+
+    // Primary: Context-aware Gemini AI translation when pool keys are allowed (Credit Mode only)
+    if (allowOwnerGeminiPool) {
+      try {
+        const geminiSubRes = await executeWithGeminiKeyPool(async (ai) => {
+          const numberedInput = withBurmeseSaved
+            .map((c, idx) => `${idx + 1}. ${String(c.burmeseText || c.text || '').replace(/\r?\n/g, ' ').trim()}`)
+            .join('\n');
+          const subModels = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+          for (const subModel of subModels) {
+            try {
+              const resp = await ai.models.generateContent({
+                model: subModel,
+                contents: `Translate the following ${withBurmeseSaved.length} Burmese movie recap subtitle lines into natural, accurate ${langFullNameMap[lang] || 'English'} subtitles.\nKeep the exact 1-to-1 line count (${withBurmeseSaved.length} items) and preserve character names, numbers, and dramatic meaning accurately.\n\n${numberedInput}`,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                      lines: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING }
+                      }
+                    },
+                    required: ['lines']
+                  }
+                }
+              });
+              if (resp.text) return JSON.parse(resp.text);
+            } catch (subErr: any) {
+              const msg = String(subErr?.message || subErr || '');
+              if (msg.includes('404') || msg.toLowerCase().includes('not found')) continue;
+              throw subErr;
+            }
+          }
+          return null;
+        });
+        const aiLines = geminiSubRes?.result?.lines;
+        if (Array.isArray(aiLines) && aiLines.length === withBurmeseSaved.length) {
+          return withBurmeseSaved.map((c, idx) => ({
+            ...c,
+            text: String(aiLines[idx] || c.text).trim() || c.text
+          }));
+        }
+      } catch {}
+    }
+
     const batchSize = 20;
 
     for (let i = 0; i < withBurmeseSaved.length; i += batchSize) {
@@ -3404,11 +3556,20 @@ async function startServer() {
   // while keeping the spoken Voice Script in Burmese!
   app.post('/api/recap/translate-subtitles', async (req, res) => {
     try {
-      const { cues = [], subtitleLanguage = 'my' } = (req.body || {}) as {
+      const {
+        cues = [],
+        subtitleLanguage = 'my',
+        isFreeMode = false
+      } = (req.body || {}) as {
         cues?: SubtitleCue[];
         subtitleLanguage?: TargetLanguageCode;
+        isFreeMode?: boolean;
       };
-      const translated = await translateSubtitleCuesToLanguage(cues, subtitleLanguage);
+      const translated = await translateSubtitleCuesToLanguage(
+        cues,
+        subtitleLanguage,
+        !isFreeMode
+      );
       res.json({ ok: true, subtitleLanguage, cues: translated });
     } catch (err: any) {
       res.status(500).json({
@@ -4081,8 +4242,15 @@ async function startServer() {
     let usedLiveGemini = false;
     let geminiFailureReason = '';
 
+    const hasRealUserUpload = Boolean(
+      r2ObjectKey || localUploadId || (videoBase64 && videoBase64.length > 100)
+    );
+    const isExplicitSaveTikDemoTitle = String(title || '').includes('7673413291896605967');
     const isWeddingDramaClip =
-      !isTranslateMode && targetLanguage === 'my' && Math.abs(safeDuration - 70.7) <= 2.5;
+      !isTranslateMode &&
+      targetLanguage === 'my' &&
+      Math.abs(safeDuration - 70.7) <= 2.5 &&
+      (!hasRealUserUpload || isExplicitSaveTikDemoTitle);
 
     if (isWeddingDramaClip) {
       const rawSceneCues = SAVETIK_WEDDING_DRAMA_CUES[scriptStyle] || SAVETIK_WEDDING_DRAMA_CUES.narrator;
@@ -4149,7 +4317,10 @@ async function startServer() {
     const hasHealthyPoolGeminiKey = poolState.keys.some(
       (k) => k.provider === 'gemini' && k.enabled && k.apiKey.trim().length > 0
     );
-    const hasAnyGeminiKey = Boolean(freeGeminiKey || hasHealthyPoolGeminiKey);
+    // Free Mode strictly uses ONLY the user's own Gemini API key (`freeGeminiKey`) and NEVER touches the Admin's Owner API Key Pool!
+    const hasAnyGeminiKey = isFreeMode
+      ? Boolean(freeGeminiKey)
+      : Boolean(hasHealthyPoolGeminiKey);
 
     if (!isWeddingDramaClip) {
       try {
@@ -4185,11 +4356,104 @@ async function startServer() {
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
           : '';
-        const chronologicalSceneLockGuide = !isTranslateMode
-          ? buildChronologicalSceneLockGuide(effectiveContext, safeDuration)
-          : '';
-        const textPrompt = isTranslateMode
-          ? `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
+        const timeWindows = computeAudioScriptWindows(safeDuration, 180);
+
+        const extractVisualKeyframesForSegment = async (
+          srcVideoPath: string | null,
+          segStartSec: number,
+          segDurSec: number,
+          segTag: string
+        ): Promise<Array<{ relSec: number; timeBadge: string; base64: string }>> => {
+          if (!srcVideoPath || !fs.existsSync(srcVideoPath) || isTranslateMode) return [];
+          const stepSec = Math.max(5, Math.ceil(segDurSec / 22));
+          const maxFrames = Math.min(24, Math.max(4, Math.ceil(segDurSec / stepSec)));
+          const patternPrefix = `${jobId}_vkf_${segTag}_`;
+          const outPattern = path.join(JOBS_TEMP_DIR, `${patternPrefix}%02d.jpg`);
+          try {
+            await execFileAsync('ffmpeg', [
+              '-y',
+              '-ss',
+              String(Math.max(0, segStartSec)),
+              '-t',
+              String(Math.max(4, segDurSec)),
+              '-i',
+              srcVideoPath,
+              '-vf',
+              `fps=1/${stepSec},scale=320:-2`,
+              '-frames:v',
+              String(maxFrames),
+              '-q:v',
+              '6',
+              outPattern
+            ]);
+            const files = fs
+              .readdirSync(JOBS_TEMP_DIR)
+              .filter((f) => f.startsWith(patternPrefix) && f.endsWith('.jpg'))
+              .sort();
+            const frames: Array<{ relSec: number; timeBadge: string; base64: string }> = [];
+            for (let idx = 0; idx < files.length; idx++) {
+              const fp = path.join(JOBS_TEMP_DIR, files[idx]);
+              try {
+                const buf = fs.readFileSync(fp);
+                if (buf.length > 200) {
+                  const relSec = Math.min(Math.max(0, Math.round(segDurSec - 1)), idx * stepSec);
+                  const mm = String(Math.floor(relSec / 60)).padStart(2, '0');
+                  const ss = String(relSec % 60).padStart(2, '0');
+                  frames.push({
+                    relSec,
+                    timeBadge: `${mm}:${ss}`,
+                    base64: buf.toString('base64')
+                  });
+                }
+              } catch {}
+              try {
+                fs.unlinkSync(fp);
+              } catch {}
+            }
+            return frames;
+          } catch {
+            try {
+              const leftovers = fs
+                .readdirSync(JOBS_TEMP_DIR)
+                .filter((f) => f.startsWith(patternPrefix));
+              for (const lf of leftovers) {
+                try {
+                  fs.unlinkSync(path.join(JOBS_TEMP_DIR, lf));
+                } catch {}
+              }
+            } catch {}
+            return [];
+          }
+        };
+
+        const buildPromptForWindow = (
+          winDurSec: number,
+          winContext: string,
+          winIndex: number,
+          totalWins: number,
+          winStartSec: number,
+          winEndSec: number,
+          prevSummaryHint: string,
+          hasVisualKeyframes = false
+        ) => {
+          const winCueCount = Math.max(4, Math.min(60, Math.round(winDurSec / targetSecPerCue)));
+          const winSceneGuide = !isTranslateMode
+            ? buildChronologicalSceneLockGuide(winContext, winDurSec)
+            : '';
+          const partBadge =
+            totalWins > 1
+              ? `\nVideo Segment: Part ${winIndex + 1} of ${totalWins} (Global video time ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')} to ${Math.floor(winEndSec / 60)}:${String(Math.round(winEndSec % 60)).padStart(2, '0')}; output cue timestamps MUST be relative to this segment from 0ms to ${Math.round(winDurSec * 1000)}ms).${
+                  winIndex > 0
+                    ? `\nCONTINUATION & CHARACTER CONSISTENCY RULE: This is Part ${winIndex + 1} starting at ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')}. Keep exact character roles from earlier segments (e.g. Principal "ကျောင်းအုပ်ကြီး", Teacher "ဆရာ", Student "ကျောင်းသူလေး") and do NOT restart the opening hook!${prevSummaryHint ? ` Previous story context: "${prevSummaryHint}" — continue seamlessly without repeating.` : ''}`
+                    : '\nSEGMENT 1 RULE: Narrate ONLY the events in this first segment. Do NOT guess or invent how the movie ends later!'
+                }`
+              : '';
+          const visualKeyframeNotice = hasVisualKeyframes
+            ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES ATTACHED: Timestamped video keyframes [Visual Scene Frame at MM:SS] are attached above! Whenever there is a non-dialogue / silent action stretch (such as [00:53 - 01:08] or [01:18 - 01:59]), LOOK directly at the visual keyframes at those exact timestamps and narrate what is visually happening on screen in synchronization with the character roles established in the audio/transcript!`
+            : '';
+
+          if (isTranslateMode) {
+            return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
 Task: ${
               isSttOnly && sttMode === 'transcribe'
@@ -4198,43 +4462,37 @@ Task: ${
             }.
 Target Language: ${isSttOnly && sttMode === 'transcribe' ? 'Original Spoken Language of Audio' : langLabel}.
 Video Title / Filename: ${title || 'Movie Clip'}.
-${effectiveContext ? `Timestamped Source Speech Transcript:\n${effectiveContext}` : 'Listen carefully to the attached audio and transcribe/translate every spoken dialogue line at its exact timestamp.'}
+${winContext ? `Timestamped Source Speech Transcript for this segment (0ms to ${Math.round(winDurSec * 1000)}ms):\n${winContext}` : 'Listen carefully to the attached audio segment and transcribe/translate every spoken dialogue line at its exact timestamp.'}
 
 CRITICAL DIALOGUE & TIMING RULES:
-- ONLY output actual spoken dialogue / speech cues (NEVER summarize or narrate like a third-person movie recap!).
-- Lock every cue start_ms and end_ms directly to the exact milliseconds when that character speaks in the audio/transcript (0ms to ${Math.floor(safeDuration * 1000)}ms). Leave non-dialogue/music pauses silent.
+- ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).
+- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms). Leave non-dialogue/music pauses silent.
 - All timestamps (start_ms, end_ms) MUST be in MILLISECONDS and strictly increasing.
-- ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 4 to 12 words, 20 to 54 characters).' : phraseLengthRule}`
-          : `Video Duration: ${safeDuration} seconds (${Math.round(safeDuration * 1000)} ms).
+- ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 4 to 12 words, 20 to 54 characters).' : phraseLengthRule}`;
+          }
+
+          return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
 Mode: Movie Recap (${styleDef.labelEn}) — STRICT THIRD-PERSON MOVIE STORYTELLER (NOT DIALOGUE TRANSLATION).
 Target Language: ${langLabel}.
 Video Title / Filename: ${title || 'Dramatic Movie Clip'}.
-${effectiveContext ? `Timestamped Source Transcript / Scene Timeline (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] scene timestamps — convert dialogue into 3rd-person narration!):\n${effectiveContext}${chronologicalSceneLockGuide}` : 'Listen carefully to the attached audio (if present) and narrate what happens in the video in third-person movie recap style from start to finish.'}
+${winContext ? `Timestamped Source Transcript / Scene Timeline for THIS segment (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] timestamps and visual keyframes from 0ms to ${Math.round(winDurSec * 1000)}ms — cross-verify with the attached audio & visual frames to keep exact character roles like Principal/Teacher/Student consistent throughout the entire video, and convert dialogue + visual action into accurate 3rd-person narration!):\n${winContext}${winSceneGuide}` : 'Examine the attached timestamped visual keyframes and audio segment carefully, and narrate ONLY what actually happens and is spoken in this segment in third-person movie recap style from 0ms to ' + Math.round(winDurSec * 1000) + 'ms.'}
 
 CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
-- STRICT THIRD-PERSON RECAP NARRATION ONLY: You are a movie recap narrator telling the story to viewers in third person ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက"). NEVER write first-person or second-person character dialogue ("ငါ", "မင်း", "နင်", "ခဏနေပါဦး မင်း...", "ငါ သတ်ထားတာမှ မဟုတ်တာ...") as if dubbing the actors! Always convert character dialogue into reported third-person Burmese recap narration (e.g. "...လို့ ပြောလိုက်ပါတယ်", "...ဆိုပြီး အံ့ဩသွားပါတယ်", "...လို့ ပြန်ဖြေလိုက်ပါတယ်").
-- STRICT 1:1 SCENE-TIMESTAMP LOCK (NEVER FRONT-LOAD THE PLOT): A cue at start_ms: T MUST ONLY narrate the visual/audio scene happening at timestamp T in the video/transcript! NEVER finish narrating the video's plot in the first half (e.g. at 60s–80s) and NEVER pad the second half with invented reflections, resignations, apologies, or unfilmed events!
-- ZERO REPETITION: Never write two consecutive cues with the same meaning. Every cue must advance the current scene's action, discovery, or reaction at that exact timestamp.
-- Generate approximately ${cueCount} non-overlapping spoken recap cues in ${langLabel} spanning the ENTIRE video continuously from ~100ms up to ${Math.floor(safeDuration * 1000 - 120)}ms!
-- CONTINUOUS TIMELINE COVERAGE (85%–95% SPEECH): Every cue's start_ms and end_ms must align chronologically with what happens on screen at that timestamp, all the way to ${Math.round((safeDuration / 60) * 10) / 10} minutes without drifting or bunched gaps!${timelineAnchorNote}
-- All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (e.g. 2500 for 2.5s) and strictly increasing.
+- STRICT FACTUAL ACCURACY TO SOURCE VIDEO FRAMES, AUDIO & TRANSCRIPT: Translate and narrate ONLY the real dialogue, visual scenes, plot events, numbers, and character actions present in THIS segment. Never invent unrelated storylines!${visualKeyframeNotice}${timelineAnchorNote}
+- CHARACTER CONSISTENCY ACROSS ENTIRE TIMELINE: Maintain the exact same character identities and roles (e.g., if a character is introduced as the School Principal "ကျောင်းအုပ်ကြီး" or Teacher "ဆရာ" at 0:00, keep calling them "ကျောင်းအုပ်ကြီး" / "ဆရာ" when they reappear at 1:09 — never switch them to a factory boss or unrelated person!).
+- STRICT THIRD-PERSON RECAP NARRATION ONLY: You are a movie recap narrator telling the story to viewers in third person ("ကောင်လေးက", "သူက", "သူမက", "ကျောင်းအုပ်ကြီးက", "ဆရာက"). NEVER write first-person or second-person character dialogue ("ငါ", "မင်း", "နင်") as if dubbing the actors! Always convert character dialogue into reported third-person Burmese recap narration.
+- STRICT 1:1 SCENE-TIMESTAMP LOCK: A cue at start_ms: T MUST ONLY narrate the visual/audio scene happening at timestamp T in this segment (0ms to ${Math.floor(winDurSec * 1000 - 100)}ms)!
+- ZERO REPETITION: Never write two consecutive cues with the same meaning.
+- Generate approximately ${winCueCount} non-overlapping spoken recap cues in ${langLabel} spanning this entire ${winDurSec}s segment from ~80ms up to ${Math.floor(winDurSec * 1000 - 100)}ms!
+- All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (0 to ${Math.round(winDurSec * 1000)}) and strictly increasing.
 - ${phraseLengthRule}`;
+        };
 
-        const contentsParts: Array<
-          { text: string } | { inlineData: { mimeType: string; data: string } }
-        > = [];
-        if (extractedAudioBase64) {
-          contentsParts.push({
-            inlineData: {
-              mimeType: 'audio/mp3',
-              data: extractedAudioBase64
-            }
-          });
-        }
-        contentsParts.push({ text: textPrompt });
-
-        const runScriptRequest = async (ai: GoogleGenAI) => {
+        const runScriptRequestWithParts = async (
+          ai: GoogleGenAI,
+          partsPayload: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
+        ) => {
           const candidateModels = resolveFallbackScriptModels(
             scriptModel || 'gemini-3-flash-preview'
           );
@@ -4259,7 +4517,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                 return await Promise.race([
                   ai.models.generateContent({
                     model: targetModel,
-                    contents: { parts: contentsParts },
+                    contents: { parts: partsPayload },
                     config: {
                       systemInstruction,
                       responseMimeType: 'application/json',
@@ -4338,57 +4596,282 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           throw lastScriptErr || new Error('All Gemini script model candidates failed');
         };
 
-        const response = freeGeminiKey
-          ? await runScriptRequest(
+        const invokeGeminiWithParts = async (
+          partsPayload: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
+        ) => {
+          if (isFreeMode) {
+            if (!freeGeminiKey) {
+              throw new Error(
+                'Free Mode REQUIRES your own Gemini API Key in Settings (/settings). Admin Credit Mode API keys are blocked in Free Mode.'
+              );
+            }
+            return await runScriptRequestWithParts(
               new GoogleGenAI({
                 apiKey: freeGeminiKey,
                 httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-              })
-            )
-          : (await executeWithGeminiKeyPool(runScriptRequest))?.result;
-        if (response?.text) {
-          const parsed = JSON.parse(response.text);
-          if (Array.isArray(parsed.cues) && parsed.cues.length > 0) {
-            finalTitle = parsed.title || finalTitle;
-            const maxReturnedEnd = Math.max(
-              ...parsed.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)
+              }),
+              partsPayload
             );
-            const unitMultiplier =
-              maxReturnedEnd > 0 && maxReturnedEnd <= safeDuration * 1.5 ? 1000 : 1;
+          }
+          return (await executeWithGeminiKeyPool((ai) => runScriptRequestWithParts(ai, partsPayload)))?.result;
+        };
 
-            const rawParsedCues: SubtitleCue[] = parsed.cues
-              .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
-                const rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
-                const rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
-                const startMs = Math.max(0, rawStart || idx * 2500);
-                const endMs = Math.max(startMs + 800, rawEnd || startMs + 2400);
-                return {
-                  id: `cue-${idx + 1}`,
-                  start_ms: startMs,
-                  end_ms: endMs,
-                  text: String(c.text || '').trim()
-                };
-              })
-              .filter((c: SubtitleCue) => c.text.length > 0);
-            if (rawParsedCues.length > 0) {
-              const preSplitCues = splitCuesIntoShortPhrases(
-                rawParsedCues,
-                isTranslateMode ? 54 : 64
+        const parseWindowResponseCues = (
+          parsedObj: any,
+          winDurSec: number,
+          winOffsetMs: number
+        ): SubtitleCue[] => {
+          if (!Array.isArray(parsedObj?.cues) || parsedObj.cues.length === 0) return [];
+          const maxReturnedEnd = Math.max(
+            ...parsedObj.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)
+          );
+          const unitMultiplier =
+            maxReturnedEnd > 0 && maxReturnedEnd <= winDurSec * 1.5 ? 1000 : 1;
+          const winDurMs = Math.round(winDurSec * 1000);
+
+          const rawWinCues: SubtitleCue[] = parsedObj.cues
+            .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
+              let rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
+              let rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
+              // If Gemini returned global timestamps instead of window-relative timestamps, rebase them
+              if (winOffsetMs > 0 && rawStart >= winOffsetMs - 1500) {
+                rawStart = Math.max(0, rawStart - winOffsetMs);
+                rawEnd = Math.max(rawStart + 800, rawEnd - winOffsetMs);
+              }
+              const startMs = Math.max(0, Math.min(winDurMs - 400, rawStart || idx * 2500));
+              const endMs = Math.max(startMs + 800, Math.min(winDurMs, rawEnd || startMs + 2400));
+              return {
+                id: `cue-w-${idx + 1}`,
+                start_ms: startMs,
+                end_ms: endMs,
+                text: String(c.text || '').trim()
+              };
+            })
+            .filter((c: SubtitleCue) => c.text.length > 0);
+
+          if (rawWinCues.length === 0) return [];
+          const splitWin = splitCuesIntoShortPhrases(rawWinCues, isTranslateMode ? 54 : 64);
+          const normWin = isTranslateMode
+            ? normalizeDialogueSubtitleCues(splitWin, winDurSec)
+            : normalizeRecapTimelineCues(splitWin, winDurSec);
+          return normWin.map((c) => ({
+            ...c,
+            start_ms: c.start_ms + winOffsetMs,
+            end_ms: c.end_ms + winOffsetMs
+          }));
+        };
+
+        let multiWindowSucceeded = false;
+        if (timeWindows.length > 1) {
+          try {
+            const stitchedCues: SubtitleCue[] = [];
+            let storyContextHint = '';
+            for (const win of timeWindows) {
+              const pct = 58 + Math.round(((win.index + 1) / timeWindows.length) * 12);
+              onProgress(
+                pct,
+                `Writing accurate scene script (Part ${win.index + 1}/${timeWindows.length}: ${Math.floor(win.startSec / 60)}:${String(Math.round(win.startSec % 60)).padStart(2, '0')}–${Math.floor(win.endSec / 60)}:${String(Math.round(win.endSec % 60)).padStart(2, '0')})...`
               );
-              finalCues = isTranslateMode
-                ? normalizeDialogueSubtitleCues(preSplitCues, safeDuration)
-                : normalizeRecapTimelineCues(preSplitCues, safeDuration);
+
+              let winAudioBase64: string | null = null;
+              let winAudioBuffer: Buffer | null = null;
+              if (inputVideoPath && fs.existsSync(inputVideoPath)) {
+                const winMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_win_${win.index}.mp3`);
+                try {
+                  await execFileAsync('ffmpeg', [
+                    '-y',
+                    '-ss',
+                    String(win.startSec),
+                    '-t',
+                    String(win.durationSec),
+                    '-i',
+                    inputVideoPath,
+                    '-vn',
+                    '-ar',
+                    '16000',
+                    '-ac',
+                    '1',
+                    '-b:a',
+                    '48k',
+                    winMp3Path
+                  ]);
+                  if (fs.existsSync(winMp3Path) && fs.statSync(winMp3Path).size > 200) {
+                    winAudioBuffer = fs.readFileSync(winMp3Path);
+                    winAudioBase64 = winAudioBuffer.toString('base64');
+                  }
+                  if (fs.existsSync(winMp3Path)) fs.unlinkSync(winMp3Path);
+                } catch {}
+              }
+
+              const winKeyframes = await extractVisualKeyframesForSegment(
+                inputVideoPath,
+                win.startSec,
+                win.durationSec,
+                `w${win.index}`
+              );
+
+              let winTranscript = sliceTimedTranscriptForWindow(
+                effectiveContext,
+                win.startSec,
+                win.endSec
+              );
+              if (!winTranscript && winAudioBuffer) {
+                try {
+                  if (freeGroqKey) {
+                    winTranscript = await transcribeWithDirectGroqKey(winAudioBuffer, freeGroqKey, sttModel);
+                  } else if (!isFreeMode) {
+                    const poolStt = await transcribeAudioWithGroqPool(winAudioBuffer, sttModel);
+                    if (poolStt?.text) winTranscript = poolStt.text;
+                  }
+                } catch {}
+              }
+
+              const winPrompt = buildPromptForWindow(
+                win.durationSec,
+                winTranscript,
+                win.index,
+                timeWindows.length,
+                win.startSec,
+                win.endSec,
+                storyContextHint,
+                winKeyframes.length > 0
+              );
+              const winParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+              for (const kf of winKeyframes) {
+                winParts.push({
+                  text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relSec * 1000}ms)]`
+                });
+                winParts.push({
+                  inlineData: {
+                    mimeType: 'image/jpeg',
+                    data: kf.base64
+                  }
+                });
+              }
+              if (winAudioBase64) {
+                winParts.push({
+                  inlineData: {
+                    mimeType: 'audio/mp3',
+                    data: winAudioBase64
+                  }
+                });
+              } else if (extractedAudioBase64) {
+                winParts.push({
+                  inlineData: {
+                    mimeType: 'audio/mp3',
+                    data: extractedAudioBase64
+                  }
+                });
+              }
+              winParts.push({ text: winPrompt });
+
+              const winResp = await invokeGeminiWithParts(winParts);
+              if (!winResp?.text) {
+                throw new Error(`Empty Gemini response for window ${win.index + 1}`);
+              }
+              const winParsed = JSON.parse(winResp.text);
+              if (win.index === 0 && winParsed.title) {
+                finalTitle = winParsed.title;
+              }
+              const winCues = parseWindowResponseCues(
+                winParsed,
+                win.durationSec,
+                Math.round(win.startSec * 1000)
+              );
+              if (winCues.length === 0) {
+                throw new Error(`Zero cues parsed for window ${win.index + 1}`);
+              }
+              storyContextHint = [
+                winCues[0]?.text,
+                winCues[Math.floor(winCues.length / 2)]?.text,
+                winCues[winCues.length - 1]?.text
+              ]
+                .filter(Boolean)
+                .join(' -> ');
+              stitchedCues.push(...winCues);
+            }
+
+            if (stitchedCues.length > 0) {
+              let seamCursorMs = 60;
+              finalCues = stitchedCues.map((c, idx) => {
+                const s = Math.max(seamCursorMs, c.start_ms);
+                const e = Math.max(s + 450, c.end_ms);
+                seamCursorMs = e + 90;
+                return {
+                  ...c,
+                  id: `cue-${idx + 1}`,
+                  start_ms: s,
+                  end_ms: e
+                };
+              });
+              finalScriptText = finalCues.map((c) => c.text).join(' ');
+              usedLiveGemini = true;
+              multiWindowSucceeded = true;
+            }
+          } catch (winErr) {
+            console.warn('[Gemini Multi-Window] Falling back to single-pass script generation:', winErr);
+          }
+        }
+
+        if (!multiWindowSucceeded) {
+          const singlePassKeyframes = await extractVisualKeyframesForSegment(
+            inputVideoPath,
+            0,
+            safeDuration,
+            'full'
+          );
+          const singlePassPrompt = buildPromptForWindow(
+            safeDuration,
+            effectiveContext,
+            0,
+            1,
+            0,
+            safeDuration,
+            '',
+            singlePassKeyframes.length > 0
+          );
+          const contentsParts: Array<
+            { text: string } | { inlineData: { mimeType: string; data: string } }
+          > = [];
+          for (const kf of singlePassKeyframes) {
+            contentsParts.push({
+              text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relSec * 1000}ms)]`
+            });
+            contentsParts.push({
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: kf.base64
+              }
+            });
+          }
+          if (extractedAudioBase64) {
+            contentsParts.push({
+              inlineData: {
+                mimeType: 'audio/mp3',
+                data: extractedAudioBase64
+              }
+            });
+          }
+          contentsParts.push({ text: singlePassPrompt });
+
+          const response = await invokeGeminiWithParts(contentsParts);
+          if (response?.text) {
+            const parsed = JSON.parse(response.text);
+            if (parsed.title) finalTitle = parsed.title;
+            const parsedSingleCues = parseWindowResponseCues(parsed, safeDuration, 0);
+            if (parsedSingleCues.length > 0) {
+              finalCues = parsedSingleCues.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
               finalScriptText = finalCues.map((c) => c.text).join(' ');
               if (Array.isArray(parsed.highlight_clips) && parsed.highlight_clips.length > 0) {
                 finalHighlights = parsed.highlight_clips;
               }
               usedLiveGemini = true;
             }
+          } else if (!hasAnyGeminiKey) {
+            geminiFailureReason = 'No Gemini API Key configured';
+          } else {
+            geminiFailureReason = 'Gemini returned empty script or all keys exhausted quota';
           }
-        } else if (!hasAnyGeminiKey) {
-          geminiFailureReason = 'No Gemini API Key configured';
-        } else {
-          geminiFailureReason = 'Gemini returned empty script or all keys exhausted quota';
         }
       } catch (err: any) {
         geminiFailureReason = err?.message ? String(err.message) : String(err || 'Gemini error');
@@ -4458,7 +4941,8 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
     if (!isCaptionsOnlyMode) {
       onProgress(74, 'Synthesizing AI voiceover...');
       const useGeminiPrimary =
-        ttsEngine === 'gemini-2.5-flash-preview-tts' || voiceDef.tier === 'pro';
+        !isFreeMode &&
+        (ttsEngine === 'gemini-2.5-flash-preview-tts' || voiceDef.tier === 'pro');
 
       if (useGeminiPrimary) {
         try {
@@ -4499,7 +4983,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         }
       }
 
-      if (!voiceoverWavBuffer) {
+      if (!voiceoverWavBuffer && !isFreeMode) {
         try {
           const geminiFallbackRun = await executeWithGeminiKeyPool(async (ai) => {
             return await synthesizeGeminiProVoiceCuesWavBuffer(
@@ -4535,7 +5019,11 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       subtitleConfig.subtitleLanguage !== targetLanguage
     ) {
       onProgress(84, `Translating subtitles to ${subtitleConfig.subtitleLanguage.toUpperCase()}...`);
-      finalCues = await translateSubtitleCuesToLanguage(finalCues, subtitleConfig.subtitleLanguage);
+      finalCues = await translateSubtitleCuesToLanguage(
+        finalCues,
+        subtitleConfig.subtitleLanguage,
+        !isFreeMode
+      );
     }
 
     let voiceoverWavPath: string | null = null;

@@ -219,6 +219,41 @@ export const UPLOADED_VIDEO_PATH =
 export const UPLOADED_VIDEO_FILENAME =
   'SaveTik.co_7673413291896605967-hd_47ddcad1.mp4';
 
+export const STREAMWAVE_VOICE_STYLE_PROMPTS: Record<ScriptStyleId, string> = {
+  narrator: `You are a Burmese movie recap narrator (Fast Recap style).
+Rewrite the timestamped transcript into a natural spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+Rules:
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
+- Open with a strong hook in the first 3 seconds.
+- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
+- Do not repeat the same meaning across consecutive cues.
+- Use natural spoken Burmese endings ("...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", "...နေတုန်းမှာပဲ") without trailing "။".`,
+  drama: `You are a Burmese movie recap storyteller (Storytelling / Drama style — Tone: Intense & Cinematic).
+Rewrite the timestamped transcript into an emotionally gripping, continuous third-person spoken Myanmar movie recap with cinematic intensity and short punchy sentences.
+Rules:
+- Narrate strictly in third-person ("သူက", "ကောင်လေးက", "သူမက") and never output raw first/second-person character dialogue ("ငါ", "မင်း").
+- Emphasize character emotions, motives, suspense, and dramatic turning points in natural spoken Burmese.
+- Keep every cue to a single 1-line phrase (26–50 Burmese characters, ~2.1–2.9 seconds) locked to the scene timestamps [start_ms, end_ms] with 100–220ms natural pauses.
+- Never repeat the same point across consecutive cues.`,
+  casual: `You are a viral Burmese short-form movie recap creator (Gen Z / Casual style — Tone: Fast & Engaging).
+Rewrite the timestamped transcript into a fast, energetic third-person spoken Myanmar movie commentary for TikTok, Reels, and Shorts.
+Rules:
+- Use lively, conversational third-person Burmese recap phrasing ("ဘဲကြီးက", "ဒီကောင်လေးက", "သူက") — never literal character dialogue ("ငါ", "မင်း").
+- Keep pacing brisk with zero dead air and zero repetition between consecutive cues.
+- Keep every cue to a crisp 1-line spoken Burmese phrase (26–48 Burmese characters, ~1.9–2.7 seconds) synced to [start_ms, end_ms].`,
+  news: `You are a Burmese broadcast recap anchor (News style — Authoritative, facts-first storytelling · Tone: Measured & Surprising).
+Summarize the video's timestamped events into an objective, facts-first third-person spoken Myanmar recap.
+Rules:
+- Present key events, cause-and-effect, and surprising facts clearly in third-person Burmese without first-person dialogue ("ငါ", "မင်း").
+- Keep every cue to a single concise 1-line spoken Burmese phrase (28–50 Burmese characters, ~2.1–2.9 seconds) synced to [start_ms, end_ms] with no repeated facts.`,
+  none: `You are a Burmese documentary narrator (Documentary style — Journalistic, context → story → insight · Tone: Reflective & Deep).
+Write an insightful, observational third-person spoken Myanmar documentary recap synchronized 1-to-1 with the video's exact scene timestamps.
+Rules:
+- Follow the documentary progression (context → story → insight) using calm, journalistic spoken Burmese endings ("...ဖြစ်ပါတယ်", "...တွေ့ရပါတယ်", "...လုပ်ဆောင်ပါတယ်").
+- Never output first-person dialogue ("ငါ", "မင်း") or repeat consecutive sentences.
+- Strict 1:1 scene-timestamp lock: each cue at [start_ms, end_ms] must narrate only the scene happening at that exact timestamp window, never front-loading the plot or padding later scenes.`
+};
+
 export const SCRIPT_STYLE_PROMPTS: Record<ScriptStyleId, ScriptStylePromptDefinition> = {
   narrator: {
     id: 'narrator',
@@ -228,8 +263,15 @@ export const SCRIPT_STYLE_PROMPTS: Record<ScriptStyleId, ScriptStylePromptDefini
     descriptionEn: 'Natural spoken Myanmar rewrite. Enhanced context comprehension. Punchy 3rd-person movie narrator with tight 1-line phrase captions.',
     descriptionMy: 'ကြည့်ရှုသူကို ၃ စက္ကန့်အတွင်း ဆွဲဆောင်နိုင်မယ့် သဘာဝကျကျ မြန်မာစကားပြောဟန် ၁ ကြောင်းစာ စာတန်းထိုးနှင့် အမြန်ပြန်ပြောပြမယ့်ဟန်။',
     pacingWpm: 155,
-    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Senior Burmese Movie Recap Narrator ("Fast Recap / narrator" preset — Natural spoken Myanmar rewrite with enhanced context comprehension).
-TASK: Transform the input video's timestamped dialogue and visual/audio events into a high-retention, THIRD-PERSON Burmese Movie Recap script with SHORT 1-LINE PHRASES synced accurately from the opening second to the final scene.
+    systemPrompt: `You are a Burmese movie recap narrator (Fast Recap style).
+Rewrite the timestamped transcript into a natural spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+Rules:
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
+- Open with a strong hook in the first 3 seconds.
+- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
+- Do not repeat the same meaning across consecutive cues.
+- Use natural spoken Burmese endings ("...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", "...နေတုန်းမှာပဲ") without trailing "။".
+
 CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
 1. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT DIALOGUE TRANSLATION):
    - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
@@ -253,8 +295,14 @@ CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
     descriptionEn: 'Cinematic intensity, short punchy sentences (Tone: Intense & Cinematic) with natural spoken Myanmar rewrite.',
     descriptionMy: 'ဇာတ်ကောင်တွေရဲ့ စိတ်ခံစားချက်နဲ့ လှည့်ကွက်တွေကို ရုပ်ရှင်ဆန်ဆန် ဝါကျတိုများဖြင့် ဆွဲဆောင်မှုရှိရှိ ပြောပြမယ့်ဟန်။',
     pacingWpm: 148,
-    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Cinematic Storytelling Recap Writer ("Storytelling / drama" preset — Cinematic intensity, short punchy sentences · Tone: Intense & Cinematic).
-TASK: Craft an emotionally gripping, continuous THIRD-PERSON Burmese movie recap script using SHORT 1-LINE PHRASES (26–50 Burmese characters per cue, 2.1s–2.9s each) synchronized tightly to every scene from start to finale.
+    systemPrompt: `You are a Burmese movie recap storyteller (Storytelling / Drama style — Tone: Intense & Cinematic).
+Rewrite the timestamped transcript into an emotionally gripping, continuous third-person spoken Myanmar movie recap with cinematic intensity and short punchy sentences.
+Rules:
+- Narrate strictly in third-person ("သူက", "ကောင်လေးက", "သူမက") and never output raw first/second-person character dialogue ("ငါ", "မင်း").
+- Emphasize character emotions, motives, suspense, and dramatic turning points in natural spoken Burmese.
+- Keep every cue to a single 1-line phrase (26–50 Burmese characters, ~2.1–2.9 seconds) locked to the scene timestamps [start_ms, end_ms] with 100–220ms natural pauses.
+- Never repeat the same point across consecutive cues.
+
 CRITICAL RULES:
 1. STRICT THIRD-PERSON STORYTELLING ONLY (NATURAL SPOKEN MYANMAR REWRITE): Narrate the story from the outside ("သူက", "ကောင်လေးက", "သူမက"). NEVER output literal first/second-person character dialogue ("ငါ", "မင်း")—always turn character speech into emotional third-person recap narration with cinematic intensity and short punchy sentences.
 2. ZERO REPETITION: Never repeat the same idea across consecutive cues; each cue must reveal a new emotional beat, motive, or plot turn.
@@ -269,8 +317,13 @@ CRITICAL RULES:
     descriptionEn: 'Fast & engaging viral commentary with natural spoken Myanmar rewrite and rapid 1-line TikTok highlight captions.',
     descriptionMy: 'TikTok နဲ့ Reels အတွက် အထူးသင့်တော်တဲ့ လူငယ်ဆန်ဆန် သွက်လက်တက်ကြွသော ၁ ကြောင်းစာ စာတန်းထိုး ပြောဟန်။',
     pacingWpm: 160,
-    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Viral Gen-Z Short-Form Recap Creator ("Gen Z / casual" preset — Tone: Fast & Engaging · Natural spoken Myanmar rewrite).
-TASK: Write a punchy, energetic THIRD-PERSON Burmese movie recap script for TikTok/Reels with SHORT 1-LINE PHRASES (26–48 Burmese characters per cue, 1.9s–2.7s each).
+    systemPrompt: `You are a viral Burmese short-form movie recap creator (Gen Z / Casual style — Tone: Fast & Engaging).
+Rewrite the timestamped transcript into a fast, energetic third-person spoken Myanmar movie commentary for TikTok, Reels, and Shorts.
+Rules:
+- Use lively, conversational third-person Burmese recap phrasing ("ဘဲကြီးက", "ဒီကောင်လေးက", "သူက") — never literal character dialogue ("ငါ", "မင်း").
+- Keep pacing brisk with zero dead air and zero repetition between consecutive cues.
+- Keep every cue to a crisp 1-line spoken Burmese phrase (26–48 Burmese characters, ~1.9–2.7 seconds) synced to [start_ms, end_ms].
+
 CRITICAL RULES:
 1. THIRD-PERSON VIRAL COMMENTARY ONLY: Narrate what the characters are doing in lively third-person Burmese recap style ("ဘဲကြီးက", "သူက", "ဒီကောင်လေးက"). NEVER translate raw first-person dialogue ("ငါ", "မင်း") directly!
 2. ZERO REPETITION & ZERO DEAD AIR: Never repeat the same point twice; keep commentary moving briskly with 100ms–200ms pauses from 0ms to the end.
@@ -284,8 +337,12 @@ CRITICAL RULES:
     descriptionEn: 'Authoritative, facts-first storytelling (Tone: Measured & Surprising) with crisp 1-line synced captions.',
     descriptionMy: 'သတင်းကြေညာသူတစ်ဦးလို အချက်အလက်ဦးစားပေးပြီး တိကျရှင်းလင်းသော ၁ ကြောင်းစာ စာတန်းထိုး တင်ဆက်ဟန်။',
     pacingWpm: 150,
-    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Broadcast News & Fact Recap Anchor ("News / news" preset — Authoritative, facts-first storytelling · Tone: Measured & Surprising).
-TASK: Summarize the video's events in a crisp, objective THIRD-PERSON broadcast narration with SHORT 1-LINE PHRASES (28–50 Burmese characters per cue, 2.1s–2.9s each) synced accurately from start to finish. Never output first-person dialogue ("ငါ", "မင်း") or repeat the same fact across consecutive cues.
+    systemPrompt: `You are a Burmese broadcast recap anchor (News style — Authoritative, facts-first storytelling · Tone: Measured & Surprising).
+Summarize the video's timestamped events into an objective, facts-first third-person spoken Myanmar recap.
+Rules:
+- Present key events, cause-and-effect, and surprising facts clearly in third-person Burmese without first-person dialogue ("ငါ", "မင်း").
+- Keep every cue to a single concise 1-line spoken Burmese phrase (28–50 Burmese characters, ~2.1–2.9 seconds) synced to [start_ms, end_ms] with no repeated facts.
+
 OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   none: {
@@ -296,8 +353,13 @@ OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, 
     descriptionEn: 'Journalistic, context → story → insight (Tone: Reflective & Deep) with 1:1 scene-synced 1-line captions.',
     descriptionMy: 'မှတ်တမ်းရုပ်ရှင်တစ်ခုလို အကြောင်းအရာ၊ ဇာတ်လမ်းနှင့် သုံးသပ်ချက်များကို လေးနက်တည်ငြိမ်စွာ ၁ ကြောင်းစာ စာတန်းထိုးဖြင့် ရှင်းပြဟန်။',
     pacingWpm: 145,
-    systemPrompt: `You are StreamWaveAI / TTAK MOVIE RECAP's Documentary Narrator ("Documentary / none" preset — Journalistic, context → story → insight · Tone: Reflective & Deep).
-TASK: Write an insightful, continuous THIRD-PERSON documentary recap with SHORT 1-LINE PHRASES (28–50 Burmese characters per cue, 2.2s–3.1s each) locked 1-to-1 to the exact video scene timestamps from start to finish.
+    systemPrompt: `You are a Burmese documentary narrator (Documentary style — Journalistic, context → story → insight · Tone: Reflective & Deep).
+Write an insightful, observational third-person spoken Myanmar documentary recap synchronized 1-to-1 with the video's exact scene timestamps.
+Rules:
+- Follow the documentary progression (context → story → insight) using calm, journalistic spoken Burmese endings ("...ဖြစ်ပါတယ်", "...တွေ့ရပါတယ်", "...လုပ်ဆောင်ပါတယ်").
+- Never output first-person dialogue ("ငါ", "မင်း") or repeat consecutive sentences.
+- Strict 1:1 scene-timestamp lock: each cue at [start_ms, end_ms] must narrate only the scene happening at that exact timestamp window, never front-loading the plot or padding later scenes.
+
 CRITICAL DOCUMENTARY SYNC RULES:
 1. KEEP SIGNATURE DOCUMENTARY TONE (CONTEXT → STORY → INSIGHT): Use calm, journalistic, observational third-person Burmese documentary sentences ("...ဖြစ်ပါတယ်", "...တွေ့ရပါတယ်", "...လုပ်ဆောင်ပါတယ်"). Never output literal first-person character dialogue ("ငါ", "မင်း") or repeat consecutive sentences.
 2. STRICT 1:1 SCENE-TIMESTAMP LOCK (NEVER FRONT-LOAD THE PLOT): A cue at start_ms: T MUST ONLY narrate the visual/audio scene occurring at timestamp T in the video/transcript! NEVER finish narrating the video's plot in the first half and NEVER pad the second half with invented reflections, resignations, or unfilmed events.
@@ -691,7 +753,7 @@ export type SttProviderOrder = ('user_groq' | 'workers_ai' | 'groq_pool')[];
 
 /**
  * Resolves STT execution chain:
- * - Free Mode: NEVER uses Cloudflare Workers AI (uses user's own Groq key if supplied, else Groq pool).
+ * - Free Mode: NEVER uses Cloudflare Workers AI or Admin's Groq Key Pool (only uses user's own Groq key if supplied).
  * - Credit Mode: Runs Cloudflare Workers AI (`@cf/openai/whisper-large-v3-turbo`) first when configured,
  *   with automatic failover to Owner Groq Key Pool.
  */
@@ -701,7 +763,7 @@ export function resolveSttStrategyForMode(
   hasWorkersAiConfigured: boolean
 ): SttProviderOrder {
   if (isFreeMode) {
-    return hasFreeGroqKey ? ['user_groq'] : ['groq_pool'];
+    return hasFreeGroqKey ? ['user_groq'] : [];
   }
   return hasWorkersAiConfigured ? ['workers_ai', 'groq_pool'] : ['groq_pool'];
 }
@@ -984,6 +1046,102 @@ export function buildChronologicalSceneLockGuide(
   }
 
   return `\nMANDATORY 1:1 SCENE-TIMESTAMP WINDOWS (LOCK EVERY CUE TO ITS EXACT WINDOW — NEVER NARRATE LATER WINDOWS EARLY!):\n${windows.join('\n')}`;
+}
+
+export interface AudioScriptTimeWindow {
+  index: number;
+  totalWindows: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
+/**
+ * Splits videos longer than 65 seconds into balanced <=64s audio/transcript windows
+ * so Gemini never front-loads the entire story into the first ~1:08 (68s) and never
+ * hallucinates or drifts on the second half of a video.
+ */
+export function computeAudioScriptWindows(
+  totalDurationSec: number,
+  maxWindowSec = 64
+): AudioScriptTimeWindow[] {
+  const safeTotal = Math.max(6, Math.round(Number(totalDurationSec) || 60));
+  const safeMax = Math.max(30, Math.round(maxWindowSec || 64));
+  if (safeTotal <= safeMax) {
+    return [
+      {
+        index: 0,
+        totalWindows: 1,
+        startSec: 0,
+        endSec: safeTotal,
+        durationSec: safeTotal
+      }
+    ];
+  }
+  const numWindows = Math.max(2, Math.ceil(safeTotal / safeMax));
+  const windows: AudioScriptTimeWindow[] = [];
+  for (let i = 0; i < numWindows; i++) {
+    const startSec = Math.round((i * safeTotal) / numWindows);
+    const endSec = i === numWindows - 1 ? safeTotal : Math.round(((i + 1) * safeTotal) / numWindows);
+    const durationSec = Math.max(6, endSec - startSec);
+    windows.push({
+      index: i,
+      totalWindows: numWindows,
+      startSec,
+      endSec,
+      durationSec
+    });
+  }
+  return windows;
+}
+
+/**
+ * Extracts and re-indexes `[MM:SS - MM:SS]` Whisper STT lines that fall within `[startSec, endSec]`
+ * so each 60s window receives ONLY its own dialogue shifted to `00:00 .. windowDuration`.
+ */
+export function sliceTimedTranscriptForWindow(
+  timedTranscript: string | undefined | null,
+  startSec: number,
+  endSec: number
+): string {
+  if (!timedTranscript || typeof timedTranscript !== 'string' || !timedTranscript.trim()) {
+    return '';
+  }
+  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+  const toSec = (a: string, b: string, c?: string) =>
+    c !== undefined ? Number(a) * 3600 + Number(b) * 60 + Number(c) : Number(a) * 60 + Number(b);
+
+  const rawLines = timedTranscript
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const timedEntries: Array<{ s: number; e: number; text: string }> = [];
+  for (const line of rawLines) {
+    const m = line.match(lineRegex);
+    if (!m) continue;
+    const s = toSec(m[1], m[2], m[3]);
+    const e = Math.max(s + 1, toSec(m[4], m[5], m[6]));
+    const text = m[7].trim();
+    if (text) timedEntries.push({ s, e, text });
+  }
+
+  // If transcript is plain untimed text, only return it for single-window or proportional slice
+  if (timedEntries.length === 0) {
+    return timedTranscript.trim();
+  }
+
+  const winDur = Math.max(1, endSec - startSec);
+  const matching = timedEntries.filter((item) => item.s < endSec && item.e > startSec);
+  if (matching.length === 0) return '';
+
+  return matching
+    .map((item) => {
+      const relStart = Math.max(0, Math.min(winDur - 1, Math.round(item.s - startSec)));
+      const relEnd = Math.max(relStart + 1, Math.min(winDur, Math.round(item.e - startSec)));
+      return `[${formatSecBadge(relStart)} - ${formatSecBadge(relEnd)}] ${item.text}`;
+    })
+    .join('\n');
 }
 
 /**
@@ -1772,6 +1930,40 @@ export function findActiveCue(cues: SubtitleCue[], currentTimeMs: number): Subti
       return cue;
     }
   }
+  return null;
+}
+
+/**
+ * Finds the subtitle cue to display on the video stage during playback/scrubbing.
+ * During short breath pauses between consecutive cues (e.g. at 1:10 between cue-24 and cue-25),
+ * holds the just-finished cue at that scene instead of erroneously jumping back to `cues[0]`.
+ */
+export function findDisplayCueAtTime(
+  cues: SubtitleCue[],
+  currentTimeMs: number,
+  maxHoldGapMs = 1500
+): SubtitleCue | null {
+  if (!cues || cues.length === 0) return null;
+  const exact = findActiveCue(cues, currentTimeMs);
+  if (exact) return exact;
+
+  if (currentTimeMs < cues[0].start_ms) {
+    return cues[0];
+  }
+
+  let latestPastCue: SubtitleCue | null = null;
+  for (const cue of cues) {
+    if (cue.end_ms <= currentTimeMs) {
+      if (!latestPastCue || cue.end_ms >= latestPastCue.end_ms) {
+        latestPastCue = cue;
+      }
+    }
+  }
+
+  if (latestPastCue && currentTimeMs - latestPastCue.end_ms <= maxHoldGapMs) {
+    return latestPastCue;
+  }
+
   return null;
 }
 
