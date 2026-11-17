@@ -908,7 +908,7 @@ export function alignCuesWithAudioSync(
         // would cause remaining speech to overflow totalDurationMs, or if the gap exceeds 2600ms.
         const latestSafeSceneStartMs = Math.max(
           audioCursorMs,
-          totalDurationMs - 100 - Math.round(remainingSpokenMs / 1.16) - minRemainingPausesMs
+          totalDurationMs - 100 - Math.round(remainingSpokenMs / 1.20) - minRemainingPausesMs
         );
         if (alignedStartMs > latestSafeSceneStartMs) {
           alignedStartMs = latestSafeSceneStartMs;
@@ -959,6 +959,14 @@ export function alignCuesWithAudioSync(
       if (availableSlotMs > avgRemainingSlot * 1.35) {
         availableSlotMs = Math.max(480, Math.round(avgRemainingSlot * 1.2));
       }
+    }
+
+    // Gentle late-drift catch-up: if accumulated voice cursor slipped >280ms behind scene timestamp,
+    // compress this phrase's slot slightly (within 1.24x tempo cap) so ending scenes remain locked 1:1.
+    const lateDriftMs = cues.length > 1 ? Math.max(0, alignedStartMs - targetSceneStartMs) : 0;
+    if (dynamicTempoFit && lateDriftMs > 280 && availableSlotMs > 600) {
+      const catchUpTrimMs = Math.min(Math.round(lateDriftMs * 0.45), Math.round(availableSlotMs * 0.16));
+      availableSlotMs = Math.max(480, availableSlotMs - catchUpTrimMs);
     }
 
     let tempoFactor = 1.0;
@@ -4117,5 +4125,111 @@ export function shouldAutoRedirectAuthenticatedRoot(
   const clean = (pathname || '/').trim();
   return clean === '' || clean === '/';
 }
+
+export interface VisualKeyframePlan {
+  segDurSec: number;
+  useTwoPassTail: boolean;
+  mainDurationSec: number;
+  mainIntervalSec: number;
+  mainMinCutGapSec: number;
+  mainSceneThreshold: number;
+  mainMaxFrames: number;
+  tailStartSec: number;
+  tailDurationSec: number;
+  tailIntervalSec: number;
+  tailMinCutGapSec: number;
+  tailSceneThreshold: number;
+  tailMaxFrames: number;
+}
+
+/**
+ * Plans a two-pass scene-aware Visual Scene Keyframe extraction schedule so early scenes
+ * can never starve the final 10-14 seconds (climax / ending twist / title card).
+ */
+export function computeVisualKeyframePlan(
+  segDurSec: number,
+  maxFrames = 22,
+  prioritizeEndingTail = true
+): VisualKeyframePlan {
+  const safeDur = Math.max(4, Number(segDurSec) || 60);
+  const safeMax = Math.max(8, Math.min(36, Math.round(maxFrames || 22)));
+
+  if (!prioritizeEndingTail || safeDur <= 24) {
+    const targetFrames = safeDur <= 24 ? Math.min(safeMax, 14) : Math.min(safeMax, 16);
+    const interval = Number(Math.max(1.2, Math.min(4.8, safeDur / Math.max(4, targetFrames - 2))).toFixed(2));
+    return {
+      segDurSec: safeDur,
+      useTwoPassTail: false,
+      mainDurationSec: safeDur,
+      mainIntervalSec: interval,
+      mainMinCutGapSec: Number(Math.max(0.8, Math.min(2.0, interval * 0.45)).toFixed(2)),
+      mainSceneThreshold: 0.34,
+      mainMaxFrames: safeMax,
+      tailStartSec: safeDur,
+      tailDurationSec: 0,
+      tailIntervalSec: interval,
+      tailMinCutGapSec: 0.8,
+      tailSceneThreshold: 0.30,
+      tailMaxFrames: 0
+    };
+  }
+
+  const tailDurationSec = Number(Math.min(12, Math.max(8, safeDur * 0.16)).toFixed(2));
+  const tailStartSec = Number(Math.max(4, safeDur - tailDurationSec).toFixed(2));
+  const mainDurationSec = tailStartSec;
+
+  const tailMaxFrames = Math.min(8, Math.max(6, Math.round(safeMax * 0.32)));
+  const mainMaxFrames = Math.max(6, safeMax - tailMaxFrames);
+
+  const mainIntervalSec = Number(
+    Math.max(2.2, Math.min(5.2, mainDurationSec / Math.max(5, mainMaxFrames * 0.78))).toFixed(2)
+  );
+  const mainMinCutGapSec = Number(
+    Math.max(1.2, Math.min(2.4, mainIntervalSec * 0.5)).toFixed(2)
+  );
+
+  const tailIntervalSec = Number(
+    Math.max(1.2, Math.min(1.75, tailDurationSec / Math.max(5, tailMaxFrames * 0.8))).toFixed(2)
+  );
+
+  return {
+    segDurSec: safeDur,
+    useTwoPassTail: true,
+    mainDurationSec,
+    mainIntervalSec,
+    mainMinCutGapSec,
+    mainSceneThreshold: 0.36,
+    mainMaxFrames,
+    tailStartSec,
+    tailDurationSec,
+    tailIntervalSec,
+    tailMinCutGapSec: 0.9,
+    tailSceneThreshold: 0.30,
+    tailMaxFrames
+  };
+}
+
+/**
+ * Parses actual `pts_time` values printed by FFmpeg's `showinfo` filter so every extracted
+ * keyframe carries its true timestamp instead of a uniform synthetic grid estimate.
+ */
+export function parseFfmpegShowinfoPtsTimes(
+  stderr: string | undefined | null,
+  timeOffsetSec = 0
+): number[] {
+  if (!stderr || typeof stderr !== 'string') return [];
+  const offset = Number(timeOffsetSec) || 0;
+  const results: number[] = [];
+  const regex = /pts_time:\s*([0-9]+(?:\.[0-9]+)?)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(stderr)) !== null) {
+    const val = Number(match[1]);
+    if (Number.isFinite(val)) {
+      results.push(Number((offset + val).toFixed(2)));
+    }
+  }
+  return results;
+}
+
 
 

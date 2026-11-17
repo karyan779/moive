@@ -72,6 +72,8 @@ import {
   extractCustomDomainHostname,
   resolveCustomAuthDomainInfo,
   isGoogleRedirectUriAuthorizedHtml,
+  computeVisualKeyframePlan,
+  parseFfmpegShowinfoPtsTimes,
   type AdminApiKeyRecord,
   type AntiCopyrightEffects,
   type ApiProviderType,
@@ -2980,26 +2982,69 @@ async function startServer() {
     }
   });
 
-  // Streaming binary local fallback upload (supports 16MB chunked append so >32MB videos never hit Cloud Run's 32MB limit)
+  // Streaming binary local fallback upload (supports offset-idempotent 6MB chunks so retries NEVER duplicate MP4 bytes)
   app.post('/api/upload/local-direct', async (req, res) => {
     try {
       const existingId =
         typeof req.query.uploadId === 'string'
           ? req.query.uploadId.replace(/[^a-zA-Z0-9_-]/g, '')
           : '';
+      const hasOffsetParam = typeof req.query.offset === 'string' && req.query.offset.trim() !== '';
+      const requestedOffset = hasOffsetParam ? Math.floor(Number(req.query.offset)) : NaN;
       const isAppend = req.query.append === '1' && existingId.length > 0;
-      const localUploadId = isAppend
-        ? existingId
-        : `loc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const localUploadId =
+        existingId.length > 0 && (isAppend || (Number.isFinite(requestedOffset) && requestedOffset > 0))
+          ? existingId
+          : `loc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const destPath = path.join(JOBS_TEMP_DIR, `${localUploadId}_upload.mp4`);
-      const writeStream = fs.createWriteStream(destPath, { flags: isAppend ? 'a' : 'w' });
-      await pipeline(req, writeStream);
+
+      if (Number.isFinite(requestedOffset) && requestedOffset >= 0) {
+        const chunks: Buffer[] = [];
+        for await (const piece of req) {
+          chunks.push(Buffer.isBuffer(piece) ? piece : Buffer.from(piece));
+        }
+        const chunkBuf = Buffer.concat(chunks);
+        if (chunkBuf.length <= 0) {
+          return res.status(400).json({ ok: false, error: 'Empty upload chunk' });
+        }
+        if (requestedOffset === 0) {
+          fs.writeFileSync(destPath, chunkBuf);
+        } else {
+          if (!fs.existsSync(destPath)) {
+            return res.status(409).json({ ok: false, error: 'Upload session missing initial chunk' });
+          }
+          const currentSize = fs.statSync(destPath).size;
+          if (currentSize < requestedOffset) {
+            return res.status(409).json({ ok: false, error: 'Upload offset ahead of current file size' });
+          }
+          const fd = fs.openSync(destPath, 'r+');
+          try {
+            fs.ftruncateSync(fd, requestedOffset);
+            fs.writeSync(fd, chunkBuf, 0, chunkBuf.length, requestedOffset);
+          } finally {
+            fs.closeSync(fd);
+          }
+        }
+      } else {
+        const writeStream = fs.createWriteStream(destPath, { flags: isAppend ? 'a' : 'w' });
+        await pipeline(req, writeStream);
+      }
+
       const size = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
       if (size <= 0) {
         try {
           fs.unlinkSync(destPath);
         } catch {}
         return res.status(400).json({ ok: false, error: 'Empty upload stream' });
+      }
+      const expectedTotal = Number(req.query.totalBytes);
+      if (
+        Number.isFinite(expectedTotal) &&
+        expectedTotal > 0 &&
+        Number.isFinite(requestedOffset) &&
+        size > expectedTotal
+      ) {
+        return res.status(409).json({ ok: false, error: 'Uploaded file size mismatch' });
       }
       res.json({ ok: true, localUploadId, sizeBytes: size });
     } catch (err) {
@@ -4356,51 +4401,125 @@ async function startServer() {
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
           : '';
-        const timeWindows = computeAudioScriptWindows(safeDuration, 180);
+        const timeWindows = computeAudioScriptWindows(safeDuration, 75);
 
         const extractVisualKeyframesForSegment = async (
           srcVideoPath: string | null,
           segStartSec: number,
           segDurSec: number,
-          segTag: string
-        ): Promise<Array<{ relSec: number; timeBadge: string; base64: string }>> => {
+          segTag: string,
+          prioritizeEndingTail = true
+        ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
           if (!srcVideoPath || !fs.existsSync(srcVideoPath) || isTranslateMode) return [];
-          const stepSec = Math.max(5, Math.ceil(segDurSec / 22));
-          const maxFrames = Math.min(24, Math.max(4, Math.ceil(segDurSec / stepSec)));
-          const patternPrefix = `${jobId}_vkf_${segTag}_`;
-          const outPattern = path.join(JOBS_TEMP_DIR, `${patternPrefix}%02d.jpg`);
-          try {
-            await execFileAsync('ffmpeg', [
-              '-y',
-              '-ss',
-              String(Math.max(0, segStartSec)),
-              '-t',
-              String(Math.max(4, segDurSec)),
-              '-i',
-              srcVideoPath,
-              '-vf',
-              `fps=1/${stepSec},scale=320:-2`,
-              '-frames:v',
-              String(maxFrames),
-              '-q:v',
-              '6',
-              outPattern
-            ]);
-            const files = fs
+          const plan = computeVisualKeyframePlan(segDurSec, prioritizeEndingTail ? 22 : 16, prioritizeEndingTail);
+
+          const runKeyframePass = async (
+            passName: string,
+            relStartSec: number,
+            passDurSec: number,
+            intervalSec: number,
+            minCutGapSec: number,
+            sceneThreshold: number,
+            maxPassFrames: number
+          ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
+            const patternPrefix = `${jobId}_vkf_${segTag}_${passName}_`;
+            const outPattern = path.join(JOBS_TEMP_DIR, `${patternPrefix}%02d.jpg`);
+            const cleanPassLeftovers = () => {
+              try {
+                const leftovers = fs
+                  .readdirSync(JOBS_TEMP_DIR)
+                  .filter((f) => f.startsWith(patternPrefix));
+                for (const lf of leftovers) {
+                  try {
+                    fs.unlinkSync(path.join(JOBS_TEMP_DIR, lf));
+                  } catch {}
+                }
+              } catch {}
+            };
+
+            const absStart = Math.max(0, segStartSec + relStartSec);
+            const durArg = String(Math.max(2, Number((passDurSec + 0.35).toFixed(2))));
+            const selectExpr = `select='isnan(prev_selected_t)+gte(t-prev_selected_t,${intervalSec})+gt(scene,${sceneThreshold})*gte(t-prev_selected_t,${minCutGapSec})',scale=440:-2,showinfo`;
+
+            let stderrOut = '';
+            try {
+              const res = await execFileAsync('ffmpeg', [
+                '-y',
+                '-ss',
+                String(absStart),
+                '-t',
+                durArg,
+                '-i',
+                srcVideoPath,
+                '-vf',
+                selectExpr,
+                '-vsync',
+                'vfr',
+                '-frames:v',
+                String(maxPassFrames),
+                '-q:v',
+                '6',
+                outPattern
+              ]);
+              stderrOut = res.stderr || '';
+            } catch {
+              cleanPassLeftovers();
+            }
+
+            let files = fs
               .readdirSync(JOBS_TEMP_DIR)
               .filter((f) => f.startsWith(patternPrefix) && f.endsWith('.jpg'))
               .sort();
-            const frames: Array<{ relSec: number; timeBadge: string; base64: string }> = [];
+
+            if (files.length === 0) {
+              try {
+                const fallbackInterval = Math.max(1.4, intervalSec);
+                const res = await execFileAsync('ffmpeg', [
+                  '-y',
+                  '-ss',
+                  String(absStart),
+                  '-t',
+                  durArg,
+                  '-i',
+                  srcVideoPath,
+                  '-vf',
+                  `fps=1/${fallbackInterval},scale=440:-2,showinfo`,
+                  '-frames:v',
+                  String(maxPassFrames),
+                  '-q:v',
+                  '6',
+                  outPattern
+                ]);
+                stderrOut = res.stderr || '';
+                files = fs
+                  .readdirSync(JOBS_TEMP_DIR)
+                  .filter((f) => f.startsWith(patternPrefix) && f.endsWith('.jpg'))
+                  .sort();
+              } catch {
+                cleanPassLeftovers();
+                return [];
+              }
+            }
+
+            const ptsTimes = parseFfmpegShowinfoPtsTimes(stderrOut, relStartSec);
+            const passFrames: Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }> = [];
             for (let idx = 0; idx < files.length; idx++) {
               const fp = path.join(JOBS_TEMP_DIR, files[idx]);
               try {
                 const buf = fs.readFileSync(fp);
                 if (buf.length > 200) {
-                  const relSec = Math.min(Math.max(0, Math.round(segDurSec - 1)), idx * stepSec);
-                  const mm = String(Math.floor(relSec / 60)).padStart(2, '0');
-                  const ss = String(relSec % 60).padStart(2, '0');
-                  frames.push({
-                    relSec,
+                  const rawRelSec =
+                    idx < ptsTimes.length
+                      ? ptsTimes[idx]
+                      : Math.min(Math.max(0, segDurSec - 0.5), relStartSec + idx * intervalSec);
+                  const clampedRelSec = Math.max(0, Math.min(Math.max(0.1, segDurSec - 0.1), rawRelSec));
+                  const relMs = Math.round(clampedRelSec * 1000);
+                  const displaySec = Math.floor(clampedRelSec + 0.25);
+                  const mm = String(Math.floor(displaySec / 60)).padStart(2, '0');
+                  const ss = String(displaySec % 60).padStart(2, '0');
+                  passFrames.push({
+                    relSec: Math.round(clampedRelSec),
+                    relMs,
                     timeBadge: `${mm}:${ss}`,
                     base64: buf.toString('base64')
                   });
@@ -4410,20 +4529,41 @@ async function startServer() {
                 fs.unlinkSync(fp);
               } catch {}
             }
-            return frames;
-          } catch {
-            try {
-              const leftovers = fs
-                .readdirSync(JOBS_TEMP_DIR)
-                .filter((f) => f.startsWith(patternPrefix));
-              for (const lf of leftovers) {
-                try {
-                  fs.unlinkSync(path.join(JOBS_TEMP_DIR, lf));
-                } catch {}
-              }
-            } catch {}
-            return [];
+            return passFrames;
+          };
+
+          const mainFrames = await runKeyframePass(
+            'm',
+            0,
+            plan.mainDurationSec,
+            plan.mainIntervalSec,
+            plan.mainMinCutGapSec,
+            plan.mainSceneThreshold,
+            plan.mainMaxFrames
+          );
+
+          if (!plan.useTwoPassTail || plan.tailDurationSec <= 0 || plan.tailMaxFrames <= 0) {
+            return mainFrames;
           }
+
+          const tailFrames = await runKeyframePass(
+            't',
+            plan.tailStartSec,
+            plan.tailDurationSec,
+            plan.tailIntervalSec,
+            plan.tailMinCutGapSec,
+            plan.tailSceneThreshold,
+            plan.tailMaxFrames
+          );
+
+          const combined = [...mainFrames];
+          const lastMainMs = combined.length > 0 ? combined[combined.length - 1].relMs : -1000;
+          for (const tf of tailFrames) {
+            if (tf.relMs > lastMainMs + 350) {
+              combined.push(tf);
+            }
+          }
+          return combined;
         };
 
         const buildPromptForWindow = (
@@ -4449,7 +4589,7 @@ async function startServer() {
                 }`
               : '';
           const visualKeyframeNotice = hasVisualKeyframes
-            ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES ATTACHED: Timestamped video keyframes [Visual Scene Frame at MM:SS] are attached above! Whenever there is a non-dialogue / silent action stretch (such as [00:53 - 01:08] or [01:18 - 01:59]), LOOK directly at the visual keyframes at those exact timestamps and narrate what is visually happening on screen in synchronization with the character roles established in the audio/transcript!`
+            ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES ATTACHED: Timestamped scene frames [Visual Scene Frame at MM:SS (XXXXms)] and audio cover ONLY this exact segment. Narrate strictly what is ACTUALLY visible in the frames and heard in the audio at each matching timestamp—never jump ahead to later scenes, never repeat earlier hooks, and never invent unrelated filler!`
             : '';
 
           if (isTranslateMode) {
@@ -4622,19 +4762,26 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           winOffsetMs: number
         ): SubtitleCue[] => {
           if (!Array.isArray(parsedObj?.cues) || parsedObj.cues.length === 0) return [];
-          const maxReturnedEnd = Math.max(
-            ...parsedObj.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)
-          );
-          const unitMultiplier =
-            maxReturnedEnd > 0 && maxReturnedEnd <= winDurSec * 1.5 ? 1000 : 1;
+          const rawEnds = parsedObj.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0);
+          const rawStarts = parsedObj.cues.map((c: { start_ms?: number }) => Number(c.start_ms) || 0);
+          const maxReturnedEnd = Math.max(...rawEnds);
           const winDurMs = Math.round(winDurSec * 1000);
+          const winEndSec = winOffsetMs / 1000 + winDurSec;
+          const unitMultiplier =
+            maxReturnedEnd > 0 && maxReturnedEnd <= Math.max(winDurSec, winEndSec) * 1.5 && maxReturnedEnd <= 900
+              ? 1000
+              : 1;
+
+          const firstScaledStart = Math.round((rawStarts[0] || 0) * unitMultiplier);
+          const scaledMaxEnd = Math.round(maxReturnedEnd * unitMultiplier);
+          const looksGlobal =
+            winOffsetMs > 0 && firstScaledStart >= winOffsetMs - 2000 && scaledMaxEnd > winDurMs + 4000;
 
           const rawWinCues: SubtitleCue[] = parsedObj.cues
             .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
               let rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
               let rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
-              // If Gemini returned global timestamps instead of window-relative timestamps, rebase them
-              if (winOffsetMs > 0 && rawStart >= winOffsetMs - 1500) {
+              if (looksGlobal) {
                 rawStart = Math.max(0, rawStart - winOffsetMs);
                 rawEnd = Math.max(rawStart + 800, rawEnd - winOffsetMs);
               }
@@ -4650,7 +4797,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             .filter((c: SubtitleCue) => c.text.length > 0);
 
           if (rawWinCues.length === 0) return [];
-          const splitWin = splitCuesIntoShortPhrases(rawWinCues, isTranslateMode ? 54 : 64);
+          const splitWin = splitCuesIntoShortPhrases(rawWinCues, isTranslateMode ? 54 : 74);
           const normWin = isTranslateMode
             ? normalizeDialogueSubtitleCues(splitWin, winDurSec)
             : normalizeRecapTimelineCues(splitWin, winDurSec);
@@ -4707,7 +4854,8 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                 inputVideoPath,
                 win.startSec,
                 win.durationSec,
-                `w${win.index}`
+                `w${win.index}`,
+                win.index === timeWindows.length - 1
               );
 
               let winTranscript = sliceTimedTranscriptForWindow(
@@ -4725,6 +4873,15 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                   }
                 } catch {}
               }
+              if (
+                inputVideoPath &&
+                !winAudioBase64 &&
+                !extractedAudioBase64 &&
+                !winTranscript &&
+                winKeyframes.length === 0
+              ) {
+                throw new Error('CORRUPT_UPLOADED_VIDEO: Uploaded video could not be decoded for audio or frames');
+              }
 
               const winPrompt = buildPromptForWindow(
                 win.durationSec,
@@ -4739,7 +4896,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
               const winParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
               for (const kf of winKeyframes) {
                 winParts.push({
-                  text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relSec * 1000}ms)]`
+                  text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relMs}ms)]`
                 });
                 winParts.push({
                   inlineData: {
@@ -4818,8 +4975,17 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             inputVideoPath,
             0,
             safeDuration,
-            'full'
+            'full',
+            true
           );
+          if (
+            inputVideoPath &&
+            !extractedAudioBase64 &&
+            !effectiveContext &&
+            singlePassKeyframes.length === 0
+          ) {
+            throw new Error('CORRUPT_UPLOADED_VIDEO: Uploaded video could not be decoded for audio or frames');
+          }
           const singlePassPrompt = buildPromptForWindow(
             safeDuration,
             effectiveContext,
@@ -4835,7 +5001,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           > = [];
           for (const kf of singlePassKeyframes) {
             contentsParts.push({
-              text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relSec * 1000}ms)]`
+              text: `[Visual Scene Frame at ${kf.timeBadge} (${kf.relMs}ms)]`
             });
             contentsParts.push({
               inlineData: {
@@ -4902,6 +5068,15 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         hasUploadedSource
       })
     ) {
+      if (geminiFailureReason.includes('CORRUPT_UPLOADED_VIDEO')) {
+        return {
+          ok: false,
+          statusCode: 422,
+          error: 'ဗီဒီယိုဖိုင် Upload မပြည့်စုံ (သို့) ဖိုင်ပျက်စီးနေပါသဖြင့် ဗီဒီယိုကို ပြန်ရွေးပြီး ထပ်မံ Upload တင်ပေးပါ။',
+          errorEn: 'Uploaded video file was incomplete or unreadable (corrupted container). Please re-upload your video.',
+          errorCode: 'corrupt_video'
+        };
+      }
       const errMeta = detectGeminiFailureMessage(
         geminiFailureReason,
         hasAnyGeminiKey,
@@ -5010,7 +5185,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
 
     finalCues = isTranslateMode
       ? normalizeDialogueSubtitleCues(splitCuesIntoShortPhrases(finalCues, 54), safeDuration)
-      : splitCuesIntoShortPhrases(finalCues, 64);
+      : splitCuesIntoShortPhrases(finalCues, 74);
     finalCues = finalCues.map((c) => ({ ...c, burmeseText: c.burmeseText || c.text }));
     finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
 

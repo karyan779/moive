@@ -1108,3 +1108,64 @@ test('findDisplayCueAtTime holds previous cue during mid-video breath pauses (e.
   assert.equal(heldAt70s?.id, 'cue-24');
   assert.notEqual(heldAt70s?.id, 'cue-1');
 });
+
+import {
+  computeVisualKeyframePlan,
+  parseFfmpegShowinfoPtsTimes
+} from './recapEngine.ts';
+
+test('computeVisualKeyframePlan, parseFfmpegShowinfoPtsTimes, and alignCuesWithAudioSync lock final-14s climax scenes', () => {
+  // 1) Short clip (<= 24s) or non-final window uses lightweight single pass
+  const shortPlan = computeVisualKeyframePlan(18, 22, true);
+  assert.equal(shortPlan.useTwoPassTail, false);
+  assert.ok(shortPlan.mainIntervalSec <= 2.6);
+
+  const win1Plan = computeVisualKeyframePlan(59.36, 16, false);
+  assert.equal(win1Plan.useTwoPassTail, false);
+  assert.equal(win1Plan.mainMaxFrames, 16);
+
+  // 2) Final 59.36s window (e.g. 0:59..1:58.72 of 118.72s clip) reserves dense ending tail inside <=22 frames
+  const planFinal = computeVisualKeyframePlan(59.36, 22, true);
+  assert.equal(planFinal.useTwoPassTail, true);
+  assert.ok(planFinal.tailDurationSec >= 8 && planFinal.tailDurationSec <= 12);
+  assert.ok(planFinal.tailStartSec >= 47 && planFinal.tailStartSec <= 52);
+  assert.ok(planFinal.tailMaxFrames >= 6 && planFinal.tailMaxFrames <= 8);
+  assert.ok(planFinal.tailIntervalSec <= 1.75);
+  assert.ok(planFinal.mainMaxFrames + planFinal.tailMaxFrames <= 22);
+
+  // 3) parseFfmpegShowinfoPtsTimes parses FFmpeg showinfo stderr accurately with pass offset
+  const sampleStderr = [
+    '[Parsed_showinfo_2 @ 0x1] n:   0 pts:      0 pts_time:0       pos: 100',
+    '[Parsed_showinfo_2 @ 0x1] n:   1 pts: 117000 pts_time:1.3     pos: 200',
+    '[Parsed_showinfo_2 @ 0x1] n:   2 pts: 711000 pts_time:7.9     pos: 300',
+    '[Parsed_showinfo_2 @ 0x1] n:   3 pts:1182000 pts_time:13.1333 pos: 400'
+  ].join('\n');
+  const parsedPts = parseFfmpegShowinfoPtsTimes(sampleStderr, 104.72);
+  assert.deepEqual(parsedPts, [104.72, 106.02, 112.62, 117.85]);
+
+  // 4) Late-video drift catch-up: if mid-video TTS phrases ran 3s longer than slots, final climax recovers inside 118.72s
+  const totalMs = 118_720;
+  const cues119 = Array.from({ length: 40 }, (_, i) => {
+    const s = Math.round((i / 40) * 114_000) + 100;
+    return {
+      id: `k-${i + 1}`,
+      start_ms: s,
+      end_ms: s + 2400,
+      text: `ဇာတ်ဝင်ခန်း ${i + 1} စာသား`
+    };
+  });
+  const spokenMs = cues119.map((_, i) => (i >= 18 && i <= 26 ? 3350 : 2550));
+  const synced = alignCuesWithAudioSync(cues119, spokenMs, 100, true, totalMs, 220);
+  assert.equal(synced.length, 40);
+  assert.ok(
+    synced[synced.length - 1].cue.end_ms <= totalMs + 120,
+    `Expected final cue to fit video ending, got ${synced[synced.length - 1].cue.end_ms}ms`
+  );
+  // Confirm climax cue (~111s) is not stranded many seconds late
+  const climaxCue = synced[38].cue;
+  assert.ok(
+    Math.abs(climaxCue.start_ms - cues119[38].start_ms) <= 2200,
+    `Expected climax cue start ${climaxCue.start_ms}ms within 2.2s of scene ${cues119[38].start_ms}ms`
+  );
+});
+

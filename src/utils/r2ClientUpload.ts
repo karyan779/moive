@@ -150,7 +150,7 @@ async function uploadToLocalDirectStream(
   const totalBytes = file.size;
   if (totalBytes <= LOCAL_STREAM_CHUNK_BYTES) {
     const resp = await xhrUploadBinary(
-      `/api/upload/local-direct?filename=${encodeURIComponent(file.name)}`,
+      `/api/upload/local-direct?filename=${encodeURIComponent(file.name)}&offset=0&totalBytes=${totalBytes}`,
       'POST',
       file,
       { 'Content-Type': 'application/octet-stream' },
@@ -175,7 +175,7 @@ async function uploadToLocalDirectStream(
     };
   }
 
-  // Multi-chunk streaming upload for larger videos
+  // Idempotent offset-based multi-chunk streaming upload for larger videos
   let localUploadId = '';
   let offset = 0;
   let chunkIndex = 0;
@@ -184,36 +184,53 @@ async function uploadToLocalDirectStream(
   while (offset < totalBytes) {
     const end = Math.min(totalBytes, offset + LOCAL_STREAM_CHUNK_BYTES);
     const slice = file.slice(offset, end);
-    const query =
-      chunkIndex === 0
-        ? `filename=${encodeURIComponent(file.name)}`
-        : `uploadId=${encodeURIComponent(localUploadId)}&append=1&filename=${encodeURIComponent(file.name)}`;
-
     const currentOffset = offset;
-    const resp = await xhrUploadBinary(
-      `/api/upload/local-direct?${query}`,
-      'POST',
-      slice,
-      { 'Content-Type': 'application/octet-stream' },
-      (loaded) => {
-        if (onProgress && totalBytes > 0) {
-          const sent = currentOffset + loaded;
-          const pct = Math.min(100, Math.round((sent / totalBytes) * 100));
-          onProgress(
-            pct,
-            `Uploading video (${chunkIndex + 1}/${totalChunks}) · ${pct}% (${formatUploadMbProgress(sent, totalBytes)})…`
-          );
+    let chunkDone = false;
+    let lastChunkErr: Error | null = null;
+
+    for (let attempt = 0; attempt < 3 && !chunkDone; attempt++) {
+      const query =
+        chunkIndex === 0
+          ? `filename=${encodeURIComponent(file.name)}&offset=0&totalBytes=${totalBytes}`
+          : `uploadId=${encodeURIComponent(localUploadId)}&append=1&offset=${currentOffset}&totalBytes=${totalBytes}&chunkIndex=${chunkIndex}&filename=${encodeURIComponent(file.name)}`;
+      try {
+        const resp = await xhrUploadBinary(
+          `/api/upload/local-direct?${query}`,
+          'POST',
+          slice,
+          { 'Content-Type': 'application/octet-stream' },
+          (loaded) => {
+            if (onProgress && totalBytes > 0) {
+              const sent = currentOffset + loaded;
+              const pct = Math.min(100, Math.round((sent / totalBytes) * 100));
+              onProgress(
+                pct,
+                `Uploading video (${chunkIndex + 1}/${totalChunks}) · ${pct}% (${formatUploadMbProgress(sent, totalBytes)})…`
+              );
+            }
+          }
+        );
+        const parsed = parseJsonTextSafe<{ ok?: boolean; localUploadId?: string; error?: string }>(
+          resp.responseText,
+          {}
+        );
+        if (!parsed.ok || !parsed.localUploadId) {
+          throw new Error(parsed.error || `Chunk ${chunkIndex + 1} upload failed`);
+        }
+        localUploadId = parsed.localUploadId;
+        chunkDone = true;
+      } catch (chunkErr) {
+        lastChunkErr = chunkErr instanceof Error ? chunkErr : new Error('Chunk upload failed');
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
         }
       }
-    );
-    const parsed = parseJsonTextSafe<{ ok?: boolean; localUploadId?: string; error?: string }>(
-      resp.responseText,
-      {}
-    );
-    if (!parsed.ok || !parsed.localUploadId) {
-      throw new Error(parsed.error || `Chunk ${chunkIndex + 1} upload failed`);
     }
-    localUploadId = parsed.localUploadId;
+
+    if (!chunkDone) {
+      throw lastChunkErr || new Error(`Chunk ${chunkIndex + 1} upload failed`);
+    }
+
     offset = end;
     chunkIndex++;
   }
