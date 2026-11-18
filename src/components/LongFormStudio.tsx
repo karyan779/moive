@@ -58,7 +58,8 @@ const OUTPUT_MODES: {
 ];
 
 const VISION_MODELS = [
-  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Recommended)', provider: 'Google AI' },
+  { id: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Recommended)', provider: 'Google AI' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Backup)', provider: 'Google AI' },
   { id: 'gemma4-26b', label: 'Gemma 4 26B Vision', provider: 'OpenRouter' },
   { id: 'llama-3.2-vision', label: 'Llama 3.2 90B Vision', provider: 'Groq Cloud' },
   { id: 'llava-1.5-7b', label: 'LLaVA 1.5 7B Fast', provider: 'Edge Vision AI' }

@@ -11,7 +11,7 @@ import { createRequire } from 'module';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type, Modality } from '@google/genai';
+import { GoogleGenAI, Type, Modality, ThinkingLevel } from '@google/genai';
 import {
   S3Client,
   PutObjectCommand,
@@ -66,6 +66,8 @@ import {
   detectGeminiFailureMessage,
   isTransientModelOverloadError,
   resolveFallbackScriptModels,
+  computeGeminiBackoffDelayMs,
+  compactMultimodalPartsForOverloadRetry,
   shouldSkipWorkersAiForPayloadSize,
   sanitizeMp4DownloadName,
   resolveEffectiveVideoDurationSec,
@@ -110,6 +112,14 @@ import {
   type R2KeyPrefix,
   type R2StoredConfig
 } from './src/utils/r2Direct.ts';
+import {
+  extractLocalFallbackTitles,
+  stripPartSuffixFromTitle,
+  buildThumbnailImagePromptTemplate,
+  buildCleanPosterArtworkPrompt,
+  normalizeDirectorAnalysisResult,
+  type ThumbnailDirectorAnalysis
+} from './src/utils/thumbnailStudio.ts';
 
 const require = createRequire(import.meta.url);
 const WebSocketClient = require('ws');
@@ -642,28 +652,43 @@ async function synthesizeGeminiProVoiceWavBuffer(
     if (!cleanText) return null;
 
     let ttsResponse: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
-    for (let ttsAttempt = 0; ttsAttempt < 2; ttsAttempt++) {
-      try {
-        ttsResponse = await ai.models.generateContent({
-          model: 'gemini-2.5-flash-preview-tts',
-          contents: [{ parts: [{ text: cleanText }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: geminiVoiceName }
+    const ttsCandidates = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts', 'gemini-2.5-flash-preview-tts'];
+    for (const ttsModel of ttsCandidates) {
+      let modelNotFound = false;
+      for (let ttsAttempt = 0; ttsAttempt < 2; ttsAttempt++) {
+        try {
+          ttsResponse = await ai.models.generateContent({
+            model: ttsModel,
+            contents: [{ parts: [{ text: cleanText }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: geminiVoiceName }
+                }
               }
             }
+          });
+          break;
+        } catch (ttsErr) {
+          const msg = ttsErr instanceof Error ? ttsErr.message : String(ttsErr || '');
+          if (msg.includes('404') || msg.toLowerCase().includes('not found')) {
+            modelNotFound = true;
+            break;
           }
-        });
-        break;
-      } catch (ttsErr) {
-        if (ttsAttempt === 0 && isTransientModelOverloadError(ttsErr)) {
-          await new Promise((r) => setTimeout(r, 800));
-          continue;
+          if (ttsAttempt === 0 && isTransientModelOverloadError(ttsErr)) {
+            await new Promise((r) => setTimeout(r, 1100));
+            continue;
+          }
+          if (isTransientModelOverloadError(ttsErr)) {
+            modelNotFound = true;
+            break;
+          }
+          throw ttsErr;
         }
-        throw ttsErr;
       }
+      if (ttsResponse) break;
+      if (!modelNotFound) break;
     }
     if (!ttsResponse) return null;
 
@@ -2468,6 +2493,7 @@ async function executeWithGeminiKeyPool<T>(
 
   const maxAttempts = Math.min(Math.max(1, enabledCount), 12);
   const triedIds = new Set<string>();
+  let lastTransientErr: unknown = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const state = loadApiKeyPoolState();
@@ -2534,8 +2560,18 @@ async function executeWithGeminiKeyPool<T>(
         continue;
       }
       saveApiKeyPoolState(latest);
+      if (isTransientModelOverloadError(err) && attempt + 1 < maxAttempts) {
+        lastTransientErr = err;
+        console.warn(
+          `[Gemini Key Pool] ${selected.label} hit transient 503/overload; trying next healthy pool key without resting...`
+        );
+        continue;
+      }
       throw err;
     }
+  }
+  if (lastTransientErr) {
+    throw lastTransientErr;
   }
   return null;
 }
@@ -3499,7 +3535,7 @@ async function startServer() {
           const numberedInput = withBurmeseSaved
             .map((c, idx) => `${idx + 1}. ${String(c.burmeseText || c.text || '').replace(/\r?\n/g, ' ').trim()}`)
             .join('\n');
-          const subModels = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+          const subModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
           for (const subModel of subModels) {
             try {
               const resp = await ai.models.generateContent({
@@ -3522,7 +3558,13 @@ async function startServer() {
               if (resp.text) return JSON.parse(resp.text);
             } catch (subErr: any) {
               const msg = String(subErr?.message || subErr || '');
-              if (msg.includes('404') || msg.toLowerCase().includes('not found')) continue;
+              if (
+                msg.includes('404') ||
+                msg.toLowerCase().includes('not found') ||
+                isTransientModelOverloadError(subErr)
+              ) {
+                continue;
+              }
               throw subErr;
             }
           }
@@ -3922,8 +3964,8 @@ async function startServer() {
       freeDailyLimit: 3,
       workersAiConfigured: Boolean(loadCloudflareWorkersAiConfig()),
       models: {
-        script: 'gemini-3-flash-preview',
-        tts: 'gemini-2.5-flash-preview-tts',
+        script: 'gemini-4-hydrogen',
+        tts: 'gemini-3.8-flash-lite-tts',
         stt: 'whisper-large-v3-turbo'
       }
     });
@@ -3937,7 +3979,7 @@ async function startServer() {
         provider,
         userGeminiApiKey,
         userGroqApiKey,
-        scriptModel = 'gemini-3-flash-preview'
+        scriptModel = 'gemini-4-hydrogen'
       } = (req.body || {}) as {
         provider?: 'gemini' | 'groq';
         userGeminiApiKey?: string;
@@ -3961,10 +4003,33 @@ async function startServer() {
               apiKey: cleanGem,
               httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
             });
-            await userAi.models.generateContent({
-              model: scriptModel,
-              contents: 'Reply with OK.'
-            });
+            const candidates = resolveFallbackScriptModels(scriptModel);
+            let testErr: unknown = null;
+            let connected = false;
+            for (const candidateModel of candidates) {
+              try {
+                await userAi.models.generateContent({
+                  model: candidateModel,
+                  contents: 'Reply with OK.'
+                });
+                connected = true;
+                break;
+              } catch (err: any) {
+                testErr = err;
+                const msg = String(err?.message || err || '');
+                if (
+                  msg.includes('404') ||
+                  msg.toLowerCase().includes('not found') ||
+                  isTransientModelOverloadError(err)
+                ) {
+                  continue;
+                }
+                throw err;
+              }
+            }
+            if (!connected && testErr) {
+              throw testErr;
+            }
             geminiOk = true;
           } catch (err: any) {
             geminiOk = false;
@@ -4089,7 +4154,7 @@ async function startServer() {
       pitchShift = false,
       mirrorFlip = false,
       effects,
-      scriptModel = 'gemini-3-flash-preview',
+      scriptModel = 'gemini-4-hydrogen',
       ttsEngine = 'edge-neural',
       sttModel = 'whisper-large-v3-turbo',
       breathPauseMs = 100,
@@ -4645,102 +4710,165 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           partsPayload: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
         ) => {
           const candidateModels = resolveFallbackScriptModels(
-            scriptModel || 'gemini-3-flash-preview'
+            scriptModel || 'gemini-4-hydrogen'
           );
+          const hasTranscriptContext = Boolean(effectiveContext && effectiveContext.trim().length >= 30);
           let lastScriptErr: unknown = null;
 
-          for (let modelIdx = 0; modelIdx < candidateModels.length; modelIdx++) {
-            const targetModel = candidateModels[modelIdx];
-            const maxAttemptsForModel = modelIdx === 0 ? 2 : 1;
+          const waves: Array<{
+            waveIdx: number;
+            models: ScriptAiModelId[];
+            payload: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>;
+            primaryRetries: number;
+          }> = [
+            {
+              waveIdx: 0,
+              models: candidateModels,
+              payload: partsPayload,
+              primaryRetries: 2
+            },
+            {
+              waveIdx: 1,
+              models: resolveFallbackScriptModels('gemini-4-hydrogen'),
+              payload: compactMultimodalPartsForOverloadRetry(partsPayload, {
+                maxFrames: 8,
+                dropLargeAudioWhenTranscriptPresent: true,
+                hasTranscript: hasTranscriptContext
+              }),
+              primaryRetries: 1
+            },
+            {
+              waveIdx: 2,
+              models: ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+              payload: compactMultimodalPartsForOverloadRetry(partsPayload, {
+                maxFrames: 4,
+                dropLargeAudioWhenTranscriptPresent: true,
+                hasTranscript: hasTranscriptContext
+              }),
+              primaryRetries: 1
+            }
+          ];
 
-            for (let attemptIdx = 0; attemptIdx < maxAttemptsForModel; attemptIdx++) {
-              let reqTimer: ReturnType<typeof setTimeout> | null = null;
-              try {
-                if (modelIdx > 0 || attemptIdx > 0) {
-                  onProgress(
-                    60,
-                    modelIdx > 0
-                      ? `Switching to backup AI model (${targetModel})...`
-                      : 'Retrying AI script generation...'
-                  );
-                }
+          for (const wave of waves) {
+            if (wave.waveIdx > 0) {
+              const backoffMs = computeGeminiBackoffDelayMs(wave.waveIdx);
+              onProgress(
+                60,
+                wave.waveIdx === 1
+                  ? 'Gemini AI busy (503) — optimizing payload & retrying with backup model...'
+                  : 'High demand on Gemini AI — final smart retry in progress...'
+              );
+              await new Promise((r) => setTimeout(r, backoffMs));
+            }
 
-                return await Promise.race([
-                  ai.models.generateContent({
-                    model: targetModel,
-                    contents: { parts: partsPayload },
-                    config: {
-                      systemInstruction,
-                      responseMimeType: 'application/json',
-                      responseSchema: {
-                        type: Type.OBJECT,
-                        properties: {
-                          title: { type: Type.STRING },
-                          scriptText: { type: Type.STRING },
-                          cues: {
-                            type: Type.ARRAY,
-                            items: {
-                              type: Type.OBJECT,
-                              properties: {
-                                start_ms: { type: Type.INTEGER },
-                                end_ms: { type: Type.INTEGER },
-                                text: { type: Type.STRING }
-                              },
-                              required: ['start_ms', 'end_ms', 'text']
+            let waveHitOnlyTransientOrMissing = false;
+
+            for (let modelIdx = 0; modelIdx < wave.models.length; modelIdx++) {
+              const targetModel = wave.models[modelIdx];
+              const maxAttemptsForModel = modelIdx === 0 ? wave.primaryRetries : 1;
+              const supportsThinkingLevel =
+                targetModel === 'gemini-4-hydrogen' ||
+                targetModel === 'gemini-4-argon' ||
+                targetModel === 'gemini-3.1-flash-lite';
+
+              for (let attemptIdx = 0; attemptIdx < maxAttemptsForModel; attemptIdx++) {
+                let reqTimer: ReturnType<typeof setTimeout> | null = null;
+                try {
+                  if (wave.waveIdx === 0 && (modelIdx > 0 || attemptIdx > 0)) {
+                    onProgress(
+                      60,
+                      modelIdx > 0
+                        ? `Switching to backup AI model (${targetModel})...`
+                        : 'Retrying AI script generation...'
+                    );
+                  }
+
+                  return await Promise.race([
+                    ai.models.generateContent({
+                      model: targetModel,
+                      contents: { parts: wave.payload },
+                      config: {
+                        systemInstruction,
+                        ...(supportsThinkingLevel
+                          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                          : {}),
+                        responseMimeType: 'application/json',
+                        responseSchema: {
+                          type: Type.OBJECT,
+                          properties: {
+                            title: { type: Type.STRING },
+                            scriptText: { type: Type.STRING },
+                            cues: {
+                              type: Type.ARRAY,
+                              items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                  start_ms: { type: Type.INTEGER },
+                                  end_ms: { type: Type.INTEGER },
+                                  text: { type: Type.STRING }
+                                },
+                                required: ['start_ms', 'end_ms', 'text']
+                              }
+                            },
+                            highlight_clips: {
+                              type: Type.ARRAY,
+                              items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                  start_ms: { type: Type.INTEGER },
+                                  end_ms: { type: Type.INTEGER },
+                                  label: { type: Type.STRING }
+                                },
+                                required: ['start_ms', 'end_ms']
+                              }
                             }
                           },
-                          highlight_clips: {
-                            type: Type.ARRAY,
-                            items: {
-                              type: Type.OBJECT,
-                              properties: {
-                                start_ms: { type: Type.INTEGER },
-                                end_ms: { type: Type.INTEGER },
-                                label: { type: Type.STRING }
-                              },
-                              required: ['start_ms', 'end_ms']
-                            }
-                          }
-                        },
-                        required: ['title', 'scriptText', 'cues']
+                          required: ['title', 'scriptText', 'cues']
+                        }
                       }
-                    }
-                  }),
-                  new Promise<never>((_, reject) => {
-                    reqTimer = setTimeout(
-                      () => reject(new Error(`Gemini script request (${targetModel}) timed out after 55s`)),
-                      55000
-                    );
-                  })
-                ]);
-              } catch (err) {
-                lastScriptErr = err;
-                const keyErrInfo = isApiKeyQuotaOrLimitError(err);
-                if (keyErrInfo.shouldRotate) {
-                  throw err;
-                }
-                const errText = err instanceof Error ? err.message : String(err || '');
-                const isModelNotFound =
-                  errText.includes('404') || errText.toLowerCase().includes('not found');
-                if (isModelNotFound) {
-                  console.warn(`[Gemini Script] Model ${targetModel} unavailable (404); trying next fallback model.`);
-                  break;
-                }
-                if (isTransientModelOverloadError(err)) {
-                  console.warn(
-                    `[Gemini Script] Model ${targetModel} hit transient 503/overload (attempt ${attemptIdx + 1}/${maxAttemptsForModel}).`
-                  );
-                  if (attemptIdx + 1 < maxAttemptsForModel) {
-                    const jitterMs = 900 + Math.floor(Math.random() * 500);
-                    await new Promise((r) => setTimeout(r, jitterMs));
-                    continue;
+                    }),
+                    new Promise<never>((_, reject) => {
+                      reqTimer = setTimeout(
+                        () => reject(new Error(`Gemini script request (${targetModel}) timed out after 55s`)),
+                        55000
+                      );
+                    })
+                  ]);
+                } catch (err) {
+                  lastScriptErr = err;
+                  const keyErrInfo = isApiKeyQuotaOrLimitError(err);
+                  if (keyErrInfo.shouldRotate) {
+                    throw err;
                   }
-                  break;
+                  const errText = err instanceof Error ? err.message : String(err || '');
+                  const isModelNotFound =
+                    errText.includes('404') || errText.toLowerCase().includes('not found');
+                  if (isModelNotFound) {
+                    waveHitOnlyTransientOrMissing = true;
+                    console.warn(`[Gemini Script] Model ${targetModel} unavailable (404); trying next fallback model.`);
+                    break;
+                  }
+                  if (isTransientModelOverloadError(err)) {
+                    waveHitOnlyTransientOrMissing = true;
+                    console.warn(
+                      `[Gemini Script] Wave ${wave.waveIdx} model ${targetModel} hit transient 503/overload (attempt ${attemptIdx + 1}/${maxAttemptsForModel}).`
+                    );
+                    if (attemptIdx + 1 < maxAttemptsForModel) {
+                      const jitterMs = computeGeminiBackoffDelayMs(0);
+                      await new Promise((r) => setTimeout(r, jitterMs));
+                      continue;
+                    }
+                    break;
+                  }
+                  throw err;
+                } finally {
+                  if (reqTimer) clearTimeout(reqTimer);
                 }
-                throw err;
-              } finally {
-                if (reqTimer) clearTimeout(reqTimer);
               }
+            }
+
+            if (!waveHitOnlyTransientOrMissing) {
+              break;
             }
           }
 
@@ -5054,6 +5182,150 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         geminiFailureReason = err?.message ? String(err.message) : String(err || 'Gemini error');
         console.warn('Gemini script generation fell back:', geminiFailureReason);
       }
+
+      // 2b. Real secondary AI rescue (Groq Llama / Cloudflare Workers AI) ONLY if Gemini returned global 503 overload AND real Whisper transcript exists
+      const transcriptContextForRescue = (effectiveTranscriptText || groqTranscript || '').trim();
+      if (
+        !usedLiveGemini &&
+        isTransientModelOverloadError(geminiFailureReason) &&
+        transcriptContextForRescue.length >= 30
+      ) {
+        try {
+          onProgress(63, 'Gemini servers busy (503) — generating synced script via backup AI engine...');
+          const rescueLangLabel =
+            targetLanguage === 'my'
+              ? 'Burmese (မြန်မာဘာသာ စကားပြောဟန်)'
+              : targetLanguage === 'th'
+                ? 'Thai'
+                : targetLanguage === 'ja'
+                  ? 'Japanese'
+                  : targetLanguage === 'ko'
+                    ? 'Korean'
+                    : targetLanguage === 'zh'
+                      ? 'Chinese'
+                      : 'English';
+          const rescueUserPrompt = `Video Duration: ${safeDuration}s (${Math.round(safeDuration * 1000)}ms).
+Target Language: ${rescueLangLabel}.
+Mode: ${isTranslateMode ? 'Dialogue Translation' : `Movie Recap (${styleDef.labelEn}) - STRICT 3rd-person movie storytelling`}.
+Timestamped Source Speech Transcript:
+${transcriptContextForRescue}
+
+Return ONLY valid JSON matching:
+{"title":"Short title","scriptText":"Full script","cues":[{"start_ms":80,"end_ms":2800,"text":"..."}]}
+Generate concise, natural, strictly increasing millisecond cues covering 0ms to ${Math.round(safeDuration * 1000)}ms based ONLY on the real transcript above.`;
+
+          let rescueRawJsonText = '';
+          const tryGroqChatWithKey = async (apiKey: string): Promise<string> => {
+            const gResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                response_format: { type: 'json_object' },
+                temperature: 0.35,
+                messages: [
+                  { role: 'system', content: systemInstruction },
+                  { role: 'user', content: rescueUserPrompt }
+                ]
+              }),
+              signal: AbortSignal.timeout(30000)
+            });
+            if (!gResp.ok) {
+              throw new Error(`Groq rescue ${gResp.status}`);
+            }
+            const gData = (await gResp.json()) as {
+              choices?: Array<{ message?: { content?: string } }>;
+            };
+            return String(gData?.choices?.[0]?.message?.content || '').trim();
+          };
+
+          if (freeGroqKey) {
+            try {
+              rescueRawJsonText = await tryGroqChatWithKey(freeGroqKey);
+            } catch {}
+          } else if (!isFreeMode) {
+            try {
+              const groqRes = await executeWithGroqKeyPool((k) => tryGroqChatWithKey(k));
+              if (groqRes?.result) rescueRawJsonText = groqRes.result;
+            } catch {}
+            if (!rescueRawJsonText) {
+              const cfCfg = loadCloudflareWorkersAiConfig();
+              if (cfCfg) {
+                try {
+                  const cfResp = await fetch(
+                    buildWorkersAiRunUrl(cfCfg.accountId, '@cf/meta/llama-3.3-70b-instruct-fp8-fast'),
+                    {
+                      method: 'POST',
+                      headers: {
+                        Authorization: `Bearer ${cfCfg.apiToken}`,
+                        'Content-Type': 'application/json'
+                      },
+                      body: JSON.stringify({
+                        messages: [
+                          { role: 'system', content: systemInstruction },
+                          { role: 'user', content: rescueUserPrompt }
+                        ],
+                        max_tokens: 2600
+                      }),
+                      signal: AbortSignal.timeout(30000)
+                    }
+                  );
+                  if (cfResp.ok) {
+                    const cfJson = (await cfResp.json()) as {
+                      result?: { response?: string };
+                    };
+                    const rawOut = String(cfJson?.result?.response || '').trim();
+                    const jsonStart = rawOut.indexOf('{');
+                    const jsonEnd = rawOut.lastIndexOf('}');
+                    if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                      rescueRawJsonText = rawOut.slice(jsonStart, jsonEnd + 1);
+                    }
+                  }
+                } catch {}
+              }
+            }
+          }
+
+          if (rescueRawJsonText) {
+            const parsedRescue = JSON.parse(rescueRawJsonText);
+            if (Array.isArray(parsedRescue?.cues) && parsedRescue.cues.length >= 2) {
+              const unitMult =
+                Math.max(...parsedRescue.cues.map((c: { end_ms?: number }) => Number(c.end_ms) || 0)) <=
+                safeDuration * 1.5
+                  ? 1000
+                  : 1;
+              const rawCues: SubtitleCue[] = parsedRescue.cues
+                .map((c: { start_ms?: number; end_ms?: number; text?: string }, idx: number) => {
+                  const s = Math.max(0, Math.round((Number(c.start_ms) || idx * 2500) * unitMult));
+                  const e = Math.max(s + 600, Math.round((Number(c.end_ms) || s + 2400) * unitMult));
+                  return {
+                    id: `cue-${idx + 1}`,
+                    start_ms: Math.min(Math.round(safeDuration * 1000) - 400, s),
+                    end_ms: Math.min(Math.round(safeDuration * 1000), e),
+                    text: String(c.text || '').trim()
+                  };
+                })
+                .filter((c: SubtitleCue) => c.text.length > 0);
+              if (rawCues.length >= 2) {
+                const splitRescue = splitCuesIntoShortPhrases(rawCues, isTranslateMode ? 54 : 74);
+                const normRescue = isTranslateMode
+                  ? normalizeDialogueSubtitleCues(splitRescue, safeDuration)
+                  : normalizeRecapTimelineCues(splitRescue, safeDuration);
+                finalCues = normRescue.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
+                finalScriptText = finalCues.map((c) => c.text).join(' ');
+                if (parsedRescue.title) finalTitle = String(parsedRescue.title);
+                usedLiveGemini = true;
+                geminiFailureReason = '';
+              }
+            }
+          }
+        } catch (rescueErr) {
+          console.warn('[503 Rescue LLM] Backup script attempt failed:', rescueErr);
+        }
+      }
     }
 
     // For Verbatim Original Speech STT mode, timed Whisper segments can satisfy cues directly if Gemini failed
@@ -5128,7 +5400,10 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       onProgress(74, 'Synthesizing AI voiceover...');
       const useGeminiPrimary =
         !isFreeMode &&
-        (ttsEngine === 'gemini-2.5-flash-preview-tts' || voiceDef.tier === 'pro');
+        (ttsEngine === 'gemini-3.8-flash-lite-tts' ||
+          ttsEngine === 'gemini-3.8-flash-tts' ||
+          ttsEngine === 'gemini-2.5-flash-preview-tts' ||
+          voiceDef.tier === 'pro');
 
       if (useGeminiPrimary) {
         try {
@@ -5469,6 +5744,723 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to generate recap assets'
+      });
+    }
+  });
+
+  // Movie Recap Visual Director: analyzes story/keyframe -> 5 Burmese titles + original title + 2-sentence summary + image prompt
+  app.post('/api/recap/suggest-titles', async (req, res) => {
+    const {
+      isFreeMode = true,
+      userGeminiApiKey,
+      scriptText = '',
+      cues = [],
+      videoTitle = '',
+      scriptStyle = 'narrator',
+      targetLanguage = 'my',
+      partNumber = 1,
+      aspectRatio = '9:16',
+      referenceFrameDataUrl
+    } = (req.body || {}) as {
+      isFreeMode?: boolean;
+      userGeminiApiKey?: string;
+      scriptText?: string;
+      cues?: Array<{ text: string }>;
+      videoTitle?: string;
+      scriptStyle?: ScriptStyleId;
+      targetLanguage?: TargetLanguageCode;
+      partNumber?: number | null;
+      aspectRatio?: string;
+      referenceFrameDataUrl?: string;
+    };
+
+    const localBaseline = normalizeDirectorAnalysisResult({
+      raw: null,
+      scriptText,
+      cues,
+      rawTitle: videoTitle,
+      scriptStyle,
+      partNumber,
+      aspectRatio
+    });
+
+    const freeKey = String(userGeminiApiKey || '').trim();
+    const cueSummary = Array.isArray(cues)
+      ? cues
+          .slice(0, 24)
+          .map((c) => String(c?.text || '').trim())
+          .filter(Boolean)
+          .join(' ')
+      : '';
+    const storyContext = (cueSummary || String(scriptText || '')).trim().slice(0, 3200);
+
+    if (!storyContext) {
+      res.json({
+        ok: true,
+        ...localBaseline,
+        titles: localBaseline.suggested_titles,
+        source: 'fallback'
+      });
+      return;
+    }
+
+    const askDirectorWithAi = async (ai: GoogleGenAI): Promise<ThumbnailDirectorAnalysis> => {
+      const langInstruction =
+        targetLanguage === 'my'
+          ? 'natural spoken/written Burmese (Myanmar Unicode)'
+          : targetLanguage === 'th'
+            ? 'Thai'
+            : targetLanguage === 'ja'
+              ? 'Japanese'
+              : targetLanguage === 'ko'
+                ? 'Korean'
+                : targetLanguage === 'zh'
+                  ? 'Chinese'
+                  : 'English';
+      const styleDef = SCRIPT_STYLE_PROMPTS[scriptStyle] || SCRIPT_STYLE_PROMPTS.narrator;
+      const directorPrompt = `You are an expert Movie Recap content creator and visual director for a Myanmar audience. Read the recap script (and inspect the attached keyframe if present) and generate both catchy ${langInstruction} titles and vivid cinematic scene descriptions for a vertical movie poster thumbnail.
+
+Style tone: ${styleDef.labelEn}
+Recap script / video context:
+${storyContext}
+${videoTitle ? `\nSource clip title hint: ${videoTitle}` : ''}
+
+Rules for Title & Story Analysis:
+1. Base everything strictly on what happens in the video/script. Do not invent plot points, characters, or backstory.
+2. Provide 5 click-worthy, high-converting titles in ${langInstruction} suitable for TikTok, Facebook Reels, and YouTube Shorts. Keep each title concise (under 15 words, punchy 4-8 words ideal for a poster headline), emotional, mysterious, or dramatic depending on the genre. DO NOT put "အပိုင်း (၁)" or "Part 1" inside the titles.
+3. Extract the original movie title if shown/spoken/identifiable from context, or "Unknown", and write a brief 2-sentence plot summary in Burmese (Myanmar Unicode).
+4. Select the single best Burmese title from your 5 suggestions as "selected_title".
+5. Write 3 distinct, vivid visual key scene descriptions in English ("scene_descriptions_en": 3 items) suitable for cinematic movie poster artwork — describing characters, expressions, action, setting, mood, and dramatic lighting WITHOUT mentioning any copyrighted movie names or real actor names.`;
+
+      const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+      if (
+        typeof referenceFrameDataUrl === 'string' &&
+        referenceFrameDataUrl.startsWith('data:image/')
+      ) {
+        const match = referenceFrameDataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+        if (match && match[2] && match[2].length < 2_000_000) {
+          parts.push({
+            inlineData: {
+              mimeType: match[1] || 'image/jpeg',
+              data: match[2]
+            }
+          });
+        }
+      }
+      parts.push({ text: directorPrompt });
+
+      const resp = await Promise.race([
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: { parts },
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                original_title: { type: Type.STRING },
+                summary_burmese: { type: Type.STRING },
+                suggested_titles: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
+                },
+                selected_title: { type: Type.STRING },
+                scene_descriptions_en: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
+                }
+              },
+              required: [
+                'original_title',
+                'summary_burmese',
+                'suggested_titles',
+                'selected_title',
+                'scene_descriptions_en'
+              ]
+            }
+          }
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Director title analysis timeout')), 18000)
+        )
+      ]);
+      const parsed = JSON.parse(resp.text || '{}') as Partial<ThumbnailDirectorAnalysis>;
+      return normalizeDirectorAnalysisResult({
+        raw: parsed,
+        scriptText,
+        cues,
+        rawTitle: videoTitle,
+        scriptStyle,
+        partNumber,
+        aspectRatio
+      });
+    };
+
+    try {
+      let aiResult: ThumbnailDirectorAnalysis | null = null;
+      if (isFreeMode) {
+        if (freeKey) {
+          aiResult = await askDirectorWithAi(
+            new GoogleGenAI({
+              apiKey: freeKey,
+              httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+            })
+          );
+        }
+      } else {
+        const poolRes = await executeWithGeminiKeyPool((ai) => askDirectorWithAi(ai));
+        if (poolRes?.result) {
+          aiResult = poolRes.result;
+        }
+      }
+
+      if (aiResult) {
+        res.json({
+          ok: true,
+          ...aiResult,
+          titles: aiResult.suggested_titles,
+          source: 'gemini'
+        });
+        return;
+      }
+    } catch (err) {
+      console.warn(
+        '[suggest-titles] Falling back to local director titles:',
+        err instanceof Error ? err.message : err
+      );
+    }
+
+    res.json({
+      ok: true,
+      ...localBaseline,
+      titles: localBaseline.suggested_titles,
+      source: 'fallback'
+    });
+  });
+
+  // Generate 3 dramatic AI Movie Poster artworks via Gemini Image model (strictly Free Key vs Credit Pool isolated)
+  app.post('/api/recap/generate-poster-art', async (req, res) => {
+    const {
+      isFreeMode = true,
+      userGeminiApiKey,
+      sceneDescriptionsEn = [],
+      selectedTitle = '',
+      partNumber = 1,
+      aspectRatio = '9:16',
+      highQuality = false,
+      directPromptWithText = false,
+      customPrompt,
+      localUploadId,
+      jobId
+    } = (req.body || {}) as {
+      isFreeMode?: boolean;
+      userGeminiApiKey?: string;
+      sceneDescriptionsEn?: string[];
+      selectedTitle?: string;
+      partNumber?: number | null;
+      aspectRatio?: string;
+      highQuality?: boolean;
+      directPromptWithText?: boolean;
+      customPrompt?: string;
+      localUploadId?: string;
+      jobId?: string | null;
+    };
+
+    const freeKey = String(userGeminiApiKey || '').trim();
+    const validRatio =
+      aspectRatio === '16:9' ||
+      aspectRatio === '1:1' ||
+      aspectRatio === '4:3' ||
+      aspectRatio === '3:4'
+        ? aspectRatio
+        : '9:16';
+
+    const fallbackScenes = [
+      'a tense protagonist standing inside a dimly lit shadowy corridor under flickering fluorescent lights, dramatic cracks or glowing crimson tension energy and floating embers',
+      'two stunned characters facing each other in high-contrast crimson and teal storm lighting, intense betrayal and emotional suspense',
+      'a mysterious lone figure in pouring rain looking back toward an ominous glowing doorway, dramatic backlit silhouette with fiery sparks'
+    ];
+    const scenes = [0, 1, 2].map(
+      (i) => String(sceneDescriptionsEn[i] || '').trim() || fallbackScenes[i]
+    );
+    const styleVariants: Array<'crimson_corridor' | 'golden_drama' | 'dark_mystery'> = [
+      'crimson_corridor',
+      'golden_drama',
+      'dark_mystery'
+    ];
+    const labels = ['Key Poster Hook', 'Dramatic Turning Point', 'Climax Poster'];
+    const modelId = highQuality ? 'gemini-nano-banana-2.1' : 'gemini-3.1-flash-lite-image';
+
+    const dimsByRatio: Record<string, { w: number; h: number }> = {
+      '9:16': { w: 540, h: 960 },
+      '16:9': { w: 960, h: 540 },
+      '1:1': { w: 768, h: 768 },
+      '3:4': { w: 600, h: 800 },
+      '4:3': { w: 800, h: 600 }
+    };
+    const posterDims = dimsByRatio[validRatio] || dimsByRatio['9:16'];
+
+    const generateFreePublicAiPoster = async (
+      idx: number
+    ): Promise<{ dataUrl: string; buf: Buffer; mime: string } | null> => {
+      const { w, h } = posterDims;
+      const cleanArtPrompt = buildCleanPosterArtworkPrompt({
+        sceneDescriptionEn: scenes[idx],
+        aspectRatio: validRatio,
+        styleVariant: styleVariants[idx]
+      })
+        .replace(/\s+/g, ' ')
+        .slice(0, 360);
+      const seed = Math.floor(1000 + Math.random() * 900000) + idx * 137;
+      for (const pollModel of ['zimage', 'flux', '']) {
+        try {
+          const modelParam = pollModel ? `&model=${encodeURIComponent(pollModel)}` : '';
+          const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+            cleanArtPrompt
+          )}?width=${w}&height=${h}${modelParam}&nologo=true&seed=${seed}`;
+          const resp = await fetch(targetUrl, {
+            headers: {
+              Accept: 'image/*',
+              'User-Agent': 'TTAK-Movie-Recap-Poster/1.0'
+            },
+            signal: AbortSignal.timeout(20000)
+          });
+          if (resp.status !== 200) continue;
+          const ct = String(resp.headers.get('content-type') || '').toLowerCase();
+          if (!ct.startsWith('image/')) continue;
+          const arr = Buffer.from(await resp.arrayBuffer());
+          if (arr.length < 15000) continue;
+          const mime = ct.split(';')[0].trim() || 'image/jpeg';
+          // Cleanly crop away any bottom-corner service watermark while keeping 100% full-bleed aspect framing
+          const rawImg = path.join(JOBS_TEMP_DIR, `poll_raw_${Date.now()}_${idx}.jpg`);
+          const cleanImg = path.join(JOBS_TEMP_DIR, `poll_clean_${Date.now()}_${idx}.jpg`);
+          let finalBuf: Buffer = arr;
+          try {
+            fs.writeFileSync(rawImg, arr);
+            await execFileAsync('ffmpeg', [
+              '-y',
+              '-i',
+              rawImg,
+              '-frames:v',
+              '1',
+              '-vf',
+              `crop=iw*0.92:ih*0.92:iw*0.04:0,scale=${w}:${h}`,
+              '-q:v',
+              '2',
+              cleanImg
+            ]);
+            if (fs.existsSync(cleanImg)) {
+              const cBuf = fs.readFileSync(cleanImg);
+              if (cBuf.length > 5000) {
+                finalBuf = cBuf;
+              }
+            }
+          } catch {
+          } finally {
+            try {
+              if (fs.existsSync(rawImg)) fs.unlinkSync(rawImg);
+              if (fs.existsSync(cleanImg)) fs.unlinkSync(cleanImg);
+            } catch {}
+          }
+          return {
+            dataUrl: `data:${mime};base64,${finalBuf.toString('base64')}`,
+            buf: finalBuf,
+            mime
+          };
+        } catch {}
+      }
+      return null;
+    };
+
+    const generateGradedVideoCinemaPoster = async (idx: number): Promise<string | null> => {
+      const outImg = path.join(JOBS_TEMP_DIR, `cposter_${Date.now()}_${idx}.jpg`);
+      try {
+        const safeJob = String(jobId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeLoc = String(localUploadId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+        const srcPath = [
+          safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_input.mp4`) : '',
+          safeLoc ? path.join(JOBS_TEMP_DIR, `${safeLoc}_upload.mp4`) : '',
+          safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_recap.mp4`) : '',
+          safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_preview.mp4`) : ''
+        ].find((p) => Boolean(p) && fs.existsSync(p));
+        if (!srcPath) return null;
+
+        let dur = 15;
+        try {
+          const probeRes = await execFileAsync('ffprobe', [
+            '-v',
+            'error',
+            '-show_entries',
+            'format=duration',
+            '-of',
+            'default=noprint_wrappers=1:nokey=1',
+            srcPath
+          ]);
+          const parsedDur = parseFloat(String(probeRes.stdout || '').trim());
+          if (Number.isFinite(parsedDur) && parsedDur > 1) dur = parsedDur;
+        } catch {}
+
+        const fracs = [0.22, 0.54, 0.84];
+        const ts = Math.max(0.25, Math.min(Math.max(1, dur) - 0.3, dur * (fracs[idx] || 0.5)));
+        const { w, h } = posterDims;
+        const zoomScale = idx === 1 ? 1.16 : idx === 2 ? 1.22 : 1.1;
+        const zw = Math.round(w * zoomScale);
+        const zh = Math.round(h * zoomScale);
+        const colorGrades = [
+          'eq=contrast=1.28:saturation=1.32:brightness=-0.05,colorbalance=rs=0.16:gs=-0.05:bs=-0.08:rh=0.14:bh=0.08,unsharp=5:5:0.9,vignette=PI/3.3',
+          'eq=contrast=1.26:saturation=1.36:brightness=-0.04,colorbalance=rs=0.22:gs=0.06:bs=-0.14:rh=0.18:gh=0.04,unsharp=5:5:0.9,vignette=PI/3.2',
+          'eq=contrast=1.32:saturation=1.22:brightness=-0.06,colorbalance=rs=-0.08:gs=0.05:bs=0.20:rh=0.06:bh=0.18,unsharp=5:5:0.9,vignette=PI/3.1'
+        ];
+        const vf = `scale=${zw}:${zh}:force_original_aspect_ratio=increase,crop=${w}:${h},${colorGrades[idx % colorGrades.length]}`;
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-ss',
+          ts.toFixed(2),
+          '-i',
+          srcPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          vf,
+          '-q:v',
+          '2',
+          outImg
+        ]);
+        if (!fs.existsSync(outImg)) return null;
+        const buf = fs.readFileSync(outImg);
+        if (buf.length < 1500) return null;
+        return `data:image/jpeg;base64,${buf.toString('base64')}`;
+      } catch {
+        return null;
+      } finally {
+        try {
+          if (fs.existsSync(outImg)) fs.unlinkSync(outImg);
+        } catch {}
+      }
+    };
+
+    const generateAiPosterVariantFromImage = async (
+      baseBuf: Buffer,
+      idx: number
+    ): Promise<string | null> => {
+      const tag = `${Date.now()}_${idx}`;
+      const inImg = path.join(JOBS_TEMP_DIR, `aivar_in_${tag}.jpg`);
+      const outImg = path.join(JOBS_TEMP_DIR, `aivar_out_${tag}.jpg`);
+      try {
+        fs.writeFileSync(inImg, baseBuf);
+        const { w, h } = posterDims;
+        const zw = Math.round(w * (idx === 1 ? 1.18 : 1.14));
+        const zh = Math.round(h * (idx === 1 ? 1.18 : 1.14));
+        const cropOffsetY = idx === 1 ? Math.round((zh - h) * 0.65) : Math.round((zh - h) * 0.35);
+        const gradeFilter =
+          idx === 1
+            ? `scale=${zw}:${zh}:force_original_aspect_ratio=increase,crop=${w}:${h}:(iw-${w})/2:${cropOffsetY},eq=contrast=1.24:saturation=1.28:brightness=-0.04,colorbalance=rs=0.22:gs=0.04:bs=-0.12:rh=0.16,vignette=PI/3.3`
+            : `hflip,scale=${zw}:${zh}:force_original_aspect_ratio=increase,crop=${w}:${h}:(iw-${w})/2:${cropOffsetY},eq=contrast=1.28:saturation=1.18:brightness=-0.05,colorbalance=rs=-0.08:gs=0.06:bs=0.22:bh=0.18,vignette=PI/3.2`;
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-i',
+          inImg,
+          '-frames:v',
+          '1',
+          '-vf',
+          gradeFilter,
+          '-q:v',
+          '2',
+          outImg
+        ]);
+        if (!fs.existsSync(outImg)) return null;
+        const outBuf = fs.readFileSync(outImg);
+        if (outBuf.length < 1500) return null;
+        return `data:image/jpeg;base64,${outBuf.toString('base64')}`;
+      } catch {
+        return null;
+      } finally {
+        try {
+          if (fs.existsSync(inImg)) fs.unlinkSync(inImg);
+          if (fs.existsSync(outImg)) fs.unlinkSync(outImg);
+        } catch {}
+      }
+    };
+
+    const runFreePublicPosterBatch = async () => {
+      const resultFrames: Array<{
+        id: string;
+        label: string;
+        timeSec: number;
+        dataUrl: string;
+        isAiPoster: boolean;
+      }> = [];
+      let seedAiBuffer: Buffer | null = null;
+      // Generate AI Poster sequentially with smart fallback: Pollinations -> Video Cinema Grade -> AI Style Remix
+      for (let idx = 0; idx < 3; idx++) {
+        const aiArt = await generateFreePublicAiPoster(idx);
+        let dataUrl = aiArt?.dataUrl || null;
+        let suffixLabel = labels[idx];
+        if (aiArt?.buf && !seedAiBuffer) {
+          seedAiBuffer = aiArt.buf;
+        }
+        if (!dataUrl) {
+          dataUrl = await generateGradedVideoCinemaPoster(idx);
+          if (dataUrl) {
+            suffixLabel = `${labels[idx]} · Cinema Grade`;
+          }
+        }
+        if (!dataUrl && seedAiBuffer) {
+          dataUrl = await generateAiPosterVariantFromImage(seedAiBuffer, idx);
+          if (dataUrl) {
+            suffixLabel = `${labels[idx]} · AI Edition`;
+          }
+        }
+        if (dataUrl) {
+          resultFrames.push({
+            id: `ai-poster-${idx + 1}`,
+            label: suffixLabel,
+            timeSec: 0,
+            dataUrl,
+            isAiPoster: true
+          });
+        }
+        if (idx < 2) {
+          await new Promise((r) => setTimeout(r, 450));
+        }
+      }
+      return resultFrames;
+    };
+
+    const generateSinglePoster = async (ai: GoogleGenAI, idx: number): Promise<string | null> => {
+      const prompt =
+        idx === 0 && customPrompt && String(customPrompt).trim()
+          ? String(customPrompt).trim()
+          : directPromptWithText
+            ? buildThumbnailImagePromptTemplate({
+                sceneDescriptionEn: scenes[idx],
+                selectedTitle,
+                partNumber,
+                aspectRatio: validRatio
+              })
+            : buildCleanPosterArtworkPrompt({
+                sceneDescriptionEn: scenes[idx],
+                aspectRatio: validRatio,
+                styleVariant: styleVariants[idx]
+              });
+
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: modelId,
+          contents: {
+            parts: [{ text: prompt }]
+          },
+          config: {
+            imageConfig: {
+              aspectRatio: validRatio,
+              ...(modelId === 'gemini-nano-banana-2.1' ? { imageSize: '1K' } : {})
+            }
+          }
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('AI poster image timeout')), 45000)
+        )
+      ]);
+
+      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
+        if (part.inlineData?.data) {
+          const mime = part.inlineData.mimeType || 'image/png';
+          return `data:${mime};base64,${part.inlineData.data}`;
+        }
+      }
+      return null;
+    };
+
+    try {
+      const runBatch = async (ai: GoogleGenAI) => {
+        const settled = await Promise.allSettled([
+          generateSinglePoster(ai, 0),
+          generateSinglePoster(ai, 1),
+          generateSinglePoster(ai, 2)
+        ]);
+        const frames = settled
+          .map((resItem, idx) => {
+            if (resItem.status === 'fulfilled' && resItem.value) {
+              return {
+                id: `ai-poster-${idx + 1}`,
+                label: labels[idx],
+                timeSec: 0,
+                dataUrl: resItem.value,
+                isAiPoster: true
+              };
+            }
+            return null;
+          })
+          .filter((x): x is NonNullable<typeof x> => Boolean(x));
+
+        if (frames.length === 0) {
+          const firstRejected = settled.find((s) => s.status === 'rejected') as
+            | PromiseRejectedResult
+            | undefined;
+          throw firstRejected?.reason || new Error('No poster image returned by model');
+        }
+        return frames;
+      };
+
+      let frames: Array<{
+        id: string;
+        label: string;
+        timeSec: number;
+        dataUrl: string;
+        isAiPoster: boolean;
+      }> = [];
+      let usedProvider: 'gemini' | 'free-ai-poster' = 'gemini';
+      let usedModelLabel = modelId;
+
+      if (isFreeMode) {
+        if (freeKey) {
+          try {
+            frames = await runBatch(
+              new GoogleGenAI({
+                apiKey: freeKey,
+                httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+              })
+            );
+          } catch (gemErr) {
+            console.warn(
+              '[generate-poster-art] Free Gemini key could not call paid image model; switching to Free AI Poster engine:',
+              gemErr instanceof Error ? gemErr.message.slice(0, 140) : gemErr
+            );
+          }
+        }
+        if (frames.length === 0) {
+          frames = await runFreePublicPosterBatch();
+          if (frames.length > 0) {
+            usedProvider = 'free-ai-poster';
+            usedModelLabel = 'pollinations-free-ai';
+          }
+        }
+      } else {
+        const poolRes = await executeWithGeminiKeyPool((ai) => runBatch(ai));
+        if (poolRes?.result && poolRes.result.length > 0) {
+          frames = poolRes.result;
+        }
+      }
+
+      if (frames.length === 0) {
+        res.status(isFreeMode ? 503 : 402).json({
+          ok: false,
+          error: isFreeMode
+            ? 'Free AI Poster Server ယာယီမအားလပ်သေးပါ — ခဏစောင့်ပြီး ထပ်နှိပ်ကြည့်ပါ (သို့မဟုတ် Video Scene Poster များကို Save နိုင်ပါသည်)။'
+            : 'AI Poster ထုတ်ရန် Billing-enabled Gemini API Key လိုအပ်နိုင်ပါသည် (Settings တွင် API Key စစ်ဆေးပါ)။',
+          errorCode: isFreeMode ? 'FREE_IMAGE_SERVER_BUSY' : 'IMAGE_GEN_UNAVAILABLE'
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        frames,
+        model: usedModelLabel,
+        provider: usedProvider,
+        directPromptWithText: usedProvider === 'gemini' ? Boolean(directPromptWithText) : false
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isQuotaOrBilling =
+        /429|RESOURCE_EXHAUSTED|PERMISSION_DENIED|403|400|billing|quota|paid/i.test(msg);
+      res.status(isQuotaOrBilling ? 402 : 500).json({
+        ok: false,
+        error: isQuotaOrBilling
+          ? 'AI Poster ပုံထုတ်ရန် Paid/Billing-enabled Gemini API Key လိုအပ်ပါသည် — Prompt ကို Copy ယူ၍ Gemini App တွင် တိုက်ရိုက်သုံးနိုင်သလို Video Scene Poster များကိုလည်း ဆက်သုံးနိုင်ပါသည်။'
+          : `AI Poster generation failed: ${msg}`,
+        errorCode: isQuotaOrBilling ? 'PAID_KEY_OR_QUOTA_REQUIRED' : 'IMAGE_GEN_ERROR'
+      });
+    }
+  });
+
+  // Extract 3 crisp scene JPEG screenshots from an already-loaded job/upload video for Thumbnail cards
+  app.post('/api/recap/extract-thumbnails', async (req, res) => {
+    try {
+      const { jobId, localUploadId, durationSec = 30, timestampsSec } = (req.body || {}) as {
+        jobId?: string;
+        localUploadId?: string;
+        durationSec?: number;
+        timestampsSec?: number[];
+      };
+
+      const safeJob = String(jobId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      const safeLoc = String(localUploadId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      const candidatePaths = [
+        safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_input.mp4`) : '',
+        safeLoc ? path.join(JOBS_TEMP_DIR, `${safeLoc}_upload.mp4`) : '',
+        safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_recap.mp4`) : '',
+        safeJob ? path.join(JOBS_TEMP_DIR, `${safeJob}_preview.mp4`) : ''
+      ].filter((p) => Boolean(p) && fs.existsSync(p));
+
+      if (candidatePaths.length === 0) {
+        res.status(200).json({ ok: false, error: 'Source video not cached on server' });
+        return;
+      }
+
+      const srcVideo = candidatePaths[0];
+      const safeDur = Math.max(6, Number(durationSec) || 30);
+      const targetTimes =
+        Array.isArray(timestampsSec) && timestampsSec.length >= 3
+          ? timestampsSec.slice(0, 3).map((t) => Math.max(0.2, Math.min(safeDur - 0.5, Number(t) || 1)))
+          : [
+              Number((safeDur * 0.16).toFixed(2)),
+              Number((safeDur * 0.5).toFixed(2)),
+              Number((safeDur * 0.82).toFixed(2))
+            ];
+
+      const labels = ['Opening Hook', 'Turning Point', 'Climax Scene'];
+      const frames: Array<{ id: string; label: string; timeSec: number; dataUrl: string }> = [];
+      const reqTag = `th_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+      for (let i = 0; i < targetTimes.length; i++) {
+        const ts = targetTimes[i];
+        const outImg = path.join(JOBS_TEMP_DIR, `${reqTag}_${i}.jpg`);
+        try {
+          await execFileAsync('ffmpeg', [
+            '-y',
+            '-ss',
+            String(ts),
+            '-i',
+            srcVideo,
+            '-frames:v',
+            '1',
+            '-vf',
+            'scale=720:-2,eq=contrast=1.10:saturation=1.16:brightness=-0.02,unsharp=3:3:0.65,vignette=PI/4.6',
+            '-q:v',
+            '2',
+            outImg
+          ]);
+          if (fs.existsSync(outImg)) {
+            const buf = fs.readFileSync(outImg);
+            if (buf.length > 300) {
+              frames.push({
+                id: `srv-frame-${i + 1}`,
+                label: labels[i] || `Scene ${i + 1}`,
+                timeSec: Math.round(ts),
+                dataUrl: `data:image/jpeg;base64,${buf.toString('base64')}`
+              });
+            }
+          }
+        } catch (ffErr) {
+          console.warn(`[extract-thumbnails] frame ${i} failed:`, ffErr instanceof Error ? ffErr.message : ffErr);
+        } finally {
+          try {
+            if (fs.existsSync(outImg)) fs.unlinkSync(outImg);
+          } catch {}
+        }
+      }
+
+      if (frames.length === 0) {
+        res.status(500).json({ ok: false, error: 'Failed to extract frames from video' });
+        return;
+      }
+
+      res.json({ ok: true, frames });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Thumbnail frame extraction failed'
       });
     }
   });
@@ -6235,8 +7227,12 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         return;
       }
 
+      const isGeminiTtsRequested =
+        ttsEngine === 'gemini-3.8-flash-lite-tts' ||
+        ttsEngine === 'gemini-3.8-flash-tts' ||
+        ttsEngine === 'gemini-2.5-flash-preview-tts';
       const useGeminiPreview =
-        !isFreeMode && (voiceDef.tier === 'pro' || ttsEngine === 'gemini-2.5-flash-preview-tts');
+        !isFreeMode && (voiceDef.tier === 'pro' || isGeminiTtsRequested);
 
       let wavBuf: Buffer | null = null;
       let providerUsed = voiceDef.ttsEngineId;
@@ -6255,14 +7251,14 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           });
           if (geminiPreviewRun?.result) {
             wavBuf = geminiPreviewRun.result.wavBuffer;
-            providerUsed = `gemini-2.5-flash-preview-tts:${voiceDef.geminiVoice}`;
+            providerUsed = `gemini-3.8-flash-lite-tts:${voiceDef.geminiVoice}`;
           }
         } catch {}
       } else if (
         isFreeMode &&
         typeof userGeminiApiKey === 'string' &&
         userGeminiApiKey.trim().length >= 12 &&
-        (voiceDef.tier === 'pro' || ttsEngine === 'gemini-2.5-flash-preview-tts')
+        (voiceDef.tier === 'pro' || isGeminiTtsRequested)
       ) {
         try {
           const userAi = new GoogleGenAI({
@@ -6430,10 +7426,23 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
     lastMode?: 'free' | 'paid';
   }
 
+  function isSyntheticTestUser(userId?: string, email?: string): boolean {
+    const uid = String(userId || '').trim().toLowerCase();
+    const em = String(email || '').trim().toLowerCase();
+    return (
+      uid.startsWith('test-user-') ||
+      em.endsWith('@ttakb.site') ||
+      em.endsWith('@example.com')
+    );
+  }
+
   function loadUsers(): StoredUserAccount[] {
     try {
       if (fs.existsSync(USERS_FILE)) {
-        return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+        const parsed = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+        if (Array.isArray(parsed)) {
+          return parsed.filter((u: StoredUserAccount) => !isSyntheticTestUser(u?.userId, u?.email));
+        }
       }
     } catch {}
     return [];
@@ -6441,7 +7450,8 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
 
   function saveUsers(users: StoredUserAccount[]) {
     try {
-      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8');
+      const cleaned = users.filter((u) => !isSyntheticTestUser(u?.userId, u?.email));
+      fs.writeFileSync(USERS_FILE, JSON.stringify(cleaned, null, 2), 'utf-8');
     } catch (e) {
       console.warn('Error saving users:', e);
     }
@@ -7804,23 +8814,28 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       }
       const usage = recordUserFreeUsage(userId);
       const user = loadUsers().find((u) => u.userId === userId);
-      const stats = getWebsiteUserStats();
+      const isTestRequest =
+        isSyntheticTestUser(userId, user?.email) ||
+        req.headers['x-test-suppress-telegram'] === '1';
 
-      const msg = [
-        `🎬 [FREE MODE] ယနေ့ ဗီဒီယို အသုံးပြုမှု`,
-        `━━━━━━━━━━━━━━━━━━━`,
-        `🪪 User ID: ${userId}`,
-        `📧 Gmail / Email: ${user?.email || 'Guest'}`,
-        `📊 ယနေ့ Free Mode သုံးပြီးမှု: ${usage.freeUsedToday} / ${usage.freeLimit} ပုဒ် (ကျန် ${usage.freeRemaining} ပုဒ်)`,
-        `🏷️ အခြေအနေ: Daily Free Mode အသုံးပြုနေသည်`,
-        `👥 Users: ${stats.totalUsers} (Free: ${stats.freeUsersCount} | Paid: ${stats.paidUsersCount})`
-      ].join('\n');
+      if (!isTestRequest) {
+        const stats = getWebsiteUserStats();
+        const msg = [
+          `🎬 [FREE MODE] ယနေ့ ဗီဒီယို အသုံးပြုမှု`,
+          `━━━━━━━━━━━━━━━━━━━`,
+          `🪪 User ID: ${userId}`,
+          `📧 Gmail / Email: ${user?.email || 'Guest'}`,
+          `📊 ယနေ့ Free Mode သုံးပြီးမှု: ${usage.freeUsedToday} / ${usage.freeLimit} ပုဒ် (ကျန် ${usage.freeRemaining} ပုဒ်)`,
+          `🏷️ အခြေအနေ: Daily Free Mode အသုံးပြုနေသည်`,
+          `👥 Users: ${stats.totalUsers} (Free: ${stats.freeUsersCount} | Paid: ${stats.paidUsersCount})`
+        ].join('\n');
 
-      notifyTelegramAdmin(msg, null, {
-        inline_keyboard: [
-          [{ text: '🎬 ယနေ့ Free သုံးနေသူများ စစ်မည်', callback_data: 'cmd_free_active' }]
-        ]
-      }).catch(() => {});
+        notifyTelegramAdmin(msg, null, {
+          inline_keyboard: [
+            [{ text: '🎬 ယနေ့ Free သုံးနေသူများ စစ်မည်', callback_data: 'cmd_free_active' }]
+          ]
+        }).catch(() => {});
+      }
 
       res.json({
         ok: true,
@@ -8940,7 +9955,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
       if (cachedProfile && typeof cachedProfile.userId === 'string' && typeof cachedProfile.email === 'string') {
         const cleanUserId = cachedProfile.userId.trim();
         const cleanEmail = cachedProfile.email.trim().toLowerCase();
-        if (cleanUserId && cleanEmail) {
+        if (cleanUserId && cleanEmail && !isSyntheticTestUser(cleanUserId, cleanEmail)) {
           const users = loadUsers();
           let user =
             users.find((u) => u.userId === cleanUserId) ||
@@ -9130,23 +10145,47 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
     res.status(404).json({ ok: false, error: 'API endpoint or media file not found' });
   });
 
+  let httpServer: ReturnType<typeof app.listen>;
+
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa'
+    let vitePromise: Promise<Awaited<ReturnType<typeof createViteServer>>> | null = null;
+    const getVite = () => {
+      if (!vitePromise) {
+        vitePromise = createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer }
+          },
+          appType: 'spa'
+        });
+      }
+      return vitePromise;
+    };
+
+    app.use((req, res, next) => {
+      getVite()
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
     });
-    app.use(vite.middlewares);
+
+    httpServer = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`TTAK MOVIE RECAP Studio server running on http://localhost:${PORT}`);
+      // Warm up Vite right after port 3000 is open
+      void getVite().catch((err) => {
+        console.error('[Vite] Failed to initialize dev middleware:', err);
+      });
+    });
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
-  }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`TTAK MOVIE RECAP Studio server running on http://localhost:${PORT}`);
-  });
+    httpServer = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`TTAK MOVIE RECAP Studio server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();

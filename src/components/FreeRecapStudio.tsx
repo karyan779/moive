@@ -83,6 +83,7 @@ import {
   CanvasVideoEditor,
   type DemoScenePreset
 } from './CanvasVideoEditor';
+import { ThumbnailStudioModal } from './ThumbnailStudioModal';
 
 export type RightInspectorTab = 'settings' | 'history';
 
@@ -402,6 +403,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [isLoadingUrl, setIsLoadingUrl] = useState<boolean>(false);
   const [urlLoadError, setUrlLoadError] = useState<string | null>(null);
   const [urlLoadStatusText, setUrlLoadStatusText] = useState<string>('');
+  const [isThumbnailStudioOpen, setIsThumbnailStudioOpen] = useState<boolean>(false);
 
   // Settings Inspector State
   const [mode, setMode] = useState<RecapMode>('recap');
@@ -919,6 +921,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           );
           r2ObjectKeyPayload = uploadRes.r2ObjectKey;
           localUploadIdPayload = uploadRes.localUploadId;
+          if (uploadRes.localUploadId) {
+            setLoadedLocalUploadId(uploadRes.localUploadId);
+          }
         } catch (uploadErr) {
           console.warn('Direct upload warning:', uploadErr);
           throw uploadErr;
@@ -967,114 +972,141 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       setRenderProgress(37);
       setRenderMessage('Starting AI recap job...');
 
-      const response = await fetch('/api/recap/free/generate-assets', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestPayload)
-      });
+      const submitAndPollRecapJob = async () => {
+        const response = await fetch('/api/recap/free/generate-assets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestPayload)
+        });
 
-      const rawRespText = await response.text();
-      let data: any = null;
-      if (rawRespText && !rawRespText.trim().startsWith('<')) {
-        try {
-          data = JSON.parse(rawRespText);
-        } catch {}
-      }
-
-      if (!data) {
-        throw new Error(
-          uiLang === 'my'
-            ? 'Server ချိတ်ဆက်မှု အချိန်ကြာသွားပါသည် (Cloudflare/Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
-            : 'Server returned an invalid/HTML gateway response. Please retry.'
-        );
-      }
-
-      if (data.ok && data.async && data.job_id) {
-        const pollJobId = String(data.job_id);
-        const pollDeadline = Date.now() + 12 * 60 * 1000;
-        let finalPayload: any = null;
-        let consecutivePollErrors = 0;
-        while (Date.now() < pollDeadline) {
-          await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutivePollErrors)));
-          let stResp: Response;
-          let stText = '';
+        const rawRespText = await response.text();
+        let data: any = null;
+        if (rawRespText && !rawRespText.trim().startsWith('<')) {
           try {
-            stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
-              cache: 'no-store',
-              signal: AbortSignal.timeout(12000)
-            });
-            stText = await stResp.text();
-          } catch (pollNetErr) {
-            consecutivePollErrors++;
-            if (consecutivePollErrors >= 3) {
-              setRenderMessage(`Reconnecting to server (${consecutivePollErrors}/15)...`);
+            data = JSON.parse(rawRespText);
+          } catch {}
+        }
+
+        if (!data) {
+          throw new Error(
+            uiLang === 'my'
+              ? 'Server ချိတ်ဆက်မှု အချိန်ကြာသွားပါသည် (Cloudflare/Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
+              : 'Server returned an invalid/HTML gateway response. Please retry.'
+          );
+        }
+
+        if (data.ok && data.async && data.job_id) {
+          const pollJobId = String(data.job_id);
+          const pollDeadline = Date.now() + 12 * 60 * 1000;
+          let finalPayload: any = null;
+          let consecutivePollErrors = 0;
+          while (Date.now() < pollDeadline) {
+            await new Promise((r) => setTimeout(r, computeNextPollDelayMs(consecutivePollErrors)));
+            let stResp: Response;
+            let stText = '';
+            try {
+              stResp = await fetch(`/api/recap/job-status/${encodeURIComponent(pollJobId)}`, {
+                cache: 'no-store',
+                signal: AbortSignal.timeout(12000)
+              });
+              stText = await stResp.text();
+            } catch {
+              consecutivePollErrors++;
+              if (consecutivePollErrors >= 3) {
+                setRenderMessage(`Reconnecting to server (${consecutivePollErrors}/15)...`);
+              }
+              if (consecutivePollErrors >= 15) {
+                throw new Error(
+                  uiLang === 'my'
+                    ? 'အင်တာနက်ချိတ်ဆက်မှု ပြတ်တောက်သွားပါသည်။ Network ပြန်စစ်ပြီး ထပ်မံကြိုးစားကြည့်ပါ။'
+                    : 'Lost network connection while checking recap progress. Please retry.'
+                );
+              }
+              continue;
             }
-            if (consecutivePollErrors >= 15) {
+
+            let stData: any = null;
+            if (stText && !stText.trim().startsWith('<')) {
+              try {
+                stData = JSON.parse(stText);
+              } catch {}
+            }
+            if (!stData) {
+              if (isTransientPollHttpStatus(stResp.status) || consecutivePollErrors < 12) {
+                consecutivePollErrors++;
+                continue;
+              }
               throw new Error(
                 uiLang === 'my'
-                  ? 'အင်တာနက်ချိတ်ဆက်မှု ပြတ်တောက်သွားပါသည်။ Network ပြန်စစ်ပြီး ထပ်မံကြိုးစားကြည့်ပါ။'
-                  : 'Lost network connection while checking recap progress. Please retry.'
+                  ? 'Server တုံ့ပြန်မှု ပုံစံမမှန်ပါ (Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
+                  : 'Server returned an invalid gateway response while polling.'
               );
             }
-            continue;
-          }
 
-          let stData: any = null;
-          if (stText && !stText.trim().startsWith('<')) {
-            try {
-              stData = JSON.parse(stText);
-            } catch {}
-          }
-          if (!stData) {
-            if (isTransientPollHttpStatus(stResp.status) || consecutivePollErrors < 12) {
+            if (isTransientPollHttpStatus(stResp.status) && stData.status !== 'error') {
               consecutivePollErrors++;
               continue;
             }
+
+            consecutivePollErrors = 0;
+            if (typeof stData.progress === 'number') {
+              setRenderProgress((prev) => Math.max(prev, Math.min(98, stData.progress)));
+            }
+            if (stData.stage_message) {
+              setRenderMessage(String(stData.stage_message));
+            }
+            if (stData.status === 'done' && stData.result) {
+              finalPayload = stData.result;
+              break;
+            }
+            if (stData.status === 'error' || stData.ok === false) {
+              const errObj = new Error(
+                (uiLang === 'my' ? stData.error : stData.error_en || stData.error) ||
+                  stData.error ||
+                  'AI script generation failed'
+              ) as Error & { errorCode?: string };
+              errObj.errorCode = stData.error_code;
+              throw errObj;
+            }
+          }
+          if (!finalPayload) {
             throw new Error(
               uiLang === 'my'
-                ? 'Server တုံ့ပြန်မှု ပုံစံမမှန်ပါ (Gateway timeout)။ ပြန်လည်ကြိုးစားကြည့်ပါ။'
-                : 'Server returned an invalid gateway response while polling.'
+                ? 'Recap ထုတ်လုပ်မှု အချိန်ကျော်လွန်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
+                : 'Recap processing timed out. Please retry.'
             );
           }
-
-          if (isTransientPollHttpStatus(stResp.status) && stData.status !== 'error') {
-            consecutivePollErrors++;
-            continue;
-          }
-
-          consecutivePollErrors = 0;
-          if (typeof stData.progress === 'number') {
-            setRenderProgress((prev) => Math.max(prev, Math.min(98, stData.progress)));
-          }
-          if (stData.stage_message) {
-            setRenderMessage(String(stData.stage_message));
-          }
-          if (stData.status === 'done' && stData.result) {
-            finalPayload = stData.result;
-            break;
-          }
-          if (stData.status === 'error' || stData.ok === false) {
-            throw new Error(
-              (uiLang === 'my' ? stData.error : stData.error_en || stData.error) ||
-                stData.error ||
-                'AI script generation failed'
-            );
-          }
+          return finalPayload;
+        } else if (!data.ok) {
+          const errObj = new Error(
+            (uiLang === 'my' ? data.error : data.error_en || data.error) ||
+              data.error ||
+              'Failed to generate recap assets'
+          ) as Error & { errorCode?: string };
+          errObj.errorCode = data.error_code;
+          throw errObj;
         }
-        if (!finalPayload) {
-          throw new Error(
-            uiLang === 'my'
-              ? 'Recap ထုတ်လုပ်မှု အချိန်ကျော်လွန်သွားပါသည်။ ထပ်မံကြိုးစားကြည့်ပါ။'
-              : 'Recap processing timed out. Please retry.'
-          );
+        return data;
+      };
+
+      let data: any;
+      try {
+        data = await submitAndPollRecapJob();
+      } catch (firstPassErr: any) {
+        const isOverloadErr =
+          firstPassErr?.errorCode === 'overloaded' ||
+          String(firstPassErr?.message || '').includes('503');
+        if (!isOverloadErr) {
+          throw firstPassErr;
         }
-        data = finalPayload;
-      } else if (!data.ok) {
-        throw new Error(
-          (uiLang === 'my' ? data.error : data.error_en || data.error) ||
-            data.error ||
-            'Failed to generate recap assets'
+        setRenderProgress(58);
+        setRenderMessage(
+          uiLang === 'my'
+            ? 'Gemini Server အသုံးပြုသူများနေသဖြင့် စက္ကန့်အနည်းငယ်စောင့်ပြီး အလိုအလျောက် ပြန်စမ်းနေပါသည်...'
+            : 'Gemini AI busy (503) — automatically retrying in a few seconds...'
         );
+        await new Promise((r) => setTimeout(r, 3500));
+        data = await submitAndPollRecapJob();
       }
 
       const generatedCues: SubtitleCue[] = data.cues || [];
@@ -3328,14 +3360,28 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                 <AlertTriangle className="size-4 shrink-0 text-red-500 mt-0.5" />
                 <span className="leading-relaxed font-medium break-words">{studioErrorMsg}</span>
               </div>
-              <button
-                type="button"
-                aria-label="Dismiss error"
-                onClick={() => setStudioErrorMsg(null)}
-                className="shrink-0 cursor-pointer rounded-lg p-1 text-red-500/80 hover:bg-red-500/15"
-              >
-                <X className="size-3.5" />
-              </button>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {hasLoadedVideo && !isGenerating && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStudioErrorMsg(null);
+                      void handleRunAutoFlow();
+                    }}
+                    className="cursor-pointer rounded-lg border border-red-500/40 bg-red-500/15 px-2.5 py-1 text-[11px] font-semibold text-red-700 hover:bg-red-500/25 dark:text-red-200 transition-colors"
+                  >
+                    {uiLang === 'my' ? 'ထပ်စမ်းမည်' : 'Retry'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  aria-label="Dismiss error"
+                  onClick={() => setStudioErrorMsg(null)}
+                  className="shrink-0 cursor-pointer rounded-lg p-1 text-red-500/80 hover:bg-red-500/15"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
             </div>
           )}
 
@@ -3583,6 +3629,19 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
                   <button
                     type="button"
+                    data-testid="open-thumbnail-studio-btn"
+                    onClick={() => {
+                      playUiSound('tap');
+                      setIsThumbnailStudioOpen(true);
+                    }}
+                    className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-amber-500/45 bg-amber-500/12 px-4 text-xs font-bold text-amber-700 shadow-2xs transition-all hover:bg-amber-500/20 active:scale-95 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25"
+                  >
+                    <ImageIcon className="size-3.5" />
+                    <span>{uiLang === 'my' ? 'Title & Thumbnail 3ပုံ' : 'Title & 3 Thumbnails'}</span>
+                  </button>
+
+                  <button
+                    type="button"
                     data-testid="download-recap-btn"
                     disabled={isExportingVideo}
                     onClick={handleDownloadVideo}
@@ -3771,6 +3830,19 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     </button>
                   )}
                 </div>
+
+                <button
+                  type="button"
+                  data-testid="mobile-open-thumbnail-studio-btn"
+                  onClick={() => {
+                    playUiSound('tap');
+                    setIsThumbnailStudioOpen(true);
+                  }}
+                  className="flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-amber-500/45 bg-amber-500/15 px-3 text-xs font-bold text-amber-800 shadow-xs transition-all select-none hover:bg-amber-500/25 active:scale-95 dark:border-amber-500/40 dark:bg-amber-500/18 dark:text-amber-200"
+                >
+                  <ImageIcon className="size-4 shrink-0" />
+                  <span>{uiLang === 'my' ? 'ခေါင်းစဉ် Auto & Thumbnail 3 ပုံထုတ်မည်' : 'Auto Title & 3 Thumbnails'}</span>
+                </button>
 
                 <button
                   type="button"
@@ -4246,6 +4318,29 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           </div>
         </div>
       )}
+
+      {/* Auto Viral Title & 3 Video Thumbnails Studio Modal */}
+      <ThumbnailStudioModal
+        isOpen={isThumbnailStudioOpen}
+        onClose={() => setIsThumbnailStudioOpen(false)}
+        userId={userId}
+        isFreeTier={isFreeTier}
+        uiLang={uiLang}
+        videoUrl={dubbedVideoUrl || videoFileUrl}
+        videoDuration={videoDuration}
+        aspectRatio={aspectRatio}
+        lastJobId={lastJobId}
+        localUploadId={loadedLocalUploadId}
+        scriptText={cues.map((c) => c.text).join(' ')}
+        cues={cues}
+        videoTitle={videoTitle || originalFilename}
+        scriptStyle={scriptStyle}
+        targetLanguage={targetLanguage}
+        channelTag={effectiveEditConfig.watermarkText.enabled ? effectiveEditConfig.watermarkText.text : ''}
+        onSelectTitle={(formatted) => {
+          setVideoTitle(formatted);
+        }}
+      />
     </div>
   );
 };

@@ -37,6 +37,8 @@ import {
   groupCuesIntoTimedBlocks,
   isTransientModelOverloadError,
   resolveFallbackScriptModels,
+  computeGeminiBackoffDelayMs,
+  compactMultimodalPartsForOverloadRetry,
   extractReadableGeminiErrorDetail,
   normalizeDialogueSubtitleCues,
   parseTimedSttTranscriptToCues,
@@ -747,19 +749,31 @@ test('503 high-demand model spikes trigger fallback models instead of 24h key co
   assert.equal(isTransientModelOverloadError(quotaErr), false);
   assert.equal(isApiKeyQuotaOrLimitError(quotaErr).shouldRotate, true);
 
-  // 3) Model fallback resolution automatically backs up preview models with gemini-2.5-flash
-  assert.deepEqual(resolveFallbackScriptModels('gemini-3-flash-preview'), [
-    'gemini-3-flash-preview',
-    'gemini-2.5-flash'
+  // 3) Model fallback resolution uses active Gemini 4 Hydrogen / 3.1 Flash Lite / 3.8 Flash and upgrades deprecated models
+  assert.deepEqual(resolveFallbackScriptModels('gemini-4-hydrogen'), [
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash'
+  ]);
+  assert.deepEqual(resolveFallbackScriptModels('gemini-3.8-flash'), [
+    'gemini-3.8-flash',
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite'
   ]);
   assert.deepEqual(resolveFallbackScriptModels('gemini-3.1-pro-preview'), [
-    'gemini-3.1-pro-preview',
-    'gemini-3-flash-preview',
-    'gemini-2.5-flash'
+    'gemini-4-argon',
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite'
   ]);
   assert.deepEqual(resolveFallbackScriptModels('gemini-2.5-flash'), [
-    'gemini-2.5-flash',
-    'gemini-3-flash-preview'
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash'
+  ]);
+  assert.deepEqual(resolveFallbackScriptModels('gemini-3-flash-preview'), [
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash'
   ]);
 
   // 4) Error message formatter returns clean Burmese/English guidance with NO truncated JSON braces
@@ -774,6 +788,34 @@ test('503 high-demand model spikes trigger fallback models instead of 24h key co
     'ApiError: {"error":{"code":500,"message":"Internal upstream failure occurred."}}'
   );
   assert.equal(cleaned, '500: Internal upstream failure occurred.');
+
+  // 6) Exponential backoff + compact multimodal parts helper for 503 overload retries
+  assert.equal(computeGeminiBackoffDelayMs(0, () => 0), 1200);
+  assert.equal(computeGeminiBackoffDelayMs(1, () => 0.5), 2950);
+  assert.equal(computeGeminiBackoffDelayMs(2, () => 1), 5200);
+
+  const bigParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+  for (let i = 0; i < 16; i++) {
+    bigParts.push({ text: `[Visual Scene Frame at 00:${String(i).padStart(2, '0')} (${i * 1000}ms)]` });
+    bigParts.push({ inlineData: { mimeType: 'image/jpeg', data: `img_${i}` } });
+  }
+  bigParts.push({ inlineData: { mimeType: 'audio/mp3', data: 'a'.repeat(1_000_000) } });
+  bigParts.push({ text: 'FINAL RECAP PROMPT' });
+
+  const compacted = compactMultimodalPartsForOverloadRetry(bigParts, {
+    maxFrames: 4,
+    dropLargeAudioWhenTranscriptPresent: true,
+    hasTranscript: true
+  });
+  const keptImages = compacted.filter((p) => p.inlineData?.mimeType === 'image/jpeg');
+  assert.equal(keptImages.length, 4);
+  assert.equal(keptImages[0].inlineData?.data, 'img_0');
+  assert.equal(keptImages[3].inlineData?.data, 'img_15');
+  assert.equal(
+    compacted.some((p) => p.inlineData?.mimeType === 'audio/mp3'),
+    false
+  );
+  assert.equal(compacted[compacted.length - 1].text, 'FINAL RECAP PROMPT');
 });
 
 test('Translate & STT dialogue helpers preserve silent gaps, parse Whisper lines, enforce cinematic prompts, and match export jobIds', () => {

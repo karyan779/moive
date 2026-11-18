@@ -582,8 +582,19 @@ export function getVoicePreviewSampleText(
   return `Hello, I am the ${shortName} voice.`;
 }
 
-export type ScriptAiModelId = 'gemini-3-flash-preview' | 'gemini-3.1-pro-preview' | 'gemini-2.5-flash';
-export type TtsEngineId = 'edge-neural' | 'gemini-2.5-flash-preview-tts';
+export type ScriptAiModelId =
+  | 'gemini-3.8-flash'
+  | 'gemini-4-hydrogen'
+  | 'gemini-3.1-flash-lite'
+  | 'gemini-4-argon'
+  | 'gemini-3-flash-preview'
+  | 'gemini-3.1-pro-preview'
+  | 'gemini-2.5-flash';
+export type TtsEngineId =
+  | 'edge-neural'
+  | 'gemini-3.8-flash-lite-tts'
+  | 'gemini-3.8-flash-tts'
+  | 'gemini-2.5-flash-preview-tts';
 export type SttEngineId = 'whisper-large-v3-turbo' | 'whisper-large-v3' | 'gemini-audio-stt';
 
 export interface ApiEngineSettingsConfig {
@@ -595,7 +606,7 @@ export interface ApiEngineSettingsConfig {
 }
 
 export const DEFAULT_API_ENGINE_CONFIG: ApiEngineSettingsConfig = {
-  scriptModel: 'gemini-3-flash-preview',
+  scriptModel: 'gemini-4-hydrogen',
   ttsEngine: 'edge-neural',
   sttModel: 'whisper-large-v3-turbo',
   breathPauseMs: 100,
@@ -604,22 +615,28 @@ export const DEFAULT_API_ENGINE_CONFIG: ApiEngineSettingsConfig = {
 
 export const SCRIPT_AI_MODELS: { id: ScriptAiModelId; label: string; badge: string; desc: string }[] = [
   {
-    id: 'gemini-3-flash-preview',
-    label: 'Gemini 3.1 Flash Lite / 3 Flash (Default · Natural Spoken Myanmar Rewrite)',
+    id: 'gemini-4-hydrogen',
+    label: 'Gemini 4 Hydrogen (Default · Fast Multimodal & Burmese Sync)',
     badge: 'DEFAULT · FAST',
-    desc: 'Natural spoken Myanmar rewrite. Enhanced context comprehension. Default.'
+    desc: 'Recommended Gemini 4 Flash model with high reliability and accurate 1:1 scene alignment.'
   },
   {
-    id: 'gemini-3.1-pro-preview',
-    label: 'Gemini 3.1 Pro Preview (Deep Storytelling & Complex Plot)',
+    id: 'gemini-3.1-flash-lite',
+    label: 'Gemini 3.1 Flash Lite (Ultra-Low Latency Backup)',
+    badge: 'LITE · HIGH SPEED',
+    desc: 'Lightweight high-throughput Flash model ideal for peak traffic hours.'
+  },
+  {
+    id: 'gemini-3.8-flash',
+    label: 'Gemini 3.8 Flash (Natural Spoken Myanmar Rewrite)',
+    badge: 'NATURAL REWRITE',
+    desc: 'Natural spoken Myanmar rewrite with automatic Gemini 4 Hydrogen failover.'
+  },
+  {
+    id: 'gemini-4-argon',
+    label: 'Gemini 4 Argon / Pro (Deep Storytelling & Complex Plot)',
     badge: 'PRO · DEEP',
     desc: 'High-reasoning cinematic storytelling and multi-character nuance'
-  },
-  {
-    id: 'gemini-2.5-flash',
-    label: 'Gemini 2.5 Flash (Flagship Translation & Creative Nuance)',
-    badge: 'BALANCED',
-    desc: 'Flagship translation model for creative nuance and timestamp alignment.'
   }
 ];
 
@@ -631,10 +648,10 @@ export const TTS_ENGINE_OPTIONS: { id: TtsEngineId; label: string; badge: string
     desc: 'Genuine Microsoft Edge ReadAloud Neural Burmese male (Thiha) & female (Nilar) voices'
   },
   {
-    id: 'gemini-2.5-flash-preview-tts',
-    label: 'Gemini 2.5 Flash Preview TTS (Studio Multi-Voice)',
+    id: 'gemini-3.8-flash-lite-tts',
+    label: 'Gemini 3.8 Flash TTS (Studio Multi-Voice)',
     badge: 'STUDIO PRO',
-    desc: 'Direct Gemini 2.5 multimodal speech synthesis (Kore, Aoede, Charon, Fenrir, Orus)'
+    desc: 'Direct Gemini 3.8 multimodal speech synthesis (Kore, Aoede, Charon, Fenrir, Orus)'
   }
 ];
 
@@ -3183,20 +3200,115 @@ export function isTransientModelOverloadError(err: unknown): boolean {
 }
 
 /**
- * Resolves ordered Gemini script model candidates so transient 503 demand spikes on
- * preview models (like `gemini-3-flash-preview`) automatically fall back to stable models.
+ * Computes bounded exponential backoff with jitter (in ms) for transient 503 High Demand retries.
+ */
+export function computeGeminiBackoffDelayMs(
+  waveIndex: number,
+  randomFn: () => number = Math.random
+): number {
+  const safeWave = Math.max(0, Math.min(4, Math.floor(waveIndex)));
+  const baseMs = safeWave === 0 ? 1200 : safeWave === 1 ? 2600 : 4500;
+  const jitterMs = Math.round(Math.max(0, Math.min(1, randomFn())) * 700);
+  return baseMs + jitterMs;
+}
+
+/**
+ * Compresses a multimodal Gemini parts payload during transient 503 High Demand / timeout spikes:
+ * - Downsamples `[Visual Scene Frame ...]` + image pairs evenly while preserving the first and climax frame.
+ * - Drops >900KB inline audio blobs only if timestamped STT transcript text is already present.
+ * - Preserves the final text prompt intact.
+ */
+export function compactMultimodalPartsForOverloadRetry<
+  T extends { text?: string; inlineData?: { mimeType: string; data: string } }
+>(
+  parts: T[],
+  opts: {
+    maxFrames?: number;
+    dropLargeAudioWhenTranscriptPresent?: boolean;
+    hasTranscript?: boolean;
+  } = {}
+): T[] {
+  const maxFrames = Math.max(2, opts.maxFrames ?? 8);
+  const dropLargeAudio = Boolean(opts.dropLargeAudioWhenTranscriptPresent && opts.hasTranscript);
+
+  interface FramePair {
+    labelPart: T | null;
+    imagePart: T;
+  }
+  const framePairs: FramePair[] = [];
+  const nonFrameParts: T[] = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    const cur = parts[i];
+    const next = i + 1 < parts.length ? parts[i + 1] : null;
+    if (
+      typeof cur.text === 'string' &&
+      cur.text.startsWith('[Visual Scene Frame') &&
+      next?.inlineData?.mimeType?.startsWith('image/')
+    ) {
+      framePairs.push({ labelPart: cur, imagePart: next });
+      i++;
+      continue;
+    }
+    if (cur.inlineData?.mimeType?.startsWith('image/')) {
+      framePairs.push({ labelPart: null, imagePart: cur });
+      continue;
+    }
+    if (cur.inlineData?.mimeType?.startsWith('audio/')) {
+      if (dropLargeAudio && cur.inlineData.data.length > 900_000) {
+        continue;
+      }
+      nonFrameParts.push(cur);
+      continue;
+    }
+    nonFrameParts.push(cur);
+  }
+
+  let selectedFrames = framePairs;
+  if (framePairs.length > maxFrames) {
+    const picked: FramePair[] = [];
+    const pickedIndices = new Set<number>();
+    for (let k = 0; k < maxFrames; k++) {
+      const idx = Math.min(
+        framePairs.length - 1,
+        Math.round((k * (framePairs.length - 1)) / Math.max(1, maxFrames - 1))
+      );
+      if (!pickedIndices.has(idx)) {
+        pickedIndices.add(idx);
+        picked.push(framePairs[idx]);
+      }
+    }
+    selectedFrames = picked;
+  }
+
+  const out: T[] = [];
+  for (const fp of selectedFrames) {
+    if (fp.labelPart) out.push(fp.labelPart);
+    out.push(fp.imagePart);
+  }
+  out.push(...nonFrameParts);
+  return out;
+}
+
+/**
+ * Resolves ordered Gemini script model candidates so deprecated models (e.g. `gemini-2.5-flash`)
+ * or 404/503 preview models automatically upgrade and fall back to active Gemini 4 / 3.1 Flash Lite / 3.8 models.
  */
 export function resolveFallbackScriptModels(primaryModel?: string): ScriptAiModelId[] {
-  const clean = (primaryModel || 'gemini-3-flash-preview').trim() as ScriptAiModelId;
+  const clean = (primaryModel || 'gemini-4-hydrogen').trim() as ScriptAiModelId;
   const presets: Record<string, ScriptAiModelId[]> = {
-    'gemini-3-flash-preview': ['gemini-3-flash-preview', 'gemini-2.5-flash'],
-    'gemini-3.1-pro-preview': ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash'],
-    'gemini-2.5-flash': ['gemini-2.5-flash', 'gemini-3-flash-preview']
+    'gemini-4-hydrogen': ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'],
+    'gemini-3.1-flash-lite': ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-3.8-flash'],
+    'gemini-3.8-flash': ['gemini-3.8-flash', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+    'gemini-4-argon': ['gemini-4-argon', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+    'gemini-3-flash-preview': ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'],
+    'gemini-2.5-flash': ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'],
+    'gemini-3.1-pro-preview': ['gemini-4-argon', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite']
   };
   if (presets[clean]) {
     return presets[clean];
   }
-  const defaults: ScriptAiModelId[] = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+  const defaults: ScriptAiModelId[] = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
   return [clean, ...defaults.filter((m) => m !== clean)];
 }
 
