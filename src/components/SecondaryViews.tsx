@@ -595,7 +595,7 @@ export const SttStudioView: React.FC<{
                   }`}
                 >
                   <span className="block">Original Speech STT</span>
-                  <span className="text-[10px] font-mono text-teal-600 dark:text-teal-400">1 Credit / Minute</span>
+                  <span className="text-[10px] font-mono tabular-nums text-teal-600 dark:text-teal-400">1 Credit / 1:10 (70s)</span>
                 </button>
                 <button
                   type="button"
@@ -610,7 +610,7 @@ export const SttStudioView: React.FC<{
                   }`}
                 >
                   <span className="block">STT + AI Translation</span>
-                  <span className="text-[10px] font-mono text-amber-600 dark:text-amber-400">2 Credits / Minute</span>
+                  <span className="text-[10px] font-mono tabular-nums text-amber-600 dark:text-amber-400">1 Credit / 1:10 (70s)</span>
                 </button>
               </div>
             </div>
@@ -802,10 +802,10 @@ export const WalletView: React.FC<{
             </span>
           </div>
           <h2 className="text-xl font-extrabold text-stone-900 dark:text-slate-100 mt-0.5 tabular-nums">
-            {proCredits} Pro Credits Available (~{proCredits} Minutes of Video)
+            {proCredits} Pro Credits Available (~{Math.round((proCredits * 70) / 60)} Minutes of Video)
           </h2>
           <p className="text-xs text-stone-500 dark:text-slate-400">
-            1 Credit = 1 Minute (Standard Recap / STT) · Plus 3 Free Videos/Day (Max 2:30m each) in Free Mode
+            1 Credit = 1:10 Min (70s) across all Credit Studios &amp; STT · Plus 5 Free Videos/Day (Max 2:30m each) in Free Mode
           </p>
         </div>
 
@@ -1125,13 +1125,13 @@ export const WalletView: React.FC<{
 
             <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] p-4 space-y-2">
               <p className="font-bold text-amber-700 dark:text-amber-300">
-                2. Credit Mode (Pro Studio — 1 Credit = 1 Minute)
+                2. Credit Mode (All Studios — 1 Credit = 1:10 / 70s)
               </p>
               <ul className="space-y-1 text-stone-600 dark:text-slate-300">
-                <li>• Standard Burmese TTS (Thiha / Nilar): <strong>1 Credit = 1 မိနစ်</strong></li>
-                <li>• Gemini Studio Pro Voices (အသံအစုံ ၁၀ မျိုး): <strong>2 Credits = 1 မိနစ်</strong></li>
-                <li>• Auto Subtitles (STT): <strong>1 Cr/min</strong> (Original) · <strong>2 Cr/min</strong> (Translated)</li>
-                <li>• Creator Pro Max Plan တွင် STT အတွက် <strong>15% Credit Discount</strong> ရရှိမည်</li>
+                <li>• Credit Studio (Recap &amp; Translate): <strong>1 Credit = 1:10 မိနစ် (70s)</strong> (0:01–1:10 = 1 Cr, 1:11–2:20 = 2 Cr)</li>
+                <li>• AI Voice အသံအစုံ ၁၀ မျိုး (Thiha, Nilar + Gemini Studio Voices): <strong>1 Credit = 1:10 မိနစ်</strong> တစ်ပြေးညီ</li>
+                <li>• Auto Subtitles (STT) &amp; Long-Form Studio: <strong>1 Credit = 1:10 မိနစ် (70s)</strong></li>
+                <li>• FHD 1080p Export &amp; Anti-Copyright Effects များအားလုံး ပါဝင်သည်</li>
               </ul>
             </div>
           </div>
@@ -1756,13 +1756,18 @@ export const SettingsView: React.FC<{ userEmail?: string }> = () => {
         playUiSound('success');
         setGeminiTestMsg({
           ok: true,
-          text: `✓ Google AI Studio Connected (${data.latencyMs}ms)`
+          text:
+            data.geminiMessage ||
+            `✓ Google AI Studio Connected (${data.latencyMs}ms)`
         });
       } else {
         playUiSound('blocked');
         setGeminiTestMsg({
           ok: false,
-          text: data.geminiError || '✕ Google AI Studio Key မမှန်ကန်ပါ'
+          text:
+            data.geminiError ||
+            data.geminiMessage ||
+            '✕ Google AI Studio Key မမှန်ကန်ပါ'
         });
       }
     } catch {
@@ -1936,7 +1941,7 @@ export const SettingsView: React.FC<{ userEmail?: string }> = () => {
                 type={showGeminiKey ? 'text' : 'password'}
                 value={geminiInput}
                 onChange={(e) => setGeminiInput(e.target.value)}
-                placeholder="AIzaSy... (Gemini API Key ထည့်ပါ)"
+                placeholder="AIzaSy... သို့မဟုတ် AQ... (Gemini API Key ထည့်ပါ)"
                 className="w-full h-11 rounded-xl border border-stone-200 dark:border-slate-700/80 bg-[#FAF8F4] dark:bg-[#151C26] pl-4 pr-11 text-xs font-mono text-stone-900 dark:text-slate-100 outline-none focus:border-amber-500"
               />
               <button
@@ -1994,7 +1999,7 @@ export const SettingsView: React.FC<{ userEmail?: string }> = () => {
         {geminiTestMsg && (
           <p
             data-testid="settings-gemini-test-msg"
-            className={`text-xs font-semibold pt-0.5 ${
+            className={`text-xs font-semibold pt-0.5 leading-relaxed break-words ${
               geminiTestMsg.ok
                 ? 'text-teal-600 dark:text-teal-400'
                 : 'text-red-500'

@@ -437,6 +437,66 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     samplePreviewLight: false
   });
   const [isTranslatingSubtitles, setIsTranslatingSubtitles] = useState<boolean>(false);
+  const [subtitleTranslateError, setSubtitleTranslateError] = useState<string | null>(null);
+  const subtitleTranslateSeqRef = useRef<number>(0);
+
+  const handleChangeSubtitleLanguage = async (nextSubLang: TargetLanguageCode) => {
+    playUiSound('select');
+    setSubtitleTranslateError(null);
+    setSubtitleConfig((prev) => ({
+      ...prev,
+      subtitleLanguage: nextSubLang
+    }));
+    if (cues.length === 0) return;
+
+    const reqSeq = ++subtitleTranslateSeqRef.current;
+    setIsTranslatingSubtitles(true);
+    try {
+      const freeUserKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
+      const resp = await fetch('/api/recap/translate-subtitles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cues,
+          subtitleLanguage: nextSubLang,
+          sourceLanguage: targetLanguage,
+          isFreeMode: isFreeTier,
+          userGeminiApiKey: isFreeTier && freeUserKeys.geminiKey ? freeUserKeys.geminiKey : undefined,
+          userGroqApiKey: isFreeTier && freeUserKeys.groqKey ? freeUserKeys.groqKey : undefined
+        })
+      });
+      const data = await resp.json();
+      if (reqSeq !== subtitleTranslateSeqRef.current) return;
+      if (data?.ok && Array.isArray(data.cues)) {
+        setCues(data.cues);
+        if (nextSubLang !== 'my' && typeof data.translatedCount === 'number' && data.translatedCount === 0) {
+          setSubtitleTranslateError(
+            uiLang === 'my'
+              ? 'ဘာသာပြန်မှု ခေတ္တမအောင်မြင်ပါ။ ထပ်မံနှိပ်ကြည့်ပါ။'
+              : 'Subtitle translation temporarily unavailable. Please tap again to retry.'
+          );
+        }
+      } else {
+        setSubtitleTranslateError(
+          data?.error ||
+            (uiLang === 'my'
+              ? 'စာတန်းထိုး ဘာသာပြန်မှု မအောင်မြင်ပါ။ ထပ်မံကြိုးစားကြည့်ပါ။'
+              : 'Failed to translate subtitles. Please retry.')
+        );
+      }
+    } catch {
+      if (reqSeq !== subtitleTranslateSeqRef.current) return;
+      setSubtitleTranslateError(
+        uiLang === 'my'
+          ? 'Network ချိတ်ဆက်မှု အဆင်မပြေပါ။ ထပ်မံနှိပ်ကြည့်ပါ။'
+          : 'Network error while translating subtitles. Please retry.'
+      );
+    } finally {
+      if (reqSeq === subtitleTranslateSeqRef.current) {
+        setIsTranslatingSubtitles(false);
+      }
+    }
+  };
 
   // Anti-Copyright / Edit Effects State:
   // In Credit Mode, ONLY FHD 1080p is ON by default; Dynamic zoom, Mirror flip, Color shift, Slight crop, Film grain, Audio pitch start OFF until user enables them.
@@ -1224,6 +1284,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     try {
       // 1. Re-burn MP4 asynchronously on server with polling (or return cached <5ms MP4)
       if (lastJobId) {
+        const exportFreeKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
         const exportRes = await fetch('/api/recap/render-export', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1241,7 +1302,11 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             effects,
             aspectRatio,
             editConfig: effectiveEditConfig,
-            isFreeMode: isFreeTier
+            isFreeMode: isFreeTier,
+            userGeminiApiKey:
+              isFreeTier && exportFreeKeys.geminiKey ? exportFreeKeys.geminiKey : undefined,
+            userGroqApiKey:
+              isFreeTier && exportFreeKeys.groqKey ? exportFreeKeys.groqKey : undefined
           })
         });
         const exportRaw = await exportRes.text();
@@ -2173,12 +2238,18 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           }}
                           className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                         >
-                          <option value="narrator">Fast Recap</option>
-                          <option value="drama">Storytelling</option>
-                          <option value="casual">Gen Z</option>
-                          <option value="news">News</option>
-                          <option value="none">Documentary</option>
+                          <option value="narrator">Fast Recap (အမြန်ဆွဲဆောင် ပြောဟန်)</option>
+                          <option value="natural">Natural Flow (သဘာဝ အပြောဟန်)</option>
+                          <option value="drama">Storytelling (ရုပ်ရှင်ဇာတ်လမ်း ပြောဟန်)</option>
+                          <option value="casual">Gen Z (လူငယ်ဆန်ဆန် သွက်လက်ပြောဟန်)</option>
+                          <option value="news">News (သတင်းကြေညာ တင်ဆက်ဟန်)</option>
+                          <option value="none">Documentary (မှတ်တမ်းရုပ်ရှင် လေးနက်ပြောဟန်)</option>
                         </select>
+                        {SCRIPT_STYLE_PROMPTS[scriptStyle]?.descriptionMy && (
+                          <p className="text-[11px] leading-relaxed text-stone-500 dark:text-slate-400">
+                            {SCRIPT_STYLE_PROMPTS[scriptStyle].descriptionMy}
+                          </p>
+                        )}
                       </div>
                     ) : (
                       <div
@@ -2283,9 +2354,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">
                             {isTranslatingSubtitles
                               ? 'Translating...'
-                              : (subtitleConfig.subtitleLanguage || 'my') === 'my'
-                                ? 'MYANMAR SUB'
-                                : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · MY VOICE`}
+                              : (subtitleConfig.subtitleLanguage || 'my') === targetLanguage
+                                ? `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB`
+                                : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · ${targetLanguage.toUpperCase()} VOICE`}
                           </span>
                         </div>
 
@@ -2294,41 +2365,17 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           aria-label="Subtitle display language"
                           value={subtitleConfig.subtitleLanguage || 'my'}
                           disabled={isTranslatingSubtitles}
-                          onChange={async (e) => {
-                            playUiSound('select');
-                            const nextSubLang = e.target.value as TargetLanguageCode;
-                            setSubtitleConfig((prev) => ({
-                              ...prev,
-                              subtitleLanguage: nextSubLang
-                            }));
-                            if (cues.length > 0) {
-                              setIsTranslatingSubtitles(true);
-                              try {
-                                const resp = await fetch('/api/recap/translate-subtitles', {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({
-                                    cues,
-                                    subtitleLanguage: nextSubLang,
-                                    isFreeMode: isFreeTier
-                                  })
-                                });
-                                const data = await resp.json();
-                                if (data?.ok && Array.isArray(data.cues)) {
-                                  setCues(data.cues);
-                                }
-                              } catch {}
-                              setIsTranslatingSubtitles(false);
-                            }
+                          onChange={(e) => {
+                            void handleChangeSubtitleLanguage(e.target.value as TargetLanguageCode);
                           }}
                           className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                         >
                           {TARGET_LANGUAGES.map((langOpt) => (
                             <option key={langOpt.code} value={langOpt.code}>
                               {langOpt.flag} {langOpt.labelEn}{' '}
-                              {langOpt.code === 'my'
-                                ? '(Default Burmese Sub)'
-                                : '(Translated Sub · Burmese Voice)'}
+                              {langOpt.code === targetLanguage
+                                ? '(Matches Voice Language)'
+                                : '(Translated Subtitles)'}
                             </option>
                           ))}
                         </select>
@@ -2344,32 +2391,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                                 type="button"
                                 data-testid={`subtitle-lang-chip-${langOpt.code}`}
                                 disabled={isTranslatingSubtitles}
-                                onClick={async () => {
-                                  playUiSound('select');
-                                  const nextSubLang = langOpt.code;
-                                  setSubtitleConfig((prev) => ({
-                                    ...prev,
-                                    subtitleLanguage: nextSubLang
-                                  }));
-                                  if (cues.length > 0) {
-                                    setIsTranslatingSubtitles(true);
-                                    try {
-                                      const resp = await fetch('/api/recap/translate-subtitles', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                          cues,
-                                          subtitleLanguage: nextSubLang,
-                                          isFreeMode: isFreeTier
-                                        })
-                                      });
-                                      const data = await resp.json();
-                                      if (data?.ok && Array.isArray(data.cues)) {
-                                        setCues(data.cues);
-                                      }
-                                    } catch {}
-                                    setIsTranslatingSubtitles(false);
-                                  }
+                                onClick={() => {
+                                  void handleChangeSubtitleLanguage(langOpt.code);
                                 }}
                                 className={`flex items-center justify-center gap-1.5 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
                                   isSelected
@@ -2384,9 +2407,21 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           })}
                         </div>
 
-                        {(subtitleConfig.subtitleLanguage || 'my') !== 'my' && (
+                        {subtitleTranslateError && (
+                          <p
+                            data-testid="subtitle-translate-error"
+                            className="text-[11px] leading-relaxed text-rose-600 dark:text-rose-400"
+                          >
+                            {subtitleTranslateError}
+                          </p>
+                        )}
+
+                        {(subtitleConfig.subtitleLanguage || 'my') !== targetLanguage && (
                           <p className="text-[11px] leading-relaxed text-teal-700 dark:text-teal-400">
-                            ✓ Voiceover audio stays Burmese while on-screen subtitles translate to{' '}
+                            ✓ Voiceover stays{' '}
+                            {TARGET_LANGUAGES.find((l) => l.code === targetLanguage)?.labelEn ||
+                              targetLanguage}{' '}
+                            while on-screen & exported subtitles translate to{' '}
                             {TARGET_LANGUAGES.find((l) => l.code === subtitleConfig.subtitleLanguage)?.labelEn ||
                               subtitleConfig.subtitleLanguage}
                             .
@@ -3507,8 +3542,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                         ? `Free Mode: တစ်ရက် ${freeLimit} ပုဒ် · ဗီဒီယို ၁ ပုဒ် အများဆုံး 2:30 မိနစ် (150s)`
                         : `Free Mode: ${freeLimit} videos/day · Max 2:30 mins (150s) per video`
                       : uiLang === 'my'
-                        ? `Credit Mode: 1 Credit = 1 မိနစ် · FHD 1080p & AI အသံအစုံ ၁၀ မျိုး`
-                        : `Credit Mode: 1 Credit = 1 Min · FHD 1080p & All 10 AI Voices`}
+                        ? `Credit Mode: 1 Credit = 1:10 မိနစ် (70s) · FHD 1080p & AI အသံအစုံ ၁၀ မျိုး`
+                        : `Credit Mode: 1 Credit = 1:10 (70s) · FHD 1080p & All 10 AI Voices`}
                   </p>
                 </div>
               ) : (
@@ -3631,13 +3666,22 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     type="button"
                     data-testid="open-thumbnail-studio-btn"
                     onClick={() => {
-                      playUiSound('tap');
+                      playUiSound(isFreeTier ? 'blocked' : 'tap');
                       setIsThumbnailStudioOpen(true);
                     }}
-                    className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-amber-500/45 bg-amber-500/12 px-4 text-xs font-bold text-amber-700 shadow-2xs transition-all hover:bg-amber-500/20 active:scale-95 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25"
+                    className={`inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border px-4 text-xs font-bold shadow-2xs transition-all active:scale-95 ${
+                      isFreeTier
+                        ? 'border-stone-300/80 bg-stone-100/90 text-stone-600 hover:border-amber-500/50 hover:text-amber-700 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-300 dark:hover:border-amber-500/45 dark:hover:text-amber-300'
+                        : 'border-amber-500/45 bg-amber-500/12 text-amber-700 hover:bg-amber-500/20 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25'
+                    }`}
                   >
-                    <ImageIcon className="size-3.5" />
+                    {isFreeTier ? <Lock className="size-3.5 text-amber-500" /> : <ImageIcon className="size-3.5" />}
                     <span>{uiLang === 'my' ? 'Title & Thumbnail 3ပုံ' : 'Title & 3 Thumbnails'}</span>
+                    {isFreeTier && (
+                      <span className="rounded-md bg-amber-500/18 px-1.5 py-0.5 text-[9px] font-extrabold text-amber-600 dark:text-amber-300">
+                        Credit
+                      </span>
+                    )}
                   </button>
 
                   <button
@@ -3835,13 +3879,28 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   type="button"
                   data-testid="mobile-open-thumbnail-studio-btn"
                   onClick={() => {
-                    playUiSound('tap');
+                    playUiSound(isFreeTier ? 'blocked' : 'tap');
                     setIsThumbnailStudioOpen(true);
                   }}
-                  className="flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-amber-500/45 bg-amber-500/15 px-3 text-xs font-bold text-amber-800 shadow-xs transition-all select-none hover:bg-amber-500/25 active:scale-95 dark:border-amber-500/40 dark:bg-amber-500/18 dark:text-amber-200"
+                  className={`flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-xl border px-3 text-xs font-bold shadow-xs transition-all select-none active:scale-95 ${
+                    isFreeTier
+                      ? 'border-stone-300/80 bg-stone-100/90 text-stone-700 hover:border-amber-500/50 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-300'
+                      : 'border-amber-500/45 bg-amber-500/15 text-amber-800 hover:bg-amber-500/25 dark:border-amber-500/40 dark:bg-amber-500/18 dark:text-amber-200'
+                  }`}
                 >
-                  <ImageIcon className="size-4 shrink-0" />
-                  <span>{uiLang === 'my' ? 'ခေါင်းစဉ် Auto & Thumbnail 3 ပုံထုတ်မည်' : 'Auto Title & 3 Thumbnails'}</span>
+                  {isFreeTier ? (
+                    <Lock className="size-4 shrink-0 text-amber-500" />
+                  ) : (
+                    <ImageIcon className="size-4 shrink-0" />
+                  )}
+                  <span>
+                    {uiLang === 'my' ? 'ခေါင်းစဉ် Auto & Thumbnail 3 ပုံထုတ်မည်' : 'Auto Title & 3 Thumbnails'}
+                  </span>
+                  {isFreeTier && (
+                    <span className="rounded-md bg-amber-500/18 px-1.5 py-0.5 text-[9px] font-extrabold text-amber-600 dark:text-amber-300">
+                      Credit Only
+                    </span>
+                  )}
                 </button>
 
                 <button
@@ -4267,8 +4326,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   : `You've used all ${freeLimit} free recaps for today (max 2:30 minutes each). Upgrade to Starter Pack, Creator Pro, or Creator Pro Max to continue generating immediately.`
                 : limitModalType === 'duration_limit'
                   ? uiLang === 'my'
-                    ? `သင်တင်ထားသော ဗီဒီယိုသည် ${formatDuration(videoDuration)} (${videoDuration}s) ရှိပြီး Free Mode ကန့်သတ်ချက် 2:30 မိနစ် (150s) ထက် ကျော်လွန်နေပါသည်။ Credit Mode တွင် ~${Math.ceil(videoDuration / 60)} Credits ဖြင့် FHD 1080p + AI အသံအစုံဖြင့် ထုတ်ယူနိုင်ပါသည်။`
-                    : `Your video is ${formatDuration(videoDuration)} (${videoDuration}s), which exceeds the 2:30-minute (150s) Free Mode limit. Switch to Credit Studio (~${Math.ceil(videoDuration / 60)} credits) or upgrade your Credit Plan.`
+                    ? `သင်တင်ထားသော ဗီဒီယိုသည် ${formatDuration(videoDuration)} (${videoDuration}s) ရှိပြီး Free Mode ကန့်သတ်ချက် 2:30 မိနစ် (150s) ထက် ကျော်လွန်နေပါသည်။ Credit Mode တွင် ~${calculateCreditCost(videoDuration, false)} Credits (1:10 = 1 Credit) ဖြင့် FHD 1080p + AI အသံအစုံဖြင့် ထုတ်ယူနိုင်ပါသည်။`
+                    : `Your video is ${formatDuration(videoDuration)} (${videoDuration}s), which exceeds the 2:30-minute (150s) Free Mode limit. Switch to Credit Studio (~${calculateCreditCost(videoDuration, false)} credits · 1:10 = 1 Credit) or upgrade your Credit Plan.`
                   : uiLang === 'my'
                     ? `ဤဗီဒီယိုအတွက် ${creditCost} Credits လိုအပ်ပြီး သင့်လက်ကျန်မှာ ${proCredits} Credits ဖြစ်ပါသည်။ Wallet တွင် Plan ဝယ်ယူပါ သို့မဟုတ် Credit ဖြည့်သွင်းပါ။`
                     : `This video requires ${creditCost} credits, and your current balance is ${proCredits} credits. Top up credits or choose a Credit Plan in Wallet.`}
@@ -4339,6 +4398,13 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         channelTag={effectiveEditConfig.watermarkText.enabled ? effectiveEditConfig.watermarkText.text : ''}
         onSelectTitle={(formatted) => {
           setVideoTitle(formatted);
+        }}
+        onSwitchToCreditMode={() => {
+          if (onNavigateToProStudio) {
+            onNavigateToProStudio();
+          } else if (onNavigateToWallet) {
+            onNavigateToWallet();
+          }
         }}
       />
     </div>

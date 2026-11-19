@@ -29,6 +29,7 @@ import {
   type AuthenticatedUserPayload
 } from './components/SecondaryViews';
 import { AdminPanelView } from './components/AdminPanelView';
+import { SiteNotificationBanner } from './components/SiteNotificationBanner';
 import {
   firebaseSignOut,
   waitForCurrentFirebaseUser,
@@ -430,6 +431,7 @@ export default function App() {
   if ((!authUser && currentRoute !== '/admin') || currentRoute === '/') {
     return (
       <>
+        <SiteNotificationBanner uiLang={uiLang} />
         <LandingView
           onNavigate={(r) => {
             if (r === '/admin') {
@@ -456,7 +458,8 @@ export default function App() {
   }
 
   return (
-    <>
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-[#F7F6F2] dark:bg-[#090C10]">
+      <SiteNotificationBanner uiLang={uiLang} />
       <SidebarAndHeader
         currentRoute={currentRoute}
         onNavigate={(r) => handleNavigate(r)}
@@ -553,6 +556,6 @@ export default function App() {
         canDismiss={true}
         onSignInSuccess={handleAuthSuccess}
       />
-    </>
+    </div>
   );
 }

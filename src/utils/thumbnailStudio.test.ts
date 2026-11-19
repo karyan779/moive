@@ -6,13 +6,21 @@ import {
   stripPartSuffixFromTitle,
   formatSeriesTitleWithPart,
   wrapBurmeseHeadlineLines,
+  balancePosterHeadlineLines,
   extractLocalFallbackTitles,
   buildThumbnailImagePromptTemplate,
+  buildGeminiAppQuickPrompt,
   buildCleanPosterArtworkPrompt,
+  buildSceneTransformPosterPrompt,
+  selectBestFramesByIndices,
   normalizeDirectorAnalysisResult,
   buildThumbnailCandidates,
   buildPart2ContinuationCandidates,
   resolveThumbnailDimensions,
+  resolveThumbnailFontOption,
+  resolveThumbnailColorPreset,
+  THUMBNAIL_FONT_OPTIONS,
+  THUMBNAIL_COLOR_PRESETS,
   POSTER_THEME_SPECS,
   type SavedSeriesPreset
 } from './thumbnailStudio';
@@ -42,7 +50,7 @@ test('stripPartSuffixFromTitle and formatSeriesTitleWithPart cleanly transition 
   );
 });
 
-test('wrapBurmeseHeadlineLines never breaks Myanmar combining vowel marks away from consonants', () => {
+test('wrapBurmeseHeadlineLines and balancePosterHeadlineLines create symmetrical poster lockups without splitting marks', () => {
   const headline = 'မထင်မှတ်ထားတဲ့ ဇာတ်သိမ်းပိုင်းမှာ အားလုံးအံ့ဩသွားရတဲ့အဖြစ်';
   const lines = wrapBurmeseHeadlineLines(headline, 18, 3);
   assert.ok(lines.length >= 2 && lines.length <= 3);
@@ -53,6 +61,18 @@ test('wrapBurmeseHeadlineLines never breaks Myanmar combining vowel marks away f
       `Line started with orphan combining mark: "${line}"`
     );
   }
+
+  const balanced = balancePosterHeadlineLines('ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ', false);
+  assert.deepEqual(balanced, ['ကျောကုန်းပေါ်က', 'သွေးစာလုံး ကျိန်စာ']);
+
+  const mmPrompt = buildGeminiAppQuickPrompt({
+    selectedTitle: 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ',
+    partNumber: 1,
+    aspectRatio: '9:16'
+  });
+  assert.ok(mmPrompt.includes('ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ'));
+  assert.ok(mmPrompt.includes('အပိုင်း (၁)'));
+  assert.ok(mmPrompt.includes('9:16'));
 });
 
 test('extractLocalFallbackTitles derives video-matched titles from cues and script without slicing mid-syllable', () => {
@@ -75,21 +95,26 @@ test('buildThumbnailImagePromptTemplate and normalizeDirectorAnalysisResult foll
     partNumber: 1,
     aspectRatio: '9:16'
   });
-  assert.ok(prompt.startsWith('Flat front-facing full-bleed cinematic movie recap poster design for a vertical 9:16 video thumbnail.'));
+  assert.ok(prompt.startsWith('Flat front-facing full-bleed ultra-photorealistic 8K live-action cinematic movie recap poster photograph for a vertical 9:16 video thumbnail'));
   assert.ok(prompt.includes("reading 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ'"));
   assert.ok(prompt.includes("a sleek red badge with the text 'အပိုင်း (၁)'"));
+  assert.ok(prompt.includes('NO cartoon, NO anime, NO illustration'));
   assert.ok(prompt.includes('Do not add any other words, Chinese/English text, watermarks, or borders.'));
 
   const cleanArtPrompt = buildCleanPosterArtworkPrompt({
-    sceneDescriptionEn: 'two rivals standing under storm rain with intense neon rim light',
+    sceneDescriptionEn: 'two rivals standing inside a dimly lit hallway with tense expressions',
     aspectRatio: '9:16',
     styleVariant: 'dark_mystery'
   });
-  assert.ok(cleanArtPrompt.includes('Strictly NO text, NO letters'));
+  assert.ok(cleanArtPrompt.includes('Ultra-photorealistic 8K live-action'));
+  assert.ok(cleanArtPrompt.includes('NO cartoon, NO anime'));
+  assert.ok(cleanArtPrompt.includes('NO text, NO letters'));
 
   const normalized = normalizeDirectorAnalysisResult({
     raw: {
-      original_title: 'Blood Curse Hallway',
+      original_title: '《怨尸》 (Yuàn Shī)',
+      detected_genre_burmese: 'သရဲ / ကျိန်စာ',
+      best_frame_indices: [1, 3, 5, 3],
       summary_burmese: 'ပထမစာကြောင်း။ ဒုတိယစာကြောင်း။',
       suggested_titles: ['ခေါင်းစဉ် ၁', 'ခေါင်းစဉ် ၂', 'ခေါင်းစဉ် ၃', 'ခေါင်းစဉ် ၄', 'ခေါင်းစဉ် ၅'],
       selected_title: 'ခေါင်းစဉ် ၁',
@@ -99,9 +124,46 @@ test('buildThumbnailImagePromptTemplate and normalizeDirectorAnalysisResult foll
     aspectRatio: '9:16'
   });
   assert.equal(normalized.suggested_titles.length, 5);
-  assert.equal(normalized.original_title, 'Blood Curse Hallway');
+  assert.equal(normalized.original_title, '《怨尸》 (Yuàn Shī)');
+  assert.equal(normalized.detected_genre_burmese, 'သရဲ / ကျိန်စာ');
+  assert.deepEqual(normalized.best_frame_indices, [1, 3, 5]);
   assert.ok(normalized.thumbnail_image_prompt.includes("reading 'ခေါင်းစဉ် ၁'"));
   assert.ok(normalized.thumbnail_image_prompt.includes("'အပိုင်း (၂)'"));
+});
+
+test('buildSceneTransformPosterPrompt preserves real video character & selectBestFramesByIndices picks AI hero scenes', () => {
+  const cleanTransform = buildSceneTransformPosterPrompt({
+    sceneDescriptionEn: 'man seen from behind in dark corridor with cracked veins and glowing red characters on his back',
+    aspectRatio: '9:16',
+    styleVariant: 'crimson_corridor',
+    directPromptWithText: false
+  });
+  assert.ok(cleanTransform.includes('attached real live-action video frame as the exact character and scene reference'));
+  assert.ok(cleanTransform.includes('do NOT replace them with a different person'));
+  assert.ok(cleanTransform.includes('NO cartoon, NO anime'));
+  assert.ok(cleanTransform.includes('Strictly NO added text'));
+
+  const directTextTransform = buildSceneTransformPosterPrompt({
+    sceneDescriptionEn: 'man seen from behind in dark corridor with cracked veins',
+    aspectRatio: '9:16',
+    directPromptWithText: true,
+    selectedTitle: 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ',
+    partNumber: 1
+  });
+  assert.ok(directTextTransform.includes("reading 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ'"));
+  assert.ok(directTextTransform.includes("reading 'အပိုင်း (၁)'"));
+
+  const sixFrames = [0, 1, 2, 3, 4, 5].map((i) => ({
+    id: `f-${i}`,
+    label: `Frame ${i}`,
+    timeSec: i * 10,
+    dataUrl: `data:image/jpeg;base64,FRAME_${i}`
+  }));
+  const picked = selectBestFramesByIndices(sixFrames, [2, 5, 1]);
+  assert.equal(picked.length, 3);
+  assert.equal(picked[0].id, 'f-2');
+  assert.equal(picked[1].id, 'f-5');
+  assert.equal(picked[2].id, 'f-1');
 });
 
 test('buildPart2ContinuationCandidates preserves Part 1 poster + Title and auto-applies Part 2 across 3 thumbnails', () => {
@@ -159,4 +221,41 @@ test('resolveThumbnailDimensions maps aspect ratios and POSTER_THEME_SPECS defin
     assert.equal(spec.gradientStops.length, 4);
     assert.ok(spec.glowColor.length > 0);
   });
+});
+
+test('THUMBNAIL_FONT_OPTIONS (4 fonts) and THUMBNAIL_COLOR_PRESETS (6 3D colors) resolve cleanly and persist into Part 2', () => {
+  assert.equal(THUMBNAIL_FONT_OPTIONS.length, 4);
+  assert.equal(THUMBNAIL_COLOR_PRESETS.length, 6);
+
+  assert.equal(resolveThumbnailFontOption('noto_serif').id, 'noto_serif');
+  assert.equal(resolveThumbnailFontOption('unknown_font').id, 'noto_sans');
+  assert.equal(resolveThumbnailColorPreset('electric_cyan').id, 'electric_cyan');
+  assert.equal(resolveThumbnailColorPreset('unknown_color').id, 'molten_gold');
+
+  for (const preset of THUMBNAIL_COLOR_PRESETS) {
+    assert.equal(preset.gradientStops.length, 4);
+    assert.ok(preset.swatchCss.includes('linear-gradient'));
+    assert.ok(preset.outlineColor.startsWith('#'));
+  }
+
+  const savedPart1: SavedSeriesPreset = {
+    id: 'series_styled',
+    baseTitle: 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ',
+    partNumber: 1,
+    layoutId: 'poster_gold_3d',
+    titleFontId: 'noto_serif',
+    titleColorId: 'inferno_crimson',
+    frameDataUrl: 'data:image/jpeg;base64,PART1_IMG',
+    aspectRatio: '9:16',
+    savedAt: Date.now()
+  };
+
+  const part2 = buildPart2ContinuationCandidates({
+    preset: savedPart1,
+    currentVideoFrames: [
+      { id: 'f1', label: 'Hero', timeSec: 5, dataUrl: 'data:image/jpeg;base64,F1' }
+    ]
+  });
+  assert.equal(part2.titleFontId, 'noto_serif');
+  assert.equal(part2.titleColorId, 'inferno_crimson');
 });

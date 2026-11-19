@@ -16,24 +16,37 @@ import {
   Wand2,
   ChevronDown,
   ChevronUp,
-  AlertCircle
+  AlertCircle,
+  Lock,
+  Crown,
+  Palette,
+  Type as TypeIcon
 } from 'lucide-react';
 import {
   formatPartBadgeLabel,
   formatSeriesTitleWithPart,
   stripPartSuffixFromTitle,
   wrapBurmeseHeadlineLines,
+  balancePosterHeadlineLines,
   extractLocalFallbackTitles,
   buildThumbnailImagePromptTemplate,
+  buildGeminiAppQuickPrompt,
+  selectBestFramesByIndices,
   normalizeDirectorAnalysisResult,
   buildThumbnailCandidates,
   buildPart2ContinuationCandidates,
   resolveThumbnailDimensions,
+  resolveThumbnailFontOption,
+  resolveThumbnailColorPreset,
+  THUMBNAIL_FONT_OPTIONS,
+  THUMBNAIL_COLOR_PRESETS,
   loadSavedSeriesPresets,
   saveSeriesPreset,
   deleteSeriesPreset,
   POSTER_THEME_SPECS,
   type ThumbnailLayoutId,
+  type ThumbnailFontId,
+  type ThumbnailColorPresetId,
   type ThumbnailPartNumber,
   type VideoFrameOption,
   type ThumbnailCandidate,
@@ -65,15 +78,18 @@ interface ThumbnailStudioModalProps {
   targetLanguage: TargetLanguageCode;
   channelTag?: string;
   onSelectTitle?: (formattedTitle: string) => void;
+  onSwitchToCreditMode?: () => void;
 }
 
 /**
- * Grabs 3 distinct crisp frames directly in the browser from a loaded <video> URL.
+ * Grabs up to 6 distinct crisp keyframes directly in the browser from a loaded <video> URL
+ * so Gemini can visually scan the movie clip (title cards, characters, climax) & pick hero scenes.
  * Falls back cleanly if CORS / codec blocks canvas extraction.
  */
 async function grabClientVideoFrames(
   srcUrl: string,
-  durationSec: number
+  durationSec: number,
+  count = 6
 ): Promise<VideoFrameOption[]> {
   if (!srcUrl || typeof document === 'undefined') return [];
   return new Promise((resolve) => {
@@ -104,7 +120,7 @@ async function grabClientVideoFrames(
         cleanup();
         resolve([]);
       }
-    }, 4000);
+    }, 6500);
 
     const cleanup = () => {
       window.clearTimeout(timeoutId);
@@ -131,20 +147,29 @@ async function grabClientVideoFrames(
           4,
           Number.isFinite(video.duration) && video.duration > 1 ? video.duration : durationSec || 20
         );
-        const targetTimes = [
-          Math.max(0.25, dur * 0.16),
-          Math.max(0.5, dur * 0.5),
-          Math.max(0.8, dur * 0.82)
-        ];
-        const labels = ['Opening Hook', 'Turning Point', 'Climax Scene'];
+        const safeCount = count >= 6 ? 6 : 3;
+        const fracs =
+          safeCount >= 6 ? [0.06, 0.18, 0.34, 0.52, 0.7, 0.86] : [0.16, 0.5, 0.82];
+        const labels =
+          safeCount >= 6
+            ? [
+                'Opening Title',
+                'Hero Hook',
+                'Early Drama',
+                'Turning Point',
+                'High Tension',
+                'Climax Scene'
+              ]
+            : ['Opening Hook', 'Turning Point', 'Climax Scene'];
+        const targetTimes = fracs.map((f) => Math.max(0.25, dur * f));
         const results: VideoFrameOption[] = [];
 
         const canvas = document.createElement('canvas');
-        const targetW = 640;
+        const targetW = 540;
         const aspect =
           video.videoWidth && video.videoHeight ? video.videoHeight / video.videoWidth : 16 / 9;
         canvas.width = targetW;
-        canvas.height = Math.max(320, Math.round(targetW * aspect));
+        canvas.height = Math.max(280, Math.round(targetW * aspect));
         const ctx = canvas.getContext('2d');
         if (!ctx) {
           settled = true;
@@ -162,7 +187,7 @@ async function grabClientVideoFrames(
                 doneSeek = true;
                 seekResolve();
               }
-            }, 2200);
+            }, 1400);
             video.onseeked = () => {
               if (!doneSeek) {
                 doneSeek = true;
@@ -172,16 +197,16 @@ async function grabClientVideoFrames(
             };
             video.currentTime = ts;
           });
-          // Wait one animation frame for Chromium video decoder surface to update
-          await new Promise((r) => window.setTimeout(r, 80));
+          // Wait briefly for Chromium video decoder surface to update
+          await new Promise((r) => window.setTimeout(r, 65));
 
           try {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.84);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
             if (dataUrl && dataUrl.length > 500) {
               results.push({
                 id: `cli-frame-${i + 1}`,
-                label: labels[i],
+                label: labels[i] || `Scene ${i + 1}`,
                 timeSec: Math.round(ts),
                 dataUrl
               });
@@ -248,7 +273,8 @@ function buildAtmosphericPosterBackdrop(variantIdx: number): string {
 }
 
 /**
- * Draws an ornate pointed-end crimson-red & gold Movie Poster plaque (`အပိုင်း (၁)` / `အပိုင်း (၂)`).
+ * Draws an ornate scalloped crimson-red & double-gold Movie Poster plaque (`အပိုင်း (၁)` / `အပိုင်း (၂)`)
+ * styled after theatrical Burmese movie recap posters.
  */
 function drawCrimsonGoldPlaque(
   ctx: CanvasRenderingContext2D,
@@ -260,42 +286,65 @@ function drawCrimsonGoldPlaque(
 ): number {
   ctx.font = `800 ${fontSize}px ${fontFamily}`;
   const metrics = ctx.measureText(text);
-  const pillPadX = Math.round(fontSize * 1.25);
+  const pillPadX = Math.round(fontSize * 1.38);
   const pillW = Math.round(metrics.width + pillPadX * 2);
-  const pillH = Math.round(fontSize * 1.88);
+  const pillH = Math.round(fontSize * 1.94);
   const pillX = Math.round(centerX - pillW / 2);
   const pillY = Math.round(topY);
-  const notch = Math.round(pillH * 0.28);
+  const notch = Math.round(pillH * 0.3);
+
+  const traceScallopedPlaque = (x: number, y: number, w: number, h: number, n: number) => {
+    ctx.beginPath();
+    ctx.moveTo(x + n, y);
+    ctx.lineTo(x + w - n, y);
+    ctx.quadraticCurveTo(x + w - n * 0.35, y + h * 0.22, x + w, y + h * 0.5);
+    ctx.quadraticCurveTo(x + w - n * 0.35, y + h * 0.78, x + w - n, y + h);
+    ctx.lineTo(x + n, y + h);
+    ctx.quadraticCurveTo(x + n * 0.35, y + h * 0.78, x, y + h * 0.5);
+    ctx.quadraticCurveTo(x + n * 0.35, y + h * 0.22, x + n, y);
+    ctx.closePath();
+  };
 
   ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,0.82)';
-  ctx.shadowBlur = Math.max(8, Math.round(pillH * 0.4));
+  ctx.shadowColor = 'rgba(0,0,0,0.88)';
+  ctx.shadowBlur = Math.max(10, Math.round(pillH * 0.45));
+  ctx.shadowOffsetY = Math.max(2, Math.round(pillH * 0.08));
 
-  ctx.beginPath();
-  ctx.moveTo(pillX + notch, pillY);
-  ctx.lineTo(pillX + pillW - notch, pillY);
-  ctx.quadraticCurveTo(pillX + pillW, pillY + pillH * 0.5, pillX + pillW - notch, pillY + pillH);
-  ctx.lineTo(pillX + notch, pillY + pillH);
-  ctx.quadraticCurveTo(pillX, pillY + pillH * 0.5, pillX + notch, pillY);
-  ctx.closePath();
+  traceScallopedPlaque(pillX, pillY, pillW, pillH, notch);
 
   const redGrad = ctx.createLinearGradient(pillX, pillY, pillX, pillY + pillH);
-  redGrad.addColorStop(0, '#7f1d1d');
-  redGrad.addColorStop(0.48, '#dc2626');
+  redGrad.addColorStop(0, '#991b1b');
+  redGrad.addColorStop(0.45, '#dc2626');
+  redGrad.addColorStop(0.82, '#991b1b');
   redGrad.addColorStop(1, '#450a0a');
   ctx.fillStyle = redGrad;
   ctx.fill();
 
-  ctx.lineWidth = Math.max(1.5, Math.round(fontSize * 0.075));
-  ctx.strokeStyle = 'rgba(253, 224, 71, 0.9)';
+  // Outer luminous gold border
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+  ctx.lineWidth = Math.max(1.8, Math.round(fontSize * 0.082));
+  ctx.strokeStyle = '#fde047';
   ctx.stroke();
 
-  // Left & right ornamental gold diamond wings
-  ctx.shadowBlur = 0;
-  const wingR = Math.max(2, Math.round(pillH * 0.1));
-  [pillX + Math.round(notch * 0.58), pillX + pillW - Math.round(notch * 0.58)].forEach((wx) => {
+  // Delicate inner inset gold hairline
+  const inset = Math.max(2.5, Math.round(pillH * 0.1));
+  traceScallopedPlaque(
+    pillX + inset,
+    pillY + inset,
+    pillW - inset * 2,
+    pillH - inset * 2,
+    Math.max(4, notch - inset * 0.6)
+  );
+  ctx.lineWidth = Math.max(1, Math.round(fontSize * 0.032));
+  ctx.strokeStyle = 'rgba(253, 224, 71, 0.52)';
+  ctx.stroke();
+
+  // Left & right ornamental gold diamond pips
+  const wingR = Math.max(2, Math.round(pillH * 0.09));
+  [pillX + Math.round(notch * 0.66), pillX + pillW - Math.round(notch * 0.66)].forEach((wx) => {
     const wy = pillY + pillH / 2;
-    ctx.fillStyle = '#fde047';
+    ctx.fillStyle = '#fef08a';
     ctx.beginPath();
     ctx.moveTo(wx, wy - wingR);
     ctx.lineTo(wx + wingR, wy);
@@ -305,6 +354,10 @@ function drawCrimsonGoldPlaque(
     ctx.fill();
   });
 
+  // Crisp pure white bold badge text with subtle dark depth
+  ctx.shadowColor = 'rgba(0,0,0,0.75)';
+  ctx.shadowBlur = 4;
+  ctx.shadowOffsetY = 1;
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -315,7 +368,7 @@ function drawCrimsonGoldPlaque(
 }
 
 /**
- * Draws floating glowing cinematic embers / atmospheric particles across the poster.
+ * Draws floating glowing cinematic embers & fine glowing sparks across the poster.
  */
 function drawPosterEmbers(
   ctx: CanvasRenderingContext2D,
@@ -325,12 +378,13 @@ function drawPosterEmbers(
 ) {
   // Varied [xRatio, yRatio, radius, angleDeg, elongation]
   const sparkSeeds: Array<[number, number, number, number, number]> = [
-    [0.09, 0.11, 2.4, -28, 3.2], [0.22, 0.24, 1.8, -35, 2.4], [0.85, 0.09, 2.8, 32, 3.4],
-    [0.91, 0.22, 2.0, 24, 2.6], [0.15, 0.39, 1.9, -20, 2.8], [0.79, 0.35, 2.2, 28, 2.9],
-    [0.49, 0.04, 1.6, -12, 2.0], [0.34, 0.29, 1.5, -40, 2.1], [0.69, 0.20, 2.1, 35, 2.5],
-    [0.08, 0.57, 1.8, -25, 2.7], [0.93, 0.51, 2.1, 20, 2.8], [0.13, 0.79, 2.3, -32, 3.1],
-    [0.87, 0.76, 2.4, 30, 3.0], [0.28, 0.87, 1.6, -18, 2.2], [0.73, 0.89, 1.7, 22, 2.3],
-    [0.24, 0.08, 1.4, -30, 1.9], [0.76, 0.14, 1.5, 26, 2.0]
+    [0.09, 0.08, 2.5, -28, 3.3], [0.22, 0.21, 1.9, -35, 2.5], [0.85, 0.08, 2.8, 32, 3.5],
+    [0.91, 0.20, 2.1, 24, 2.7], [0.14, 0.36, 2.0, -20, 2.8], [0.80, 0.33, 2.3, 28, 3.0],
+    [0.49, 0.04, 1.7, -12, 2.1], [0.33, 0.27, 1.6, -40, 2.2], [0.69, 0.18, 2.2, 35, 2.6],
+    [0.08, 0.56, 1.9, -25, 2.7], [0.93, 0.50, 2.2, 20, 2.8], [0.12, 0.78, 2.4, -32, 3.2],
+    [0.88, 0.75, 2.4, 30, 3.0], [0.27, 0.87, 1.6, -18, 2.2], [0.74, 0.89, 1.7, 22, 2.3],
+    [0.24, 0.07, 1.5, -30, 2.0], [0.76, 0.12, 1.6, 26, 2.1], [0.42, 0.14, 1.3, -15, 1.8],
+    [0.58, 0.11, 1.4, 18, 1.9], [0.18, 0.45, 1.4, -22, 2.0], [0.84, 0.44, 1.5, 25, 2.1]
   ];
   const scaleFactor = Math.min(w, h) / 1080;
   sparkSeeds.forEach(([sx, sy, sr, deg, elong]) => {
@@ -344,37 +398,37 @@ function drawPosterEmbers(
     ctx.rotate((deg * Math.PI) / 180);
 
     // Outer fiery halo
-    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx * 1.7);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx * 1.85);
     if (tint === 'crimson_fire') {
-      g.addColorStop(0, 'rgba(254, 240, 138, 0.92)');
-      g.addColorStop(0.38, 'rgba(239, 68, 68, 0.65)');
+      g.addColorStop(0, 'rgba(254, 240, 138, 0.94)');
+      g.addColorStop(0.38, 'rgba(239, 68, 68, 0.68)');
       g.addColorStop(1, 'rgba(220, 38, 38, 0)');
     } else if (tint === 'icy_amber') {
-      g.addColorStop(0, 'rgba(224, 242, 254, 0.92)');
-      g.addColorStop(0.42, 'rgba(251, 191, 36, 0.55)');
+      g.addColorStop(0, 'rgba(224, 242, 254, 0.94)');
+      g.addColorStop(0.42, 'rgba(251, 191, 36, 0.58)');
       g.addColorStop(1, 'rgba(14, 165, 233, 0)');
     } else {
-      g.addColorStop(0, 'rgba(254, 249, 195, 0.95)');
-      g.addColorStop(0.42, 'rgba(249, 115, 22, 0.62)');
+      g.addColorStop(0, 'rgba(254, 249, 195, 0.96)');
+      g.addColorStop(0.4, 'rgba(249, 115, 22, 0.68)');
       g.addColorStop(1, 'rgba(249, 115, 22, 0)');
     }
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.ellipse(0, 0, rx * 1.7, ry * 1.7, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 0, rx * 1.85, ry * 1.85, 0, 0, Math.PI * 2);
     ctx.fill();
 
     // Hot white-gold spark core streak
-    ctx.fillStyle = tint === 'icy_amber' ? 'rgba(240, 249, 255, 0.9)' : 'rgba(254, 249, 195, 0.92)';
+    ctx.fillStyle = tint === 'icy_amber' ? 'rgba(240, 249, 255, 0.92)' : 'rgba(254, 249, 195, 0.95)';
     ctx.beginPath();
-    ctx.ellipse(0, 0, rx * 0.55, ry * 0.45, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 0, rx * 0.56, ry * 0.44, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   });
 }
 
 /**
- * Renders 3D embossed Burmese poster typography onto a Canvas context with thick dark extrude,
- * atmospheric glow, vertical metallic gradient fill, and subtle top gleam.
+ * Renders sculptural multi-layer 3D molten-gold Burmese movie poster typography with stacked dark
+ * depth extrusion, fiery outer glow halo, metallic gradient fill, and subtle top specular gleam.
  */
 function draw3dPosterTextLine(
   ctx: CanvasRenderingContext2D,
@@ -384,32 +438,53 @@ function draw3dPosterTextLine(
   titleSize: number,
   gradientStops: [string, string, string, string],
   outlineColor: string,
-  glowColor: string
+  glowColor: string,
+  baseShadowStop = '#7c2d12',
+  contourColor = '#2a0901'
 ) {
   ctx.save();
   ctx.lineJoin = 'round';
   ctx.miterLimit = 2;
 
-  // 1. Deep 3D extrude + outer atmospheric aura
-  ctx.lineWidth = Math.max(4, Math.round(titleSize * 0.25));
+  // 1. Fiery outer atmospheric glow aura
+  ctx.lineWidth = Math.max(5, Math.round(titleSize * 0.24));
   ctx.strokeStyle = outlineColor;
   ctx.shadowColor = glowColor;
-  ctx.shadowBlur = Math.max(10, Math.round(titleSize * 0.34));
-  ctx.strokeText(line, centerX, y + Math.max(2, Math.round(titleSize * 0.055)));
+  ctx.shadowBlur = Math.max(14, Math.round(titleSize * 0.42));
+  ctx.strokeText(line, centerX, y + Math.max(3, Math.round(titleSize * 0.065)));
 
-  // 2. Crisp dark contour around letters
+  // 2. Sculptural multi-layer 3D depth extrusion (stacked dark bevel slices)
   ctx.shadowBlur = 0;
-  ctx.lineWidth = Math.max(2.5, Math.round(titleSize * 0.14));
-  ctx.strokeStyle = '#1f0802';
+  const extrudeDepth = Math.max(4, Math.round(titleSize * 0.085));
+  const extrudeSteps = Math.min(8, Math.max(4, extrudeDepth));
+  ctx.lineWidth = Math.max(3.5, Math.round(titleSize * 0.19));
+  for (let step = extrudeSteps; step >= 1; step--) {
+    const dy = (step / extrudeSteps) * extrudeDepth;
+    ctx.strokeStyle = step === extrudeSteps ? '#080506' : outlineColor;
+    ctx.strokeText(line, centerX, y + dy);
+  }
+
+  // 3. Tight dark metallic contour around foreground letterforms
+  ctx.lineWidth = Math.max(2.5, Math.round(titleSize * 0.13));
+  ctx.strokeStyle = contourColor;
   ctx.strokeText(line, centerX, y);
 
-  // 3. Vertical 4-stop metallic gradient fill
-  const fillGrad = ctx.createLinearGradient(0, y, 0, y + titleSize * 1.05);
+  // 4. Rich 5-stop vertical metallic gradient fill
+  const fillGrad = ctx.createLinearGradient(0, y, 0, y + titleSize * 1.06);
   fillGrad.addColorStop(0, gradientStops[0]);
-  fillGrad.addColorStop(0.32, gradientStops[1]);
-  fillGrad.addColorStop(0.7, gradientStops[2]);
-  fillGrad.addColorStop(1, gradientStops[3]);
+  fillGrad.addColorStop(0.24, gradientStops[1]);
+  fillGrad.addColorStop(0.58, gradientStops[2]);
+  fillGrad.addColorStop(0.86, gradientStops[3]);
+  fillGrad.addColorStop(1, baseShadowStop);
   ctx.fillStyle = fillGrad;
+  ctx.fillText(line, centerX, y);
+
+  // 5. Subtle warm metallic top highlight sheen for 3D embossed pop
+  const sheenGrad = ctx.createLinearGradient(0, y, 0, y + titleSize * 0.42);
+  sheenGrad.addColorStop(0, 'rgba(255, 255, 245, 0.46)');
+  sheenGrad.addColorStop(0.65, 'rgba(255, 252, 220, 0.12)');
+  sheenGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = sheenGrad;
   ctx.fillText(line, centerX, y);
   ctx.restore();
 }
@@ -425,6 +500,8 @@ function drawPosterOntoCanvas(
     baseTitle: string;
     partNumber: ThumbnailPartNumber;
     layoutId: ThumbnailLayoutId;
+    titleFontId?: ThumbnailFontId;
+    titleColorId?: ThumbnailColorPresetId;
     channelTag?: string;
     skipOverlayText?: boolean;
   }
@@ -435,9 +512,11 @@ function drawPosterOntoCanvas(
   const w = dims.width;
   const h = dims.height;
   const theme = POSTER_THEME_SPECS[params.layoutId] || POSTER_THEME_SPECS.poster_gold_3d;
+  const fontOption = resolveThumbnailFontOption(params.titleFontId);
+  const colorPreset = resolveThumbnailColorPreset(params.titleColorId);
 
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#070a10';
+  ctx.fillStyle = '#06090e';
   ctx.fillRect(0, 0, w, h);
 
   if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
@@ -456,43 +535,61 @@ function drawPosterOntoCanvas(
 
   if (params.skipOverlayText) return;
 
-  const fontFamily = '"Noto Sans Myanmar", "Pyidaungsu", "Padauk", sans-serif';
+  const fontFamily = fontOption.fontFamily;
+  const fontWeight = fontOption.fontWeight;
   const minDim = Math.min(w, h);
   const padX = Math.round(w * 0.065);
   const partBadge = formatPartBadgeLabel(params.partNumber);
   const cleanTitle = stripPartSuffixFromTitle(params.baseTitle) || params.baseTitle.trim();
 
-  // Compute wrapped headline lines + pixel-fitted font size
+  // Symmetrical balanced movie-poster headline lockup + generous commanding font scale
   const isLandscape = w > h;
-  const maxCharsPerLine = isLandscape ? 19 : 9;
-  const lines = cleanTitle ? wrapBurmeseHeadlineLines(cleanTitle, maxCharsPerLine, 3) : [];
+  const lines = cleanTitle ? balancePosterHeadlineLines(cleanTitle, isLandscape) : [];
   let titleSize = Math.round(
-    minDim * (lines.length >= 3 ? 0.076 : lines.length === 2 ? 0.092 : 0.106)
+    minDim *
+      (lines.length >= 3 ? 0.082 : lines.length === 2 ? 0.104 : 0.118) *
+      fontOption.sizeMultiplier
   );
-  const safeTextMaxW = Math.round(w * 0.87);
+  const safeTextMaxW = Math.round(w * 0.88);
   while (titleSize > Math.round(minDim * 0.036) && lines.length > 0) {
-    ctx.font = `900 ${titleSize}px ${fontFamily}`;
+    ctx.font = `${fontWeight} ${titleSize}px ${fontFamily}`;
     const widest = Math.max(...lines.map((l) => ctx.measureText(l).width), 0);
     if (widest <= safeTextMaxW) break;
     titleSize -= 2;
   }
-  const lineHeight = Math.round(titleSize * 1.34);
-  const badgeFontSize = Math.max(11, Math.round(minDim * 0.044));
+  const lineHeight = Math.round(titleSize * 1.32);
+  const badgeFontSize = Math.max(12, Math.round(minDim * 0.045));
 
   if (params.layoutId === 'poster_gold_3d' || params.layoutId === 'dramatic_spotlight') {
-    // Rich upper atmospheric vignette + subtle bottom edge vignette
-    const topDark = ctx.createLinearGradient(0, 0, 0, h * 0.5);
-    topDark.addColorStop(0, 'rgba(4, 7, 12, 0.94)');
-    topDark.addColorStop(0.55, 'rgba(6, 10, 14, 0.68)');
-    topDark.addColorStop(1, 'rgba(6, 10, 14, 0)');
+    // Deep cinematic obsidian upper headroom gradient so the 3D gold Burmese headline pops dramatically
+    const topDark = ctx.createLinearGradient(0, 0, 0, h * 0.52);
+    topDark.addColorStop(0, 'rgba(3, 6, 10, 0.96)');
+    topDark.addColorStop(0.45, 'rgba(5, 9, 13, 0.78)');
+    topDark.addColorStop(0.75, 'rgba(6, 11, 15, 0.34)');
+    topDark.addColorStop(1, 'rgba(6, 11, 15, 0)');
     ctx.fillStyle = topDark;
-    ctx.fillRect(0, 0, w, h * 0.5);
+    ctx.fillRect(0, 0, w, h * 0.52);
 
-    const botDark = ctx.createLinearGradient(0, h * 0.72, 0, h);
-    botDark.addColorStop(0, 'rgba(5, 8, 12, 0)');
-    botDark.addColorStop(1, 'rgba(5, 8, 12, 0.72)');
+    // Subtle dramatic cinema radial edge vignette framing the hero subject
+    const edgeVignette = ctx.createRadialGradient(
+      w * 0.5,
+      h * 0.58,
+      minDim * 0.28,
+      w * 0.5,
+      h * 0.54,
+      Math.max(w, h) * 0.76
+    );
+    edgeVignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+    edgeVignette.addColorStop(0.72, 'rgba(2, 6, 10, 0.26)');
+    edgeVignette.addColorStop(1, 'rgba(2, 5, 8, 0.72)');
+    ctx.fillStyle = edgeVignette;
+    ctx.fillRect(0, 0, w, h);
+
+    const botDark = ctx.createLinearGradient(0, h * 0.74, 0, h);
+    botDark.addColorStop(0, 'rgba(4, 7, 11, 0)');
+    botDark.addColorStop(1, 'rgba(4, 7, 11, 0.76)');
     ctx.fillStyle = botDark;
-    ctx.fillRect(0, h * 0.72, w, h * 0.28);
+    ctx.fillRect(0, h * 0.74, w, h * 0.26);
 
     if (params.layoutId === 'dramatic_spotlight') {
       ctx.save();
@@ -503,26 +600,30 @@ function drawPosterOntoCanvas(
       ctx.restore();
     }
 
-    drawPosterEmbers(ctx, w, h, theme.emberTint);
+    drawPosterEmbers(ctx, w, h, colorPreset.emberTint);
 
     let lastHeadlineBottomY = Math.round(h * 0.16);
     if (lines.length > 0) {
-      const topAnchorY = Math.round(h * (lines.length === 1 ? 0.105 : lines.length === 2 ? 0.075 : 0.06));
-      ctx.font = `900 ${titleSize}px ${fontFamily}`;
+      const topAnchorY = Math.round(
+        h * (lines.length === 1 ? 0.10 : lines.length === 2 ? 0.068 : 0.052)
+      );
+      ctx.font = `${fontWeight} ${titleSize}px ${fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       lines.forEach((line, idx) => {
         const y = topAnchorY + idx * lineHeight;
-        lastHeadlineBottomY = y + titleSize * 1.08;
+        lastHeadlineBottomY = y + titleSize * 1.1;
         draw3dPosterTextLine(
           ctx,
           line,
           w / 2,
           y,
           titleSize,
-          theme.gradientStops,
-          theme.outlineColor,
-          theme.glowColor
+          colorPreset.gradientStops,
+          colorPreset.outlineColor,
+          colorPreset.glowColor,
+          colorPreset.baseShadowStop,
+          colorPreset.contourColor
         );
       });
     }
@@ -532,59 +633,53 @@ function drawPosterOntoCanvas(
         ctx,
         partBadge,
         w / 2,
-        lastHeadlineBottomY + Math.round(h * 0.02),
+        lastHeadlineBottomY + Math.round(h * 0.018),
         badgeFontSize,
         fontFamily
       );
     }
   } else if (params.layoutId === 'cinema_hook') {
-    // Inferno Crimson Poster: fiery dark crimson lower vignette + top soft darkness
-    const topVignette = ctx.createLinearGradient(0, 0, 0, h * 0.28);
-    topVignette.addColorStop(0, 'rgba(10, 3, 5, 0.76)');
-    topVignette.addColorStop(1, 'rgba(10, 3, 5, 0)');
-    ctx.fillStyle = topVignette;
-    ctx.fillRect(0, 0, w, h * 0.28);
+    // Inferno Crimson Poster: top dark crimson headroom so 3D title + Part badge never cover the hero character's chest/back
+    const topCrimson = ctx.createLinearGradient(0, 0, 0, h * 0.52);
+    topCrimson.addColorStop(0, 'rgba(18, 3, 5, 0.96)');
+    topCrimson.addColorStop(0.46, 'rgba(26, 5, 8, 0.78)');
+    topCrimson.addColorStop(0.76, 'rgba(18, 4, 6, 0.30)');
+    topCrimson.addColorStop(1, 'rgba(12, 3, 5, 0)');
+    ctx.fillStyle = topCrimson;
+    ctx.fillRect(0, 0, w, h * 0.52);
 
-    const botScrim = ctx.createLinearGradient(0, h * 0.36, 0, h);
-    botScrim.addColorStop(0, 'rgba(12, 3, 5, 0)');
-    botScrim.addColorStop(0.5, 'rgba(24, 5, 8, 0.78)');
-    botScrim.addColorStop(1, 'rgba(8, 2, 4, 0.96)');
-    ctx.fillStyle = botScrim;
-    ctx.fillRect(0, h * 0.36, w, h * 0.64);
-
-    // Warm crimson spotlight glow behind lower headline
-    const crimsonHalo = ctx.createRadialGradient(w / 2, h * 0.84, minDim * 0.05, w / 2, h * 0.84, w * 0.65);
+    const crimsonHalo = ctx.createRadialGradient(w / 2, h * 0.18, minDim * 0.05, w / 2, h * 0.18, w * 0.65);
     crimsonHalo.addColorStop(0, 'rgba(220, 38, 38, 0.34)');
     crimsonHalo.addColorStop(1, 'rgba(220, 38, 38, 0)');
     ctx.fillStyle = crimsonHalo;
-    ctx.fillRect(0, h * 0.45, w, h * 0.55);
+    ctx.fillRect(0, 0, w, h * 0.5);
 
-    drawPosterEmbers(ctx, w, h, 'crimson_fire');
+    const botScrim = ctx.createLinearGradient(0, h * 0.74, 0, h);
+    botScrim.addColorStop(0, 'rgba(10, 2, 4, 0)');
+    botScrim.addColorStop(1, 'rgba(10, 2, 4, 0.78)');
+    ctx.fillStyle = botScrim;
+    ctx.fillRect(0, h * 0.74, w, h * 0.26);
 
-    const totalTextH = lines.length * lineHeight;
-    const textStartTopY = Math.round(h * 0.92 - totalTextH);
-    if (partBadge) {
-      const plaqueH = Math.round(badgeFontSize * 1.88);
-      drawCrimsonGoldPlaque(
-        ctx,
-        partBadge,
-        w / 2,
-        textStartTopY - plaqueH - Math.round(h * 0.022),
-        badgeFontSize,
-        fontFamily
-      );
-    }
+    drawPosterEmbers(ctx, w, h, colorPreset.emberTint);
 
+    let lastCrimsonBottomY = Math.round(h * 0.16);
     if (lines.length > 0) {
-      ctx.font = `900 ${titleSize}px ${fontFamily}`;
+      const topAnchorY = Math.round(
+        h * (lines.length === 1 ? 0.10 : lines.length === 2 ? 0.068 : 0.052)
+      );
+      ctx.font = `${fontWeight} ${titleSize}px ${fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       lines.forEach((line, idx) => {
-        const y = textStartTopY + idx * lineHeight;
+        const y = topAnchorY + idx * lineHeight;
+        lastCrimsonBottomY = y + titleSize * 1.1;
+        const useCustomColor = Boolean(params.titleColorId && params.titleColorId !== 'molten_gold');
         const isLast = idx === lines.length - 1;
-        const stops: [string, string, string, string] = isLast
-          ? ['#fef08a', '#fb923c', '#ef4444', '#b91c1c']
-          : ['#ffffff', '#f8fafc', '#fef9c3', '#cbd5e1'];
+        const stops: [string, string, string, string] = useCustomColor
+          ? colorPreset.gradientStops
+          : isLast
+            ? ['#fef08a', '#fb923c', '#ef4444', '#b91c1c']
+            : ['#ffffff', '#fef9c3', '#fdba74', '#ea580c'];
         draw3dPosterTextLine(
           ctx,
           line,
@@ -592,10 +687,23 @@ function drawPosterOntoCanvas(
           y,
           titleSize,
           stops,
-          theme.outlineColor,
-          theme.glowColor
+          useCustomColor ? colorPreset.outlineColor : theme.outlineColor,
+          useCustomColor ? colorPreset.glowColor : theme.glowColor,
+          useCustomColor ? colorPreset.baseShadowStop : '#7f1d1d',
+          useCustomColor ? colorPreset.contourColor : '#2a0901'
         );
       });
+    }
+
+    if (partBadge) {
+      drawCrimsonGoldPlaque(
+        ctx,
+        partBadge,
+        w / 2,
+        lastCrimsonBottomY + Math.round(h * 0.018),
+        badgeFontSize,
+        fontFamily
+      );
     }
   } else {
     // Teal Noir Gold (`viral_split`): top & bottom vignette + golden hairline border + top plaque + bottom gold 3D headline
@@ -620,7 +728,7 @@ function drawPosterOntoCanvas(
     ctx.strokeRect(inset, inset, w - inset * 2, h - inset * 2);
     ctx.restore();
 
-    drawPosterEmbers(ctx, w, h, 'icy_amber');
+    drawPosterEmbers(ctx, w, h, colorPreset.emberTint);
 
     if (partBadge) {
       drawCrimsonGoldPlaque(ctx, partBadge, w / 2, Math.round(h * 0.06), badgeFontSize, fontFamily);
@@ -629,7 +737,7 @@ function drawPosterOntoCanvas(
     if (lines.length > 0) {
       const totalTextH = lines.length * lineHeight;
       const textStartTopY = Math.round(h * 0.92 - totalTextH);
-      ctx.font = `900 ${titleSize}px ${fontFamily}`;
+      ctx.font = `${fontWeight} ${titleSize}px ${fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       lines.forEach((line, idx) => {
@@ -640,9 +748,11 @@ function drawPosterOntoCanvas(
           w / 2,
           y,
           titleSize,
-          theme.gradientStops,
-          theme.outlineColor,
-          theme.glowColor
+          colorPreset.gradientStops,
+          colorPreset.outlineColor,
+          colorPreset.glowColor,
+          colorPreset.baseShadowStop,
+          colorPreset.contourColor
         );
       });
     }
@@ -671,6 +781,8 @@ async function renderThumbnailToPngBlob(params: {
   baseTitle: string;
   partNumber: ThumbnailPartNumber;
   layoutId: ThumbnailLayoutId;
+  titleFontId?: ThumbnailFontId;
+  titleColorId?: ThumbnailColorPresetId;
   aspectRatio: string;
   channelTag?: string;
   skipOverlayText?: boolean;
@@ -681,6 +793,13 @@ async function renderThumbnailToPngBlob(params: {
   canvas.height = dims.height;
 
   try {
+    const fontOpt = resolveThumbnailFontOption(params.titleFontId);
+    if (document.fonts && typeof document.fonts.load === 'function') {
+      await Promise.race([
+        document.fonts.load(fontOpt.loadSpec),
+        new Promise((r) => setTimeout(r, 900))
+      ]);
+    }
     if (document.fonts && document.fonts.ready) {
       await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 800))]);
     }
@@ -714,6 +833,8 @@ interface PosterPreviewCanvasProps {
   baseTitle: string;
   partNumber: ThumbnailPartNumber;
   layoutId: ThumbnailLayoutId;
+  titleFontId: ThumbnailFontId;
+  titleColorId: ThumbnailColorPresetId;
   aspectRatio: string;
   channelTag?: string;
   skipOverlayText?: boolean;
@@ -725,6 +846,8 @@ const PosterPreviewCanvas: React.FC<PosterPreviewCanvasProps> = ({
   baseTitle,
   partNumber,
   layoutId,
+  titleFontId,
+  titleColorId,
   aspectRatio,
   channelTag,
   skipOverlayText,
@@ -748,6 +871,13 @@ const PosterPreviewCanvas: React.FC<PosterPreviewCanvasProps> = ({
 
     const paint = async () => {
       try {
+        const fontOpt = resolveThumbnailFontOption(titleFontId);
+        if (document.fonts && typeof document.fonts.load === 'function') {
+          await Promise.race([
+            document.fonts.load(fontOpt.loadSpec),
+            new Promise((r) => setTimeout(r, 700))
+          ]);
+        }
         if (document.fonts && document.fonts.ready) {
           await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 600))]);
         }
@@ -768,6 +898,8 @@ const PosterPreviewCanvas: React.FC<PosterPreviewCanvasProps> = ({
         baseTitle,
         partNumber,
         layoutId,
+        titleFontId,
+        titleColorId,
         channelTag,
         skipOverlayText
       });
@@ -777,13 +909,23 @@ const PosterPreviewCanvas: React.FC<PosterPreviewCanvasProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [aspectRatio, baseTitle, channelTag, frameDataUrl, layoutId, partNumber, skipOverlayText]);
+  }, [
+    aspectRatio,
+    baseTitle,
+    channelTag,
+    frameDataUrl,
+    layoutId,
+    partNumber,
+    skipOverlayText,
+    titleColorId,
+    titleFontId
+  ]);
 
   return (
     <canvas
       ref={canvasRef}
       aria-label={alt}
-      className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.025]"
+      className="h-full w-full object-contain transition-transform duration-300 group-hover:scale-[1.02]"
     />
   );
 };
@@ -805,28 +947,38 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
   scriptStyle,
   targetLanguage,
   channelTag,
-  onSelectTitle
+  onSelectTitle,
+  onSwitchToCreditMode
 }) => {
   const [suggestedTitles, setSuggestedTitles] = useState<string[]>([]);
   const [isLoadingTitles, setIsLoadingTitles] = useState(false);
   const [baseTitle, setBaseTitle] = useState('');
   const [partNumber, setPartNumber] = useState<ThumbnailPartNumber>(1);
+  const [titleFontId, setTitleFontId] = useState<ThumbnailFontId>('noto_sans');
+  const [titleColorId, setTitleColorId] = useState<ThumbnailColorPresetId>('molten_gold');
   const [videoFrames, setVideoFrames] = useState<VideoFrameOption[]>([]);
   const [isExtractingFrames, setIsExtractingFrames] = useState(false);
   const [isGeneratingAiPosters, setIsGeneratingAiPosters] = useState(false);
   const [aiPosterError, setAiPosterError] = useState<string | null>(null);
-  const [highQualityAiPoster, setHighQualityAiPoster] = useState(false);
+  const [highQualityAiPoster, setHighQualityAiPoster] = useState(true);
   const [directAiTextRender, setDirectAiTextRender] = useState(false);
   const [showPromptBox, setShowPromptBox] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copiedGeminiAppPrompt, setCopiedGeminiAppPrompt] = useState(false);
   const [directorMeta, setDirectorMeta] = useState<{
     original_title: string;
+    detected_genre_burmese?: string;
+    visual_hook_summary?: string;
+    scannedFrameCount?: number;
     summary_burmese: string;
     scene_descriptions_en: string[];
   }>(() => {
     const init = normalizeDirectorAnalysisResult({});
     return {
       original_title: init.original_title,
+      detected_genre_burmese: init.detected_genre_burmese,
+      visual_hook_summary: init.visual_hook_summary,
+      scannedFrameCount: 0,
       summary_burmese: init.summary_burmese,
       scene_descriptions_en: init.scene_descriptions_en
     };
@@ -839,76 +991,145 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
   const [copiedTitle, setCopiedTitle] = useState(false);
   const [hasManuallyChosenTitle, setHasManuallyChosenTitle] = useState(false);
   const customImageInputRef = useRef<HTMLInputElement>(null);
+  const scannedFramesRef = useRef<VideoFrameOption[]>([]);
+  const rawVideoFramesRef = useRef<VideoFrameOption[]>([]);
+  const hasUserModifiedFramesRef = useRef(false);
   const wasOpenRef = useRef(false);
 
-  const loadTitlesFromServer = useCallback(async () => {
-    setIsLoadingTitles(true);
-    const localNormalized = normalizeDirectorAnalysisResult({
-      scriptText,
-      cues,
-      rawTitle: videoTitle,
-      scriptStyle,
-      partNumber,
-      aspectRatio
-    });
-    setSuggestedTitles(localNormalized.suggested_titles);
-    setDirectorMeta({
-      original_title: localNormalized.original_title,
-      summary_burmese: localNormalized.summary_burmese,
-      scene_descriptions_en: localNormalized.scene_descriptions_en
-    });
-    setBaseTitle((prev) => (prev.trim() ? prev : localNormalized.selected_title || ''));
-
-    try {
-      const freeKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
-      const resp = await fetch('/api/recap/suggest-titles', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          isFreeMode: isFreeTier,
-          userGeminiApiKey: isFreeTier && freeKeys.geminiKey ? freeKeys.geminiKey : undefined,
-          scriptText,
-          cues: cues.slice(0, 24).map((c) => ({ text: c.text })),
-          videoTitle,
-          scriptStyle,
-          targetLanguage,
-          partNumber,
-          aspectRatio
-        })
+  const loadTitlesFromServer = useCallback(
+    async (explicitScanFrames?: VideoFrameOption[]) => {
+      setIsLoadingTitles(true);
+      const localNormalized = normalizeDirectorAnalysisResult({
+        scriptText,
+        cues,
+        rawTitle: videoTitle,
+        scriptStyle,
+        partNumber,
+        aspectRatio
       });
-      if (resp.ok) {
-        const data = await resp.json();
-        const nextTitles =
-          Array.isArray(data?.suggested_titles) && data.suggested_titles.length > 0
-            ? data.suggested_titles
-            : Array.isArray(data?.titles) && data.titles.length > 0
-              ? data.titles
-              : null;
-        if (data?.ok && nextTitles) {
-          setSuggestedTitles(nextTitles.slice(0, 5));
-          setDirectorMeta({
-            original_title: String(data.original_title || 'Unknown'),
-            summary_burmese: String(data.summary_burmese || localNormalized.summary_burmese),
-            scene_descriptions_en:
-              Array.isArray(data.scene_descriptions_en) && data.scene_descriptions_en.length >= 3
-                ? data.scene_descriptions_en.slice(0, 3)
-                : localNormalized.scene_descriptions_en
-          });
-          setBaseTitle((prev) =>
-            !prev.trim() || localNormalized.suggested_titles.includes(prev)
-              ? data.selected_title || nextTitles[0]
-              : prev
-          );
-        }
-      }
-    } catch {
-      // Local fallback already populated
-    } finally {
-      setIsLoadingTitles(false);
-    }
-  }, [aspectRatio, cues, isFreeTier, partNumber, scriptStyle, scriptText, targetLanguage, videoTitle]);
+      setSuggestedTitles(localNormalized.suggested_titles);
+      setDirectorMeta((prev) => ({
+        original_title:
+          prev.original_title && prev.original_title !== 'Unknown'
+            ? prev.original_title
+            : localNormalized.original_title,
+        detected_genre_burmese: prev.detected_genre_burmese,
+        visual_hook_summary: prev.visual_hook_summary,
+        scannedFrameCount: prev.scannedFrameCount || 0,
+        summary_burmese: localNormalized.summary_burmese,
+        scene_descriptions_en: localNormalized.scene_descriptions_en
+      }));
+      setBaseTitle((prev) => (prev.trim() ? prev : localNormalized.selected_title || ''));
 
-  const extractThreeFrames = useCallback(async () => {
+      const framesToScan = (
+        explicitScanFrames && explicitScanFrames.length > 0
+          ? explicitScanFrames
+          : scannedFramesRef.current
+      ).filter((f) => Boolean(f?.dataUrl) && !f.id.startsWith('bg-frame-'));
+
+      try {
+        const freeKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
+        const resp = await fetch('/api/recap/suggest-titles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            isFreeMode: isFreeTier,
+            userGeminiApiKey: isFreeTier && freeKeys.geminiKey ? freeKeys.geminiKey : undefined,
+            scriptText,
+            cues: cues.slice(0, 28).map((c) => ({ text: c.text })),
+            videoTitle,
+            scriptStyle,
+            targetLanguage,
+            partNumber,
+            aspectRatio,
+            jobId: lastJobId,
+            localUploadId,
+            videoDuration: Math.max(6, videoDuration || 30),
+            scanFrames: framesToScan.slice(0, 6).map((f) => ({
+              dataUrl: f.dataUrl,
+              timeSec: f.timeSec,
+              label: f.label
+            }))
+          })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const nextTitles =
+            Array.isArray(data?.suggested_titles) && data.suggested_titles.length > 0
+              ? data.suggested_titles
+              : Array.isArray(data?.titles) && data.titles.length > 0
+                ? data.titles
+                : null;
+          if (data?.ok && nextTitles) {
+            setSuggestedTitles(nextTitles.slice(0, 5));
+            setDirectorMeta({
+              original_title: String(data.original_title || 'Unknown'),
+              detected_genre_burmese: data.detected_genre_burmese
+                ? String(data.detected_genre_burmese)
+                : undefined,
+              visual_hook_summary: data.visual_hook_summary
+                ? String(data.visual_hook_summary)
+                : undefined,
+              scannedFrameCount: Number(data.scannedFrameCount || framesToScan.length || 0),
+              summary_burmese: String(data.summary_burmese || localNormalized.summary_burmese),
+              scene_descriptions_en:
+                Array.isArray(data.scene_descriptions_en) && data.scene_descriptions_en.length >= 3
+                  ? data.scene_descriptions_en.slice(0, 3)
+                  : localNormalized.scene_descriptions_en
+            });
+            setBaseTitle((prev) =>
+              !prev.trim() || localNormalized.suggested_titles.includes(prev)
+                ? data.selected_title || nextTitles[0]
+                : prev
+            );
+
+            // Auto-apply AI-picked best hero character scenes from the scanned video!
+            if (!hasUserModifiedFramesRef.current) {
+              if (
+                Array.isArray(data.best_frame_indices) &&
+                data.best_frame_indices.length > 0 &&
+                framesToScan.length >= 3
+              ) {
+                const pickedHeroFrames = selectBestFramesByIndices(
+                  framesToScan,
+                  data.best_frame_indices
+                );
+                if (pickedHeroFrames.length > 0) {
+                  rawVideoFramesRef.current = pickedHeroFrames;
+                  setVideoFrames(pickedHeroFrames);
+                }
+              } else if (
+                Array.isArray(data.selected_frames) &&
+                data.selected_frames.length > 0
+              ) {
+                rawVideoFramesRef.current = data.selected_frames;
+                setVideoFrames(data.selected_frames);
+              }
+            }
+          }
+        }
+      } catch {
+        // Local fallback already populated
+      } finally {
+        setIsLoadingTitles(false);
+      }
+    },
+    [
+      aspectRatio,
+      cues,
+      isFreeTier,
+      lastJobId,
+      localUploadId,
+      partNumber,
+      scriptStyle,
+      scriptText,
+      targetLanguage,
+      videoDuration,
+      videoTitle
+    ]
+  );
+
+  const extractThreeFrames = useCallback(async (): Promise<VideoFrameOption[]> => {
     setIsExtractingFrames(true);
     try {
       if (lastJobId || localUploadId) {
@@ -919,28 +1140,35 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
             body: JSON.stringify({
               jobId: lastJobId,
               localUploadId,
-              durationSec: Math.max(6, videoDuration || 30)
+              durationSec: Math.max(6, videoDuration || 30),
+              count: 6
             })
           });
           if (resp.ok) {
             const data = await resp.json();
             if (data?.ok && Array.isArray(data.frames) && data.frames.length > 0) {
-              setVideoFrames(data.frames);
-              return;
+              scannedFramesRef.current = data.frames;
+              const initialThree = selectBestFramesByIndices(data.frames);
+              rawVideoFramesRef.current = initialThree;
+              setVideoFrames(initialThree);
+              return data.frames;
             }
           }
         } catch {}
       }
 
       if (videoUrl) {
-        const cliFrames = await grabClientVideoFrames(videoUrl, videoDuration);
+        const cliFrames = await grabClientVideoFrames(videoUrl, videoDuration, 6);
         if (cliFrames.length >= 2) {
-          setVideoFrames(cliFrames);
-          return;
+          scannedFramesRef.current = cliFrames;
+          const initialThree = selectBestFramesByIndices(cliFrames);
+          rawVideoFramesRef.current = initialThree;
+          setVideoFrames(initialThree);
+          return cliFrames;
         }
       }
 
-      setVideoFrames([
+      const fallbackBackdrops: VideoFrameOption[] = [
         {
           id: 'bg-frame-1',
           label: 'Key Poster Hook',
@@ -959,7 +1187,11 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
           timeSec: Math.round((videoDuration || 30) * 0.82),
           dataUrl: buildAtmosphericPosterBackdrop(2)
         }
-      ]);
+      ];
+      scannedFramesRef.current = [];
+      rawVideoFramesRef.current = [];
+      setVideoFrames(fallbackBackdrops);
+      return [];
     } finally {
       setIsExtractingFrames(false);
     }
@@ -974,6 +1206,13 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
 
     try {
       const freeKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
+      const sourceSceneFrames = (
+        rawVideoFramesRef.current.length > 0 ? rawVideoFramesRef.current : videoFrames
+      )
+        .filter((f) => Boolean(f?.dataUrl) && !f.id.startsWith('bg-frame-') && !f.isAiPoster)
+        .slice(0, 3)
+        .map((f) => f.dataUrl);
+
       const resp = await fetch('/api/recap/generate-poster-art', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -986,6 +1225,7 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
           aspectRatio,
           highQuality: highQualityAiPoster,
           directPromptWithText: directAiTextRender,
+          referenceFrames: sourceSceneFrames,
           localUploadId,
           jobId: lastJobId
         })
@@ -1011,10 +1251,16 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
         return;
       }
 
-      if (data?.provider === 'free-ai-poster' || data?.directPromptWithText === false) {
+      if (
+        data?.provider === 'cloudflare-flux' ||
+        data?.provider === 'free-ai-poster' ||
+        data?.provider === 'cinema-scene-poster' ||
+        data?.directPromptWithText === false
+      ) {
         setDirectAiTextRender(false);
       }
 
+      hasUserModifiedFramesRef.current = true;
       setVideoFrames(
         returnedFrames.map((f: VideoFrameOption) => ({
           ...f,
@@ -1025,12 +1271,22 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
       playUiSound('success');
       setSaveFeedback(
         uiLang === 'my'
-          ? data?.provider === 'free-ai-poster'
-            ? 'Free AI Movie Poster ၃ ပုံ ထုတ်ပေးပြီးပါပြီ — 3D ရွှေရောင်ခေါင်းစဉ် + အပိုင်း Badge တွဲ Save နိုင်ပါပြီ'
-            : 'AI Movie Poster ၃ ပုံ အသစ်ဖန်တီးပြီးပါပြီ — ကြိုက်ရာပုံရွေးပြီး Save နိုင်ပါပြီ'
-          : 'Generated 3 cinematic AI movie posters! Pick one to Save & Download.'
+          ? data?.provider === 'gemini' && data?.sceneBased
+            ? 'Gemini Nano Banana ဖြင့် ဗီဒီယိုဇာတ်ကောင်အစစ်မှ 8K Movie Poster ၃ ပုံ ဖန်တီးပြီးပါပြီ — ကြိုက်ရာရွေး Save နိုင်ပါပြီ'
+            : data?.provider === 'cloudflare-flux'
+              ? data?.sceneBased
+                ? 'FLUX-2 AI ဖြင့် ဗီဒီယိုဇာတ်ကောင်အစစ်မှ 8K Photorealistic Movie Poster ၃ ပုံ ဖန်တီးပြီးပါပြီ — 3D ရွှေရောင်ခေါင်းစဉ် + အပိုင်း Badge တွဲ Save နိုင်ပါပြီ'
+                : 'FLUX-2 AI Photorealistic Movie Poster ၃ ပုံ ဖန်တီးပြီးပါပြီ — 3D ရွှေရောင်ခေါင်းစဉ် + အပိုင်း Badge တွဲ Save နိုင်ပါပြီ'
+              : data?.provider === 'cinema-scene-poster'
+                ? 'ဗီဒီယို Scene ဇာတ်ကောင်အစစ်ကို Cinema Poster ၃ ပုံ အလှပြင်ပေးပြီးပါပြီ — 3D ရွှေရောင်ခေါင်းစဉ် + အပိုင်း Badge တွဲ Save နိုင်ပါပြီ'
+                : data?.provider === 'free-ai-poster'
+                  ? 'AI Movie Poster ၃ ပုံ ထုတ်ပေးပြီးပါပြီ — 3D ရွှေရောင်ခေါင်းစဉ် + အပိုင်း Badge တွဲ Save နိုင်ပါပြီ'
+                  : 'AI Movie Poster ၃ ပုံ အသစ်ဖန်တီးပြီးပါပြီ — ကြိုက်ရာပုံရွေးပြီး Save နိုင်ပါပြီ'
+          : data?.provider === 'gemini' && data?.sceneBased
+            ? 'Transformed 3 real video scenes with Gemini Nano Banana! Pick one to Save & Download.'
+            : 'Generated 3 cinematic AI movie posters! Pick one to Save & Download.'
       );
-      window.setTimeout(() => setSaveFeedback(null), 4500);
+      window.setTimeout(() => setSaveFeedback(null), 5000);
     } catch (err) {
       playUiSound('blocked');
       setAiPosterError(err instanceof Error ? err.message : 'Failed to generate AI posters.');
@@ -1039,14 +1295,15 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
     }
   };
 
-  // Initialize strictly on modal open transition so background prop updates never wipe active selections
+  // Initialize strictly on modal open transition: extract 6 video keyframes first, then scan them with Gemini Director
   useEffect(() => {
-    if (!isOpen) {
+    if (!isOpen || isFreeTier) {
       wasOpenRef.current = false;
       return;
     }
     if (wasOpenRef.current) return;
     wasOpenRef.current = true;
+    hasUserModifiedFramesRef.current = false;
     setSaveFeedback(null);
     setAiPosterError(null);
     setSavedSeriesList(loadSavedSeriesPresets(userId));
@@ -1055,11 +1312,81 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
     setBaseTitle('');
     setPartNumber(1);
     setSelectedCardId('thumb-card-1');
-    void loadTitlesFromServer();
-    void extractThreeFrames();
-  }, [isOpen, userId, loadTitlesFromServer, extractThreeFrames]);
+    void (async () => {
+      const scanned = await extractThreeFrames();
+      await loadTitlesFromServer(scanned);
+    })();
+  }, [isOpen, isFreeTier, userId, loadTitlesFromServer, extractThreeFrames]);
 
   if (!isOpen) return null;
+
+  if (isFreeTier) {
+    return (
+      <div
+        data-testid="thumbnail-credit-lock-backdrop"
+        className="fixed inset-0 z-[110] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+        onClick={onClose}
+      >
+        <div
+          data-testid="thumbnail-credit-lock-modal"
+          onClick={(e) => e.stopPropagation()}
+          className="w-full max-w-md overflow-hidden rounded-2xl border border-amber-500/35 bg-white p-5 shadow-2xl dark:border-amber-500/30 dark:bg-[#111720]"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-500">
+                <Lock className="size-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-stone-900 dark:text-white">
+                  {uiLang === 'my' ? 'Credit Mode သီးသန့် Feature' : 'Credit Mode Exclusive'}
+                </h3>
+                <p className="text-[11px] text-amber-600 dark:text-amber-400 font-semibold">
+                  Auto Title &amp; 3 AI Movie Posters Studio
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex size-8 cursor-pointer items-center justify-center rounded-lg border border-stone-200 text-stone-500 hover:bg-stone-100 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800"
+            >
+              <X className="size-4" />
+            </button>
+          </div>
+          <p className="mt-3 text-xs leading-relaxed text-stone-600 dark:text-slate-300">
+            {uiLang === 'my'
+              ? 'Thumbnail Studio (ဗီဒီယို Scan ခေါင်းစဉ် Auto ထုတ်ခြင်း၊ AI Movie Poster ၃ ပုံနှင့် 3D Myanmar Font/Color အလှပြင်ခြင်း) ကို Credit Mode တွင်သာ အခမဲ့ (Credit အပိုမဖြတ်ဘဲ) အသုံးပြုနိုင်ပါသည်။'
+              : 'Thumbnail Studio (Video Scan Auto Titles, 3 AI Movie Posters, and 3D Myanmar Font & Color styling) is available exclusively in Credit Mode with 0 extra credits deducted.'}
+          </p>
+          <div className="mt-4 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="h-9.5 cursor-pointer rounded-xl border border-stone-200 px-4 text-xs font-semibold text-stone-700 hover:bg-stone-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              {uiLang === 'my' ? 'ပိတ်မည်' : 'Close'}
+            </button>
+            {onSwitchToCreditMode && (
+              <button
+                type="button"
+                data-testid="switch-to-credit-mode-from-thumbnail-btn"
+                onClick={() => {
+                  playUiSound('tap');
+                  onClose();
+                  onSwitchToCreditMode();
+                }}
+                className="inline-flex h-9.5 cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-amber-500 px-4 text-xs font-bold text-slate-950 shadow-sm hover:bg-amber-400"
+              >
+                <Crown className="size-3.5" />
+                <span>{uiLang === 'my' ? 'Credit Mode သို့ ပြောင်းမည်' : 'Switch to Credit Mode'}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const candidates: ThumbnailCandidate[] = buildThumbnailCandidates({
     frames: videoFrames,
@@ -1081,6 +1408,13 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
     partNumber,
     aspectRatio
   });
+  const geminiAppQuickPrompt = buildGeminiAppQuickPrompt({
+    selectedTitle: baseTitle,
+    partNumber,
+    aspectRatio,
+    sceneDescriptionEn:
+      directorMeta.scene_descriptions_en[activeIdx] || directorMeta.scene_descriptions_en[0] || ''
+  });
 
   // Trigger Part 1 -> Part 2 Auto Reuse (restores saved Part 1 title + Part 1 photo & auto stamps Part 2!)
   const handleApplySavedSeriesToPart = (
@@ -1095,6 +1429,8 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
     });
     setBaseTitle(plan.baseTitle);
     setPartNumber(plan.partNumber);
+    setTitleFontId(plan.titleFontId);
+    setTitleColorId(plan.titleColorId);
     setReusedPart1Preset(preset);
     setHasManuallyChosenTitle(false);
     setSelectedCardId('thumb-card-1');
@@ -1139,17 +1475,22 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
       const dataUrl = String(reader.result || '');
       if (!dataUrl) return;
       playUiSound('success');
+      hasUserModifiedFramesRef.current = true;
       setReusedPart1Preset(null);
       setVideoFrames((prev) => {
         const next = [...prev];
         const targetIdx = candidates.findIndex((c) => c.id === selectedCardId);
         const idx = targetIdx >= 0 ? targetIdx : 0;
-        next[idx] = {
+        const customFrame = {
           id: `custom-${Date.now()}`,
           label: 'Custom Photo',
           timeSec: 0,
           dataUrl
         };
+        next[idx] = customFrame;
+        const rawCopy = [...(rawVideoFramesRef.current.length ? rawVideoFramesRef.current : next)];
+        rawCopy[idx] = customFrame;
+        rawVideoFramesRef.current = rawCopy;
         return next;
       });
     };
@@ -1163,6 +1504,8 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
         baseTitle: stripPartSuffixFromTitle(baseTitle) || 'Movie Recap',
         partNumber: partNumber || 1,
         layoutId: activeCandidate.layoutId,
+        titleFontId,
+        titleColorId,
         frameDataUrl: activeCandidate.frameDataUrl,
         aspectRatio,
         channelTag
@@ -1193,6 +1536,8 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
         baseTitle,
         partNumber,
         layoutId: activeCandidate.layoutId,
+        titleFontId,
+        titleColorId,
         aspectRatio,
         channelTag,
         skipOverlayText: Boolean(activeCandidate.isFullAiRendered)
@@ -1359,7 +1704,7 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                 {isLoadingTitles && (
                   <span className="inline-flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400">
                     <Loader2 className="size-3 animate-spin" />
-                    AI generating titles...
+                    Scanning video &amp; titles...
                   </span>
                 )}
               </div>
@@ -1375,19 +1720,32 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                 className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11px] font-semibold text-stone-700 hover:bg-stone-100 disabled:opacity-50 dark:border-slate-700 dark:bg-[#151C26] dark:text-slate-300"
               >
                 <RefreshCw className={`size-3 ${isLoadingTitles ? 'animate-spin' : ''}`} />
-                <span>Auto Title အသစ်ရှာ</span>
+                <span>Video Scan &amp; Title အသစ်ရှာ</span>
               </button>
             </div>
 
-            {/* Original Title + 2-Sentence Story Summary Strip */}
+            {/* Original Title + Detected Genre + 2-Sentence Video-Scanned Story Summary Strip */}
             {(directorMeta.original_title && directorMeta.original_title !== 'Unknown') ||
+            directorMeta.detected_genre_burmese ||
             directorMeta.summary_burmese ? (
               <div className="mb-2.5 rounded-xl border border-stone-200/70 bg-[#FAF8F4] px-3 py-2 text-[11px] text-stone-600 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300">
-                {directorMeta.original_title && directorMeta.original_title !== 'Unknown' && (
-                  <span className="mr-2 inline-flex items-center rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                    {directorMeta.original_title}
-                  </span>
-                )}
+                <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                  {directorMeta.scannedFrameCount && directorMeta.scannedFrameCount > 0 ? (
+                    <span className="inline-flex items-center rounded-md bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-bold text-teal-700 dark:text-teal-300">
+                      Video Scanned ({directorMeta.scannedFrameCount} frames)
+                    </span>
+                  ) : null}
+                  {directorMeta.original_title && directorMeta.original_title !== 'Unknown' && (
+                    <span className="inline-flex items-center rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
+                      {directorMeta.original_title}
+                    </span>
+                  )}
+                  {directorMeta.detected_genre_burmese && (
+                    <span className="inline-flex items-center rounded-md bg-rose-500/12 px-1.5 py-0.5 text-[10px] font-bold text-rose-700 dark:text-rose-300">
+                      {directorMeta.detected_genre_burmese}
+                    </span>
+                  )}
+                </div>
                 <span className="leading-relaxed">{directorMeta.summary_burmese}</span>
               </div>
             ) : null}
@@ -1491,6 +1849,89 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                   </button>
                 </div>
               </div>
+
+              {/* Myanmar Display Font (4 Fonts) + 3D Poster Color Presets (6 Presets) */}
+              <div
+                data-testid="thumbnail-typography-customizer"
+                className="space-y-2.5 rounded-xl border border-stone-200/80 bg-[#FAF8F4] p-2.5 dark:border-slate-800 dark:bg-[#151C26]"
+              >
+                <div className="space-y-1.5">
+                  <span className="flex items-center gap-1.5 text-[11px] font-semibold text-stone-600 dark:text-slate-300">
+                    <TypeIcon className="size-3.5 text-amber-500" />
+                    <span>{uiLang === 'my' ? 'ခေါင်းစဉ် Font အလှ (4 မျိုး)' : 'Title Font Style (4 Fonts)'}</span>
+                  </span>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {THUMBNAIL_FONT_OPTIONS.map((fontOpt) => {
+                      const active = titleFontId === fontOpt.id;
+                      return (
+                        <button
+                          key={fontOpt.id}
+                          type="button"
+                          data-testid={`thumb-font-btn-${fontOpt.id}`}
+                          onClick={() => {
+                            playUiSound('select');
+                            setTitleFontId(fontOpt.id);
+                          }}
+                          className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl border px-2.5 py-1.5 text-left transition-all ${
+                            active
+                              ? 'border-amber-500 bg-amber-500/15 text-stone-900 shadow-2xs dark:text-amber-200'
+                              : 'border-stone-200/90 bg-white text-stone-700 hover:border-amber-500/40 dark:border-slate-700/80 dark:bg-[#111720] dark:text-slate-200'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <span
+                              className="block truncate text-xs font-bold leading-tight"
+                              style={{ fontFamily: fontOpt.fontFamily }}
+                            >
+                              {fontOpt.sampleMy}
+                            </span>
+                            <span className="block truncate text-[10px] text-stone-500 dark:text-slate-400">
+                              {uiLang === 'my' ? fontOpt.labelMy : fontOpt.label}
+                            </span>
+                          </div>
+                          {active && <Check className="size-3.5 shrink-0 text-amber-500" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <span className="flex items-center gap-1.5 text-[11px] font-semibold text-stone-600 dark:text-slate-300">
+                    <Palette className="size-3.5 text-amber-500" />
+                    <span>{uiLang === 'my' ? '3D စာလုံးကာလာ အရောင် (6 မျိုး)' : '3D Title Color Preset (6 Colors)'}</span>
+                  </span>
+                  <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+                    {THUMBNAIL_COLOR_PRESETS.map((preset) => {
+                      const active = titleColorId === preset.id;
+                      return (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          data-testid={`thumb-color-btn-${preset.id}`}
+                          onClick={() => {
+                            playUiSound('select');
+                            setTitleColorId(preset.id);
+                          }}
+                          className={`flex cursor-pointer items-center gap-2 rounded-xl border px-2.5 py-1.5 text-left transition-all ${
+                            active
+                              ? 'border-amber-500 bg-amber-500/15 text-stone-900 shadow-2xs dark:text-amber-200'
+                              : 'border-stone-200/90 bg-white text-stone-700 hover:border-amber-500/40 dark:border-slate-700/80 dark:bg-[#111720] dark:text-slate-200'
+                          }`}
+                        >
+                          <span
+                            className="size-4 shrink-0 rounded-md border border-black/30 shadow-xs"
+                            style={{ background: preset.swatchCss }}
+                          />
+                          <span className="truncate text-[10px] font-bold">
+                            {uiLang === 'my' ? preset.labelMy : preset.label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Copyable Combined Video Post Title + AI Image Prompt Drawer */}
@@ -1545,21 +1986,46 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                 data-testid="thumbnail-image-prompt-box"
                 className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/[0.04] p-2.5 dark:bg-amber-500/[0.06]"
               >
-                <div className="mb-1 flex items-center justify-between gap-2">
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                    AI Poster Image Prompt (Synced with Selected Title &amp; Part)
+                    AI Poster Prompt (Synced with Selected Title &amp; Part)
                   </span>
-                  <button
-                    type="button"
-                    data-testid="copy-image-prompt-btn"
-                    onClick={handleCopyImagePrompt}
-                    className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-amber-500/40 bg-white px-2 py-0.5 text-[10px] font-bold text-stone-800 hover:bg-amber-50 dark:bg-[#111720] dark:text-amber-200"
-                  >
-                    {copiedPrompt ? <Check className="size-3 text-teal-500" /> : <Copy className="size-3" />}
-                    <span>{copiedPrompt ? 'Copied' : 'Copy Prompt'}</span>
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      data-testid="copy-gemini-app-prompt-btn"
+                      onClick={async () => {
+                        playUiSound('tap');
+                        try {
+                          await navigator.clipboard.writeText(geminiAppQuickPrompt);
+                          setCopiedGeminiAppPrompt(true);
+                          window.setTimeout(() => setCopiedGeminiAppPrompt(false), 1800);
+                        } catch {}
+                      }}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-md bg-amber-500 px-2 py-0.5 text-[10px] font-bold text-slate-950 hover:bg-amber-400"
+                    >
+                      {copiedGeminiAppPrompt ? (
+                        <Check className="size-3" />
+                      ) : (
+                        <Copy className="size-3" />
+                      )}
+                      <span>{copiedGeminiAppPrompt ? 'Copied!' : 'Gemini App (MM)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="copy-image-prompt-btn"
+                      onClick={handleCopyImagePrompt}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-amber-500/40 bg-white px-2 py-0.5 text-[10px] font-bold text-stone-800 hover:bg-amber-50 dark:bg-[#111720] dark:text-amber-200"
+                    >
+                      {copiedPrompt ? <Check className="size-3 text-teal-500" /> : <Copy className="size-3" />}
+                      <span>{copiedPrompt ? 'Copied' : 'EN Prompt'}</span>
+                    </button>
+                  </div>
                 </div>
-                <p className="text-[11px] leading-relaxed text-stone-600 dark:text-slate-300 select-all">
+                <p className="text-[11px] leading-relaxed text-stone-700 dark:text-amber-100/90 select-all">
+                  {geminiAppQuickPrompt}
+                </p>
+                <p className="mt-1.5 border-t border-amber-500/20 pt-1.5 text-[10px] leading-relaxed text-stone-500 dark:text-slate-400 select-all">
                   {liveImagePrompt}
                 </p>
               </div>
@@ -1661,6 +2127,7 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                   disabled={isExtractingFrames}
                   onClick={() => {
                     playUiSound('tap');
+                    hasUserModifiedFramesRef.current = false;
                     setReusedPart1Preset(null);
                     void extractThreeFrames();
                   }}
@@ -1726,59 +2193,66 @@ export const ThumbnailStudioModal: React.FC<ThumbnailStudioModalProps> = ({
                           : 'border-stone-200/90 bg-[#FAF8F4] hover:border-amber-500/50 dark:border-slate-800 dark:bg-[#151C26]'
                       }`}
                     >
-                      {/* Live WYSIWYG High-Res Canvas Poster Preview Stage */}
-                      <div
-                        className="relative mx-auto w-full overflow-hidden bg-slate-950"
-                        style={{
-                          aspectRatio:
-                            aspectRatio === '16:9'
-                              ? '16 / 9'
-                              : aspectRatio === '1:1'
-                                ? '1 / 1'
-                                : aspectRatio === '4:5'
-                                  ? '4 / 5'
-                                  : aspectRatio === '4:3'
-                                    ? '4 / 3'
-                                    : '9 / 16',
-                          maxHeight: '340px'
-                        }}
-                      >
-                        {card.frameDataUrl ? (
-                          <PosterPreviewCanvas
-                            frameDataUrl={card.frameDataUrl}
-                            baseTitle={cleanCardTitle}
-                            partNumber={partNumber}
-                            layoutId={card.layoutId}
-                            aspectRatio={aspectRatio}
-                            channelTag={channelTag}
-                            skipOverlayText={Boolean(card.isFullAiRendered)}
-                            alt={card.label}
-                          />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center bg-slate-900 text-slate-600">
-                            <ImageIcon className="size-8" />
-                          </div>
-                        )}
-
-                        {/* Corner Selection & Source Status Tags */}
-                        <div className="pointer-events-none absolute right-2 bottom-2 left-2 flex items-center justify-between gap-1.5">
-                          <div className="flex items-center gap-1">
-                            {isSelected && (
-                              <span className="flex size-5 items-center justify-center rounded-full bg-amber-500 text-slate-950 shadow-md">
-                                <Check className="size-3 stroke-[3]" />
-                              </span>
-                            )}
-                            {card.isReusedPart1Image && (
-                              <span className="rounded-md bg-teal-600/95 px-1.5 py-0.5 text-[9px] font-bold text-white shadow">
-                                Part 1 Reused
-                              </span>
-                            )}
-                          </div>
-                          {card.isAiPoster && !card.isReusedPart1Image && (
-                            <span className="rounded-md bg-amber-500/90 px-1.5 py-0.5 text-[9px] font-bold text-slate-950 shadow">
-                              AI Art
-                            </span>
+                      {/* Live WYSIWYG Full-Frame Aspect-Locked Canvas Poster Preview Stage (Never Crops Top Title or Bottom Badge on Mobile) */}
+                      <div className="flex w-full items-center justify-center bg-[#06090e] p-2 sm:p-0">
+                        <div
+                          className={`relative mx-auto w-full overflow-hidden rounded-lg sm:rounded-none bg-slate-950 ${
+                            aspectRatio === '16:9' || aspectRatio === '4:3'
+                              ? 'max-w-full'
+                              : 'max-w-[240px] sm:max-w-none'
+                          }`}
+                          style={{
+                            aspectRatio:
+                              aspectRatio === '16:9'
+                                ? '16 / 9'
+                                : aspectRatio === '1:1'
+                                  ? '1 / 1'
+                                  : aspectRatio === '4:5'
+                                    ? '4 / 5'
+                                    : aspectRatio === '4:3'
+                                      ? '4 / 3'
+                                      : '9 / 16'
+                          }}
+                        >
+                          {card.frameDataUrl ? (
+                            <PosterPreviewCanvas
+                              frameDataUrl={card.frameDataUrl}
+                              baseTitle={cleanCardTitle}
+                              partNumber={partNumber}
+                              layoutId={card.layoutId}
+                              titleFontId={titleFontId}
+                              titleColorId={titleColorId}
+                              aspectRatio={aspectRatio}
+                              channelTag={channelTag}
+                              skipOverlayText={Boolean(card.isFullAiRendered)}
+                              alt={card.label}
+                            />
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center bg-slate-900 text-slate-600">
+                              <ImageIcon className="size-8" />
+                            </div>
                           )}
+
+                          {/* Corner Selection & Source Status Tags */}
+                          <div className="pointer-events-none absolute right-2 bottom-2 left-2 flex items-center justify-between gap-1.5">
+                            <div className="flex items-center gap-1">
+                              {isSelected && (
+                                <span className="flex size-5 items-center justify-center rounded-full bg-amber-500 text-slate-950 shadow-md">
+                                  <Check className="size-3 stroke-[3]" />
+                                </span>
+                              )}
+                              {card.isReusedPart1Image && (
+                                <span className="rounded-md bg-teal-600/95 px-1.5 py-0.5 text-[9px] font-bold text-white shadow">
+                                  Part 1 Reused
+                                </span>
+                              )}
+                            </div>
+                            {card.isAiPoster && !card.isReusedPart1Image && (
+                              <span className="rounded-md bg-amber-500/90 px-1.5 py-0.5 text-[9px] font-bold text-slate-950 shadow">
+                                AI Poster
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
 

@@ -174,7 +174,7 @@ export const SidebarAndHeader: React.FC<SidebarAndHeaderProps> = ({
   const activePlanObj = CREDIT_PLANS.find((p) => p.id === activePlanId);
 
   return (
-    <div className="flex h-dvh w-full overflow-hidden bg-[#F7F6F2] dark:bg-[#090C10] text-stone-900 dark:text-slate-100 select-none">
+    <div className="flex flex-1 min-h-0 w-full overflow-hidden bg-[#F7F6F2] dark:bg-[#090C10] text-stone-900 dark:text-slate-100 select-none">
       {/* Mobile Backdrop */}
       {mobileMenuOpen && (
         <div

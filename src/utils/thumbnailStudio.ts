@@ -29,18 +29,37 @@ export interface ThumbnailCandidate {
 
 export interface ThumbnailDirectorAnalysis {
   original_title: string;
+  detected_genre_burmese?: string;
+  visual_hook_summary?: string;
   summary_burmese: string;
   suggested_titles: string[];
   selected_title: string;
+  best_frame_indices?: number[];
   scene_descriptions_en: string[];
   thumbnail_image_prompt: string;
 }
+
+export type ThumbnailFontId =
+  | 'noto_sans'
+  | 'noto_serif'
+  | 'padauk'
+  | 'poster_round';
+
+export type ThumbnailColorPresetId =
+  | 'molten_gold'
+  | 'inferno_crimson'
+  | 'electric_cyan'
+  | 'royal_violet'
+  | 'emerald_venom'
+  | 'pure_platinum';
 
 export interface SavedSeriesPreset {
   id: string;
   baseTitle: string;
   partNumber: number;
   layoutId: ThumbnailLayoutId;
+  titleFontId?: ThumbnailFontId;
+  titleColorId?: ThumbnailColorPresetId;
   frameDataUrl: string;
   aspectRatio: string;
   channelTag?: string;
@@ -182,6 +201,58 @@ export function wrapBurmeseHeadlineLines(
 }
 
 /**
+ * Balances movie poster Burmese headlines into symmetrical, commanding 2-line (or 3-line)
+ * theatrical lockups (e.g. "ကျောကုန်းပေါ်က" / "သွေးစာလုံး ကျိန်စာ") without breaking
+ * Myanmar combining vowel marks or medials.
+ */
+export function balancePosterHeadlineLines(
+  text: string,
+  isLandscape = false
+): string[] {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+
+  const clusters = splitBurmeseClusters(clean);
+  if (isLandscape) {
+    return wrapBurmeseHeadlineLines(clean, 19, 2);
+  }
+  if (clusters.length <= 7) {
+    return [clean];
+  }
+
+  // Prefer a balanced 2-line split at the space closest to the midpoint for titles up to ~20 clusters
+  if (clusters.length <= 22) {
+    const mid = Math.floor(clusters.length / 2);
+    let bestSpaceIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 2; i < clusters.length - 2; i++) {
+      if (clusters[i] === ' ') {
+        const dist = Math.abs(i - mid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestSpaceIdx = i;
+        }
+      }
+    }
+    if (bestSpaceIdx > 0 && bestDist <= Math.ceil(clusters.length * 0.28)) {
+      const line1 = clusters.slice(0, bestSpaceIdx).join('').trim();
+      const line2 = clusters.slice(bestSpaceIdx + 1).join('').trim();
+      if (line1 && line2) {
+        return [line1, line2];
+      }
+    }
+    // If no good space exists (continuous Burmese text), split cleanly at the midpoint cluster
+    if (clusters.length <= 18) {
+      const line1 = clusters.slice(0, mid).join('').trim();
+      const line2 = clusters.slice(mid).join('').trim();
+      if (line1 && line2) return [line1, line2];
+    }
+  }
+
+  return wrapBurmeseHeadlineLines(clean, 11, 3);
+}
+
+/**
  * Resolves high-resolution PNG export canvas dimensions matching the project's aspect ratio.
  */
 export function resolveThumbnailDimensions(aspectRatio: string): {
@@ -319,12 +390,40 @@ export function buildThumbnailImagePromptTemplate(params: {
     ? `At the top center, bold glowing cinematic Burmese typography reading '${cleanTitle}' and directly below it a sleek red badge with the text '${partText}'. Render only the Burmese text listed above. Do not add any other words, Chinese/English text, watermarks, or borders.`
     : `At the top center, bold glowing cinematic Burmese typography reading '${cleanTitle}'. Render only the Burmese text listed above. Do not add any other words, Chinese/English text, watermarks, or borders.`;
 
-  return `Flat front-facing full-bleed cinematic movie recap poster design for a ${orientation} ${ratio} video thumbnail. Dramatic scene depicting ${cleanScene}. High-contrast dramatic lighting, suspenseful cinematic atmosphere, ultra-detailed digital poster art. ${badgeClause}`;
+  return `Flat front-facing full-bleed ultra-photorealistic 8K live-action cinematic movie recap poster photograph for a ${orientation} ${ratio} video thumbnail, shot on ARRI Alexa 35mm lens. Dramatic live-action scene depicting ${cleanScene}. High-contrast dramatic cinema lighting, real human skin pores and natural fabric texture, suspenseful theatrical atmosphere, drifting glowing embers. Strictly live-action photography — NO cartoon, NO anime, NO illustration. ${badgeClause}`;
 }
 
 /**
- * Builds an AI image generation prompt for clean full-bleed poster artwork (negative dark space
- * at upper third) so crisp Burmese 3D typography + red Part badge overlay cleanly without text artifacts.
+ * Builds the exact natural Burmese + cinematic direction prompt for 1-click pasting into Gemini App
+ * alongside the movie clip to produce Nano Banana 2.1 posters identical to the reference style.
+ */
+export function buildGeminiAppQuickPrompt(params: {
+  selectedTitle: string;
+  partNumber?: ThumbnailPartNumber;
+  aspectRatio?: string;
+  sceneDescriptionEn?: string;
+}): string {
+  const ratio =
+    params.aspectRatio === '16:9' ||
+    params.aspectRatio === '1:1' ||
+    params.aspectRatio === '4:5' ||
+    params.aspectRatio === '4:3'
+      ? params.aspectRatio
+      : '9:16';
+  const cleanTitle =
+    stripPartSuffixFromTitle(params.selectedTitle) || 'မထင်မှတ်ထားတဲ့ လျှို့ဝှက်ဇာတ်လမ်း';
+  const partText = formatPartBadgeLabel(
+    params.partNumber === undefined ? 1 : params.partNumber
+  );
+  const sceneHint = String(params.sceneDescriptionEn || '').trim();
+
+  const partClause = partText ? ` နဲ့ ${partText} အနီရောင်ရွှေကွပ် Badge ကိုပါ` : '';
+  return `ဒီဗီဒီယိုထဲက အဓိကဇာတ်ကောင်နဲ့ အထင်ရှားဆုံး Scene ကိုယူပြီး 8K ရုပ်ရှင် Movie Poster ပုံလှလှလေး ဖန်တီးပေးပါ။ အပေါ်အလယ်မှာ "${cleanTitle}" ခေါင်းစဉ်ကို 3D ရွှေလိမ္မော်ရောင် တောက်ပတဲ့ မြန်မာစာလုံးကြီးကြီး${partClause} ထည့်သွင်းပြီး ${ratio} အရွယ်အစား၊ မီးပွားအလင်းအမှောင် (dramatic lighting & glowing embers) တွေနဲ့ အလှဆုံးထုတ်ပေးပါ။${sceneHint ? ` Scene focus: ${sceneHint}` : ''}`;
+}
+
+/**
+ * Builds an AI image generation prompt for ultra-photorealistic live-action movie poster photography
+ * (with clean dark atmospheric upper third) so crisp Burmese 3D typography + red Part badge overlay cleanly.
  */
 export function buildCleanPosterArtworkPrompt(params: {
   sceneDescriptionEn: string;
@@ -340,15 +439,115 @@ export function buildCleanPosterArtworkPrompt(params: {
       : '9:16';
   const cleanScene =
     String(params.sceneDescriptionEn || '').replace(/\s+/g, ' ').trim() ||
-    'intense dramatic movie protagonist in moody atmospheric lighting with suspenseful expression';
+    'dramatic close-up live-action portrait of a tense Asian protagonist inside a dimly lit atmospheric room with intense emotional expression';
   const moodBoost =
     params.styleVariant === 'golden_drama'
-      ? 'blazing amber rim lighting against obsidian shadows, swirling golden fire embers, dramatic depth of field'
+      ? 'blazing warm amber rim lighting against deep obsidian shadows, subtle floating golden embers, anamorphic bokeh'
       : params.styleVariant === 'dark_mystery'
-        ? 'cold cyan and deep blood-crimson chiaroscuro spotlight, volumetric rain mist, glowing embers'
-        : 'cinematic teal and fiery crimson backlighting, razor-sharp key light, drifting glowing embers and volumetric haze';
+        ? 'cold moody teal-cyan shadows paired with deep crimson key lighting, atmospheric haze, fine drifting glowing sparks'
+        : 'moody dark green-teal shadows and dramatic crimson-amber theatrical backlighting, razor-sharp 35mm film grain, subtle drifting orange fire embers';
 
-  return `Flat front-facing full-bleed theatrical IMAX movie poster illustration for ${ratio} vertical aspect ratio. Dramatic scene depicting ${cleanScene}. ${moodBoost}, hyper-detailed digital key art, ultra-crisp dramatic focus on characters and action in the lower two-thirds, dark moody uncluttered atmospheric backdrop in the top third reserved for typography. Strictly NO text, NO letters, NO Burmese/Chinese/English words, NO logos, NO watermarks, NO borders.`;
+  return `Ultra-photorealistic 8K live-action Asian cinema movie poster photograph (${ratio} aspect ratio), shot on ARRI Alexa 65 with 35mm lens, shallow depth of field, authentic human skin pores and natural clothing fabric texture. Dramatic live-action movie still depicting ${cleanScene}. ${moodBoost}. Frame the realistic human protagonist prominently in the lower two-thirds, with deep dark moody uncluttered atmospheric shadows in the top third reserved for typography. Strictly live-action photographic realism — NO cartoon, NO anime, NO vector art, NO painting, NO illustration, NO text, NO letters, NO Burmese/Chinese/English words, NO logos, NO watermarks, NO borders.`;
+}
+
+/**
+ * Builds an Image-to-Image poster transformation prompt that takes a REAL video keyframe
+ * and dramatically upgrades the actual character & scene into an ultra-photorealistic live-action
+ * movie recap poster (preserving real character identity, iconic marks/props, and setting while
+ * adding cinema lighting, glowing embers, and clean dark upper-third negative space).
+ */
+export function buildSceneTransformPosterPrompt(params: {
+  sceneDescriptionEn: string;
+  aspectRatio?: string;
+  styleVariant?: 'crimson_corridor' | 'golden_drama' | 'dark_mystery';
+  directPromptWithText?: boolean;
+  selectedTitle?: string;
+  partNumber?: ThumbnailPartNumber;
+}): string {
+  const ratio =
+    params.aspectRatio === '16:9' ||
+    params.aspectRatio === '1:1' ||
+    params.aspectRatio === '4:5' ||
+    params.aspectRatio === '4:3' ||
+    params.aspectRatio === '3:4'
+      ? params.aspectRatio
+      : '9:16';
+  const orientation = ratio === '16:9' || ratio === '4:3' ? 'horizontal' : 'vertical';
+  const cleanScene =
+    String(params.sceneDescriptionEn || '').replace(/\s+/g, ' ').trim() ||
+    'dramatic live-action protagonist from the reference video frame with heightened suspenseful expression and theatrical lighting';
+
+  const moodBoost =
+    params.styleVariant === 'golden_drama'
+      ? 'blazing warm amber and golden rim lighting, deep theatrical contrast, subtle floating glowing sparks and embers'
+      : params.styleVariant === 'dark_mystery'
+        ? 'cold moody cyan shadows paired with deep crimson rim highlights, atmospheric depth, razor-sharp 35mm live-action detail and drifting embers'
+        : 'moody dark teal-and-crimson theatrical horror/thriller film lighting, authentic ultra-sharp skin pores and fabric texture, subtle drifting fiery orange embers';
+
+  const cleanTitle = stripPartSuffixFromTitle(params.selectedTitle || '');
+  const partText = formatPartBadgeLabel(
+    params.partNumber === undefined ? 1 : params.partNumber
+  );
+
+  const textDirective =
+    params.directPromptWithText && cleanTitle
+      ? partText
+        ? `At the top center inside the dark atmospheric headroom, place bold glowing 3D molten gold-orange Burmese movie poster typography reading '${cleanTitle}', and directly underneath it an ornate crimson-red badge with thin gold trim reading '${partText}'. Render ONLY this exact Burmese text and no other words.`
+        : `At the top center inside the dark atmospheric headroom, place bold glowing 3D molten gold-orange Burmese movie poster typography reading '${cleanTitle}'. Render ONLY this exact Burmese text and no other words.`
+      : 'Keep the upper third clean, dark, moody atmospheric negative space reserved for typography. Strictly NO added text, NO letters, NO Burmese/Chinese/English words, NO logos, NO borders.';
+
+  return `Using the attached real live-action video frame as the exact character and scene reference, transform it into a flat front-facing full-bleed ultra-photorealistic 8K live-action ${orientation} ${ratio} theatrical movie poster photograph, shot on ARRI Alexa 35mm lens. STRICTLY preserve the real main character's face, body, hair, pose, clothing, iconic marks/props, and real setting from the reference frame — do NOT replace them with a different person and do NOT turn it into a cartoon or drawing. Enhance the real footage into cinematic blockbuster movie still photography: ${cleanScene}. Apply ${moodBoost}. Frame the hero character prominently in the lower two-thirds, seamlessly extending and darkening the top third into moody atmospheric shadows. Cleanly remove any original video subtitles, Chinese/English captions, TikTok/channel watermarks, or black letterbox bars from the source frame. Strictly live-action photographic realism — NO cartoon, NO anime, NO vector illustration, NO painting. ${textDirective}`;
+}
+
+/**
+ * Picks up to 3 distinct hero frames from a multi-frame video scan using AI-selected indices,
+ * falling back cleanly to balanced opening/middle/climax picks when indices are missing.
+ */
+export function selectBestFramesByIndices(
+  scannedFrames: VideoFrameOption[],
+  bestIndices?: number[] | null
+): VideoFrameOption[] {
+  const validFrames = scannedFrames.filter((f) => Boolean(f?.dataUrl));
+  if (validFrames.length <= 3) return validFrames;
+
+  const picked: VideoFrameOption[] = [];
+  const used = new Set<number>();
+
+  if (Array.isArray(bestIndices)) {
+    for (const rawIdx of bestIndices) {
+      const idx = Math.floor(Number(rawIdx));
+      if (Number.isInteger(idx) && idx >= 0 && idx < validFrames.length && !used.has(idx)) {
+        used.add(idx);
+        picked.push(validFrames[idx]);
+        if (picked.length >= 3) break;
+      }
+    }
+  }
+
+  const defaultFallbacks = [
+    Math.min(validFrames.length - 1, Math.floor(validFrames.length * 0.2)),
+    Math.min(validFrames.length - 1, Math.floor(validFrames.length * 0.52)),
+    Math.min(validFrames.length - 1, Math.floor(validFrames.length * 0.84))
+  ];
+  for (const idx of defaultFallbacks) {
+    if (picked.length >= 3) break;
+    if (!used.has(idx) && validFrames[idx]) {
+      used.add(idx);
+      picked.push(validFrames[idx]);
+    }
+  }
+  for (let i = 0; i < validFrames.length && picked.length < 3; i++) {
+    if (!used.has(i)) {
+      used.add(i);
+      picked.push(validFrames[i]);
+    }
+  }
+
+  const roleLabels = ['AI Hero Scene', 'Dramatic Turning Point', 'Climax Scene'];
+  return picked.slice(0, 3).map((frame, i) => ({
+    ...frame,
+    label: roleLabels[i] || frame.label
+  }));
 }
 
 /**
@@ -400,9 +599,9 @@ export function normalizeDirectorAnalysisResult(params: {
     ? params.raw!.scene_descriptions_en.map((s) => String(s || '').trim()).filter(Boolean)
     : [];
   const defaultScenes = [
-    'a tense protagonist turning slightly in a shadowed atmospheric hallway illuminated by flickering fluorescent light, glowing red tension aura and floating fiery sparks around them',
-    'a dramatic close-up of two opposing characters in deep emotional shock under high-contrast crimson and teal rim lighting, storm haze and cinematic suspense',
-    'a lone mysterious figure facing a looming dark revelation in pouring rain with dramatic backlit silhouettes, glowing amber embers, and intense theatrical shadows'
+    'close-up live-action photograph of a shocked Asian protagonist standing inside a dimly lit eerie corridor under cold fluorescent shadows, intense dramatic rim light and subtle glowing orange embers',
+    'dramatic medium-shot live-action movie still of the main character in deep emotional tension facing an unseen threat, warm amber key lighting against deep cinematic shadows',
+    'intense high-contrast live-action cinema close-up of the protagonist in a climactic confrontation inside a dark interior room, sharp facial detail, cold teal shadows and fiery amber rim highlights'
   ];
   const scene_descriptions_en = [
     rawScenes[0] || defaultScenes[0],
@@ -417,11 +616,29 @@ export function normalizeDirectorAnalysisResult(params: {
     aspectRatio: params.aspectRatio
   });
 
+  const detected_genre_burmese =
+    String(params.raw?.detected_genre_burmese || '').trim() || undefined;
+  const visual_hook_summary =
+    String(params.raw?.visual_hook_summary || '').trim() || undefined;
+  const best_frame_indices = Array.isArray(params.raw?.best_frame_indices)
+    ? Array.from(
+        new Set(
+          params.raw!.best_frame_indices
+            .map((n) => Math.floor(Number(n)))
+            .filter((n) => Number.isInteger(n) && n >= 0 && n < 12)
+        )
+      ).slice(0, 3)
+    : undefined;
+
   return {
     original_title,
+    detected_genre_burmese,
+    visual_hook_summary,
     summary_burmese,
     suggested_titles,
     selected_title,
+    best_frame_indices:
+      best_frame_indices && best_frame_indices.length > 0 ? best_frame_indices : undefined,
     scene_descriptions_en,
     thumbnail_image_prompt
   };
@@ -443,11 +660,11 @@ export const POSTER_THEME_SPECS: Record<ThumbnailLayoutId, PosterThemeVisualSpec
     id: 'poster_gold_3d',
     headlinePlacement: 'top',
     badgeStyle: 'crimson_gold_ribbon',
-    gradientStops: ['#fffbeb', '#fde047', '#f59e0b', '#c2410c'],
-    outlineColor: '#1b0701',
-    glowColor: 'rgba(234, 88, 12, 0.92)',
+    gradientStops: ['#fffef0', '#fde047', '#f97316', '#c2410c'],
+    outlineColor: '#1b0601',
+    glowColor: 'rgba(249, 115, 22, 0.94)',
     emberTint: 'gold_orange',
-    canvasFilter: 'contrast(1.13) saturate(1.18) brightness(0.97)'
+    canvasFilter: 'contrast(1.16) saturate(1.18) brightness(0.95)'
   },
   cinema_hook: {
     id: 'cinema_hook',
@@ -480,6 +697,158 @@ export const POSTER_THEME_SPECS: Record<ThumbnailLayoutId, PosterThemeVisualSpec
     canvasFilter: 'contrast(1.14) saturate(1.16)'
   }
 };
+
+export interface ThumbnailFontOption {
+  id: ThumbnailFontId;
+  label: string;
+  labelMy: string;
+  sampleMy: string;
+  fontFamily: string;
+  fontWeight: number;
+  loadSpec: string;
+  sizeMultiplier: number;
+}
+
+export const THUMBNAIL_FONT_OPTIONS: ThumbnailFontOption[] = [
+  {
+    id: 'noto_sans',
+    label: 'Cinema Bold',
+    labelMy: 'ရုပ်ရှင် Bold',
+    sampleMy: 'ကျိန်စာ',
+    fontFamily: '"Noto Sans Myanmar", "Pyidaungsu", "Padauk", sans-serif',
+    fontWeight: 900,
+    loadSpec: '900 48px "Noto Sans Myanmar"',
+    sizeMultiplier: 1.0
+  },
+  {
+    id: 'noto_serif',
+    label: 'Classic Serif',
+    labelMy: 'ဂန္ထဝင် Serif',
+    sampleMy: 'ကျိန်စာ',
+    fontFamily: '"Noto Serif Myanmar", Georgia, "Noto Sans Myanmar", serif',
+    fontWeight: 800,
+    loadSpec: '800 48px "Noto Serif Myanmar"',
+    sizeMultiplier: 0.96
+  },
+  {
+    id: 'padauk',
+    label: 'Modern Clean',
+    labelMy: 'ပိတောက် Clean',
+    sampleMy: 'ကျိန်စာ',
+    fontFamily: '"Padauk", "Noto Sans Myanmar", sans-serif',
+    fontWeight: 700,
+    loadSpec: '700 48px "Padauk"',
+    sizeMultiplier: 1.04
+  },
+  {
+    id: 'poster_round',
+    label: 'Poster Round',
+    labelMy: 'ပိုစတာ အဝိုင်း',
+    sampleMy: 'ကျိန်စာ',
+    fontFamily: '"Pyidaungsu", "Myanmar Text", "Padauk", "Noto Sans Myanmar", sans-serif',
+    fontWeight: 800,
+    loadSpec: '700 48px "Padauk"',
+    sizeMultiplier: 0.98
+  }
+];
+
+export interface ThumbnailColorPreset {
+  id: ThumbnailColorPresetId;
+  label: string;
+  labelMy: string;
+  swatchCss: string;
+  gradientStops: [string, string, string, string];
+  baseShadowStop: string;
+  outlineColor: string;
+  contourColor: string;
+  glowColor: string;
+  emberTint: 'gold_orange' | 'crimson_fire' | 'icy_amber';
+}
+
+export const THUMBNAIL_COLOR_PRESETS: ThumbnailColorPreset[] = [
+  {
+    id: 'molten_gold',
+    label: 'Molten Gold',
+    labelMy: 'ရွှေမီးတောက်',
+    swatchCss: 'linear-gradient(180deg, #fffef0 0%, #fde047 40%, #f97316 78%, #c2410c 100%)',
+    gradientStops: ['#fffef0', '#fde047', '#f97316', '#c2410c'],
+    baseShadowStop: '#7c2d12',
+    outlineColor: '#1b0601',
+    contourColor: '#2a0901',
+    glowColor: 'rgba(249, 115, 22, 0.94)',
+    emberTint: 'gold_orange'
+  },
+  {
+    id: 'inferno_crimson',
+    label: 'Inferno Red',
+    labelMy: 'သွေးနီမီးလျှံ',
+    swatchCss: 'linear-gradient(180deg, #fff1f2 0%, #fda4af 32%, #ef4444 68%, #991b1b 100%)',
+    gradientStops: ['#fff1f2', '#fca5a5', '#ef4444', '#991b1b'],
+    baseShadowStop: '#450a0a',
+    outlineColor: '#1a0204',
+    contourColor: '#2d0509',
+    glowColor: 'rgba(239, 68, 68, 0.95)',
+    emberTint: 'crimson_fire'
+  },
+  {
+    id: 'electric_cyan',
+    label: 'Electric Cyan',
+    labelMy: 'ရေခဲပြာတောက်',
+    swatchCss: 'linear-gradient(180deg, #f0f9ff 0%, #7dd3fc 38%, #06b6d4 75%, #0369a1 100%)',
+    gradientStops: ['#f0f9ff', '#7dd3fc', '#06b6d4', '#0369a1'],
+    baseShadowStop: '#0c4a6e',
+    outlineColor: '#020b18',
+    contourColor: '#06192e',
+    glowColor: 'rgba(6, 182, 212, 0.92)',
+    emberTint: 'icy_amber'
+  },
+  {
+    id: 'royal_violet',
+    label: 'Royal Violet',
+    labelMy: 'ခရမ်းရောင်တောက်',
+    swatchCss: 'linear-gradient(180deg, #faf5ff 0%, #d8b4fe 38%, #a855f7 74%, #6b21a8 100%)',
+    gradientStops: ['#faf5ff', '#d8b4fe', '#a855f7', '#6b21a8'],
+    baseShadowStop: '#3b0764',
+    outlineColor: '#12031e',
+    contourColor: '#230738',
+    glowColor: 'rgba(168, 85, 247, 0.92)',
+    emberTint: 'icy_amber'
+  },
+  {
+    id: 'emerald_venom',
+    label: 'Emerald Venom',
+    labelMy: 'မြစိမ်းတောက်',
+    swatchCss: 'linear-gradient(180deg, #ecfdf5 0%, #6ee7b7 38%, #10b981 74%, #047857 100%)',
+    gradientStops: ['#ecfdf5', '#6ee7b7', '#10b981', '#047857'],
+    baseShadowStop: '#064e3b',
+    outlineColor: '#02150e',
+    contourColor: '#04261a',
+    glowColor: 'rgba(16, 185, 129, 0.9)',
+    emberTint: 'icy_amber'
+  },
+  {
+    id: 'pure_platinum',
+    label: 'Pure Silver',
+    labelMy: 'ငွေဖြူတောက်',
+    swatchCss: 'linear-gradient(180deg, #ffffff 0%, #f1f5f9 42%, #cbd5e1 76%, #64748b 100%)',
+    gradientStops: ['#ffffff', '#f1f5f9', '#cbd5e1', '#64748b'],
+    baseShadowStop: '#334155',
+    outlineColor: '#05070c',
+    contourColor: '#0f172a',
+    glowColor: 'rgba(226, 232, 240, 0.85)',
+    emberTint: 'icy_amber'
+  }
+];
+
+export function resolveThumbnailFontOption(fontId?: ThumbnailFontId | string | null): ThumbnailFontOption {
+  return THUMBNAIL_FONT_OPTIONS.find((f) => f.id === fontId) || THUMBNAIL_FONT_OPTIONS[0];
+}
+
+export function resolveThumbnailColorPreset(
+  colorId?: ThumbnailColorPresetId | string | null
+): ThumbnailColorPreset {
+  return THUMBNAIL_COLOR_PRESETS.find((c) => c.id === colorId) || THUMBNAIL_COLOR_PRESETS[0];
+}
 
 export const LAYOUT_OPTIONS: Array<{
   id: ThumbnailLayoutId;
@@ -601,6 +970,8 @@ export function buildPart2ContinuationCandidates(params: {
   baseTitle: string;
   partNumber: number;
   layoutId: ThumbnailLayoutId;
+  titleFontId: ThumbnailFontId;
+  titleColorId: ThumbnailColorPresetId;
   candidates: ThumbnailCandidate[];
 } {
   const partNumber = Math.max(2, params.targetPartNumber ?? params.preset.partNumber + 1);
@@ -614,6 +985,8 @@ export function buildPart2ContinuationCandidates(params: {
     baseTitle,
     partNumber,
     layoutId: params.preset.layoutId || 'poster_gold_3d',
+    titleFontId: params.preset.titleFontId || 'noto_sans',
+    titleColorId: params.preset.titleColorId || 'molten_gold',
     candidates
   };
 }
@@ -656,6 +1029,8 @@ export function saveSeriesPreset(
     baseTitle: cleanBase,
     partNumber: Math.max(1, Math.floor(preset.partNumber || 1)),
     layoutId: preset.layoutId || 'cinema_hook',
+    titleFontId: preset.titleFontId || 'noto_sans',
+    titleColorId: preset.titleColorId || 'molten_gold',
     frameDataUrl: preset.frameDataUrl,
     aspectRatio: preset.aspectRatio || '9:16',
     channelTag: preset.channelTag,

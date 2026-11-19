@@ -14,6 +14,7 @@ import {
 import {
   LONG_FORM_STYLE_PROMPTS,
   VOICE_OPTIONS,
+  calculateCreditCost,
   exportCuesToSrt,
   type LongFormStyleId,
   type VoiceGender,
@@ -361,8 +362,8 @@ export const LongFormStudio: React.FC<{ uiLang: 'my' | 'en' }> = ({ uiLang }) =>
                     }`}
                   >
                     <span className="text-xs font-bold">{m.label}</span>
-                    <span className="text-[10px] font-mono text-amber-600 dark:text-amber-400 mt-0.5">
-                      {m.aspect} · {m.durationLabel}
+                    <span className="text-[10px] font-mono tabular-nums text-amber-600 dark:text-amber-400 mt-0.5">
+                      {m.aspect} · {m.durationLabel} · {calculateCreditCost(m.targetSec, false)} Cr
                     </span>
                   </button>
                 );

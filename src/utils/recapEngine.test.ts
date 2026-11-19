@@ -8,7 +8,11 @@ import {
   findActiveCue,
   calculateSubtitleScalePercent,
   clampBlurRegion,
+  CREDIT_SECONDS_PER_UNIT,
   calculateCreditCost,
+  parseDismissedSiteNotificationIds,
+  addDismissedSiteNotificationId,
+  shouldShowSiteNotification,
   buildSyncedRecapCues,
   splitCuesIntoShortPhrases,
   getVoicePreviewSampleText,
@@ -115,15 +119,20 @@ test('clampBlurRegion prevents out-of-bounds watermark boxes', () => {
   assert.equal(clamped.blurStrength, 60);
 });
 
-test('calculateCreditCost computes flat 1 credit per 60 seconds across all AI voices, and 0 for free recap', () => {
+test('calculateCreditCost computes flat 1 credit per 1:10 (70 seconds) across all AI voices, and 0 for free recap', () => {
   assert.equal(FREE_DAILY_VIDEO_LIMIT, 5);
   assert.equal(FREE_MAX_DURATION_SEC, 150);
+  assert.equal(CREDIT_SECONDS_PER_UNIT, 70);
 
   assert.equal(calculateCreditCost(45, true), 0);
+  assert.equal(calculateCreditCost(1, false), 1);
   assert.equal(calculateCreditCost(45, false), 1);
-  assert.equal(calculateCreditCost(125, false), 3);
+  assert.equal(calculateCreditCost(70, false), 1);
+  assert.equal(calculateCreditCost(71, false), 2);
+  assert.equal(calculateCreditCost(140, false), 2);
+  assert.equal(calculateCreditCost(141, false), 3);
 
-  // Flat 1 credit per minute across all AI voices
+  // Flat 1 credit per 1:10 (70s) across all AI voices
   assert.equal(calculateCreditCost(120, false, { voiceGender: 'kore' }), 2);
   assert.equal(calculateCreditCost(120, false, { voiceGender: 'male' }), 2);
   assert.equal(calculateCreditCost(300, false, { voiceGender: 'aoede' }), 5);
@@ -182,6 +191,15 @@ test('splitCuesIntoShortPhrases and buildSyncedRecapCues generate crisp 1-line n
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('SHORT, PUNCHY 1-LINE PHRASES'));
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('STRICT THIRD-PERSON RECAP NARRATION ONLY'));
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('ZERO REPETITION'));
+
+  // Verify new Natural Flow ('natural') script style prompt and cues
+  assert.equal(SCRIPT_STYLE_PROMPTS.natural.labelEn, 'Natural Flow');
+  assert.ok(SCRIPT_STYLE_PROMPTS.natural.systemPrompt.includes('Natural Flow style'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.natural.systemPrompt.includes('AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်"'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.natural.systemPrompt.includes('NATURAL SPOKEN BURMESE FLOW & VARIED ENDINGS'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.natural.systemPrompt.includes('...လိုက်တော့တာပေါ့'));
+  const naturalResult = buildSyncedRecapCues(20, 'natural', 'my', 'Natural Flow Clip');
+  assert.ok(naturalResult.cues.length >= 6);
 
   // Verify 70-second SaveTik wedding drama cues start with exact StreamWave 1-line phrase
   const weddingResult = buildSyncedRecapCues(
@@ -1023,6 +1041,9 @@ test('alignCuesWithAudioSync keeps 123.67s 44-cue movie recap locked to video sc
 
 import {
   resolveSubtitleFontMeta,
+  doesTextMatchSubtitleLanguage,
+  needsSubtitleTranslation,
+  parseTranslatedSubtitleChunkOutput,
   buildChronologicalSceneLockGuide,
   computeAudioScriptWindows,
   sliceTimedTranscriptForWindow,
@@ -1349,4 +1370,74 @@ test('RedNote (Xiaohongshu) helpers parse share snippets, normalize domains, and
     false
   );
 });
+
+test('Site online notification helpers show active update once, hide across reloads after X dismiss, and re-show only on new Telegram update ID', () => {
+  const firstNotice = {
+    id: 'notif_1001_abc',
+    message: 'Website Update v2.5 တင်ပြီးပါပြီ (1:30 = 1 Credit)',
+    updatedAt: 1795000000000,
+    active: true
+  };
+
+  // Fresh user with empty storage sees the active announcement
+  const initialDismissed = parseDismissedSiteNotificationIds(null);
+  assert.deepEqual(initialDismissed, []);
+  assert.equal(shouldShowSiteNotification(firstNotice, initialDismissed), true);
+
+  // User clicks X -> saved ID stays hidden across reloads
+  const afterDismiss = addDismissedSiteNotificationId(initialDismissed, firstNotice.id);
+  const reloadedDismissed = parseDismissedSiteNotificationIds(JSON.stringify(afterDismiss));
+  assert.equal(shouldShowSiteNotification(firstNotice, reloadedDismissed), false);
+
+  // Admin clears notification (/clearnotify) -> hidden
+  assert.equal(shouldShowSiteNotification({ ...firstNotice, active: false }, []), false);
+  assert.equal(shouldShowSiteNotification(null, []), false);
+
+  // Admin posts a brand-new announcement (/notify) -> new ID appears once to everyone
+  const secondNotice = {
+    id: 'notif_2002_def',
+    message: 'Natural Flow Script Style အသစ် ထည့်သွင်းပြီးပါပြီ',
+    updatedAt: 1795003600000,
+    active: true
+  };
+  assert.equal(shouldShowSiteNotification(secondNotice, reloadedDismissed), true);
+});
+
+test('Multilingual subtitle helpers detect untranslated Burmese and parse indexed/JSON/numbered LLM outputs for all 6 languages', () => {
+  assert.equal(doesTextMatchSubtitleLanguage('ကျောကုန်းပေါ်က ကျိန်စာ', 'my'), true);
+  assert.equal(doesTextMatchSubtitleLanguage('ကျောကုန်းပေါ်က ကျိန်စာ', 'en'), false);
+  assert.equal(doesTextMatchSubtitleLanguage('The curse on his back changed everything.', 'en'), true);
+  assert.equal(doesTextMatchSubtitleLanguage('เพราะคำสาปบนแผ่นหลัง', 'th'), true);
+  assert.equal(doesTextMatchSubtitleLanguage('등 뒤의 저주로 모든 것이 변했다', 'ko'), true);
+  assert.equal(doesTextMatchSubtitleLanguage('背上的血字诅咒改变了他的一生', 'zh'), true);
+  assert.equal(doesTextMatchSubtitleLanguage('背中の呪いが彼の人生を変えた', 'ja'), true);
+
+  const burmeseCues = [
+    { id: '1', start_ms: 0, end_ms: 2000, text: 'ကျောကုန်းပေါ်က သွေးစာလုံး ကျိန်စာ' },
+    { id: '2', start_ms: 2000, end_ms: 4000, text: 'သူ့ဘဝတစ်ခုလုံး ပြောင်းလဲသွားခဲ့တယ်' }
+  ];
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'my'), false);
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'en'), true);
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'th'), true);
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'ko'), true);
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'zh'), true);
+  assert.equal(needsSubtitleTranslation(burmeseCues, 'ja'), true);
+
+  // Indexed JSON survives missing item without discarding other lines
+  const indexed = parseTranslatedSubtitleChunkOutput(
+    '```json\n{"items":[{"i":1,"t":"First line"},{"i":3,"t":"Third line"}]}\n```',
+    3
+  );
+  assert.deepEqual(indexed, ['First line', null, 'Third line']);
+
+  // Object response from Cloudflare Workers AI
+  const cfObj = parseTranslatedSubtitleChunkOutput({ lines: ['1. สวัสดี', '2. ลาก่อน'] }, 2);
+  assert.deepEqual(cfObj, ['สวัสดี', 'ลาก่อน']);
+
+  // Plain numbered text fallback
+  const numbered = parseTranslatedSubtitleChunkOutput('1. 안녕하세요\n2. 감사합니다', 2);
+  assert.deepEqual(numbered, ['안녕하세요', '감사합니다']);
+});
+
+
 

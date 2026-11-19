@@ -14,7 +14,7 @@ export type VoiceGender =
   | 'orus'
   | 'zephyr';
 export type CreditPlanId = 'free' | 'starter-pack' | 'creator-pro' | 'creator-pro-max';
-export type ScriptStyleId = 'narrator' | 'drama' | 'casual' | 'news' | 'none';
+export type ScriptStyleId = 'narrator' | 'natural' | 'drama' | 'casual' | 'news' | 'none';
 export type LongFormStyleId = 'educational' | 'dramatic' | 'listicle' | 'documentary' | 'morris';
 export type AspectRatioMode = 'original' | '9:16' | '16:9' | '1:1' | '4:5';
 export type FramingFitMode = 'pad' | 'crop';
@@ -228,6 +228,14 @@ Rules:
 - Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
 - Do not repeat the same meaning across consecutive cues.
 - Use natural spoken Burmese endings ("...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", "...နေတုန်းမှာပဲ") without trailing "။".`,
+  natural: `You are a Burmese movie recap narrator (Natural Flow style).
+Rewrite the timestamped transcript into a natural, lively spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+Rules:
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
+- Open with a strong hook in the first 3 seconds.
+- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
+- Do not repeat the same meaning across consecutive cues.
+- AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence. Vary sentence endings naturally like a real human Burmese storyteller ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မှန်း မသိခဲ့ဘူးလေ") without trailing "။".`,
   drama: `You are a Burmese movie recap storyteller (Storytelling / Drama style — Tone: Intense & Cinematic).
 Rewrite the timestamped transcript into an emotionally gripping, continuous third-person spoken Myanmar movie recap with cinematic intensity and short punchy sentences.
 Rules:
@@ -285,6 +293,38 @@ CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
    - Open immediately (0.0s–3.0s) with a gripping hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
 5. NATURAL SPOKEN BURMESE FLOW:
    - Use lively spoken Burmese recap connectors and endings ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "နောက်ဆုံးမှာတော့", "...လိုက်ပါတယ်", "...နေတုန်းမှာပဲ", "...သွားခဲ့ပါတယ်"). Avoid trailing "။" inside subtitle text.
+6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+  },
+  natural: {
+    id: 'natural',
+    labelEn: 'Natural Flow',
+    labelMy: 'သဘာဝ အပြောဟန် (Natural Flow)',
+    badge: 'LIVELY · HUMAN FLOW',
+    descriptionEn: 'Lively human Burmese storyteller with varied natural sentence endings (...လိုက်တော့တာပေါ့, ...သွားခဲ့ပြီ, ...လုပ်ချလိုက်ပါလေရော) — avoids repetitive "...ပါတယ်".',
+    descriptionMy: '“...တယ် / ...ပါတယ်” ချည်း ထပ်မနေဘဲ တကယ့်လူတစ်ယောက် ဇာတ်လမ်းပြောပြသလို သဘာဝကျကျ အဆုံးသတ်မျိုးစုံဖြင့် သွက်လက်စွာ ပြန်ပြောပြမယ့်ဟန်။',
+    pacingWpm: 155,
+    systemPrompt: `You are a Burmese movie recap narrator (Natural Flow style).
+Rewrite the timestamped transcript into a natural, lively spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+Rules:
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
+- Open with a strong hook in the first 3 seconds.
+- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
+- Do not repeat the same meaning across consecutive cues.
+- AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence. Vary sentence endings naturally like a real human Burmese storyteller ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မှန်း မသိခဲ့ဘူးလေ") without trailing "။".
+
+CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
+1. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT DIALOGUE TRANSLATION):
+   - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
+   - NEVER output raw first-person or second-person character dialogue ("ငါ", "မင်း", "နင်") as if dubbing the actors!
+   - Convert every spoken line in the transcript into natural spoken Myanmar third-person recap storytelling.
+2. ZERO REPETITION / NO DUPLICATE MEANING:
+   - NEVER write two consecutive cues that repeat the same point in different words. Every cue must advance the plot with new action, cause-and-effect, or twist.
+3. SHORT, PUNCHY 1-LINE PHRASES:
+   - Every cue.text MUST be one crisp spoken Burmese recap phrase of 5 to 10 words (26 to 50 Burmese characters, ~2.0s–2.8s when spoken). Never write multi-sentence paragraphs in one cue.
+4. HOOK FIRST & CONTINUOUS SCENE SYNC:
+   - Open immediately (0.0s–3.0s) with a gripping hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
+5. NATURAL SPOKEN BURMESE FLOW & VARIED ENDINGS:
+   - Use lively spoken Burmese recap connectors ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့လည်း", "တကယ်တမ်းကျတော့", "နောက်ဆုံးမှာတော့") and vary your sentence endings naturally ("...လိုက်တော့တာပေါ့", "...နေတုန်းမှာပဲ", "...ဖြစ်သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်လိုက်ပါလေရော", "...မထင်ထားခဲ့ဘူး") so it never sounds robotic. Avoid trailing "။" inside subtitle text.
 6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   drama: {
@@ -1679,6 +1719,22 @@ export const SAVETIK_WEDDING_DRAMA_CUES: Record<ScriptStyleId, SubtitleCue[]> = 
       text: 'သတို့သမီးက ကိုယ်ဝန်ရှိနေပြီဆိုပြီး အော်ဟစ်တားဆီးလိုက်ပါတော့တယ်'
     }
   ],
+  natural: [
+    { id: 'st-nat-1', start_ms: 100, end_ms: 3200, text: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်လဲလို့ သတို့သားက မေးချလိုက်တော့တာပေါ့' },
+    { id: 'st-nat-2', start_ms: 3320, end_ms: 6800, text: 'သတို့သမီးကတော့ အိမ်ပြင်လိုက်တာပါဆိုပြီး ခပ်တည်တည်ပဲ လိမ်ညာနေတုန်းမှာပဲ' },
+    { id: 'st-nat-3', start_ms: 6920, end_ms: 10600, text: 'အဲဒီအချိန်မှာပဲ အိမ်ရှင်မိန်းကလေး ဝင်လာပြီး အမှန်တရားကို ဖော်ထုတ်လိုက်ပါလေရော' },
+    { id: 'st-nat-4', start_ms: 10720, end_ms: 14500, text: 'ပရိဘောဂအားလုံးက လွန်ခဲ့တဲ့သုံးနှစ်ကတည်းက သူမဝယ်ထားတာချည်း ဖြစ်နေခဲ့ပြီ' },
+    { id: 'st-nat-5', start_ms: 14620, end_ms: 19200, text: 'သတို့သားလည်း ဒေါသထွက်ပြီး နောက်ဆုံးအကြိမ် ထပ်စစ်မေးလိုက်တော့တာပေါ့' },
+    { id: 'st-nat-6', start_ms: 19320, end_ms: 24100, text: 'မိခင်ဖြစ်သူကလည်း ဒီငွေဟာ မင်္ဂလာအိမ်ပြင်ဖို့ ပေးထားတာမှန်း ထောက်ပြလိုက်ပြီ' },
+    { id: 'st-nat-7', start_ms: 24220, end_ms: 29200, text: 'တကယ်တမ်းကျတော့ သတို့သမီးအမေက နှစ်သိန်းကို သားငယ်အိမ်ဝယ်ဖို့ သုံးပစ်ခဲ့တာလေ' },
+    { id: 'st-nat-8', start_ms: 29320, end_ms: 34200, text: 'မိသားစုချင်း ခဏယူသုံးတာ ဘာဖြစ်လဲဆိုပြီး ပြန်အော်ဟစ်နေခဲ့ရရှာတယ်' },
+    { id: 'st-nat-9', start_ms: 34320, end_ms: 39600, text: 'ဒါပေမဲ့လည်း သတို့သားဘက်က လုံးဝသည်းမခံနိုင်တော့တဲ့ အခြေအနေ ရောက်သွားခဲ့ပြီ' },
+    { id: 'st-nat-10', start_ms: 39720, end_ms: 45100, text: 'ဒီအိမ်ကိုပါ မောင်လေးအတွက် ပေးလိုက်မယ်ဆိုပြီး မျက်နှာပြောင်တိုက် ပြောချလိုက်ပါလေရော' },
+    { id: 'st-nat-11', start_ms: 45220, end_ms: 51200, text: 'အဲဒီစကားကြားတာနဲ့ အိမ်ပိုင်ရှင်အစစ်က ဂရန်စာချုပ်ကို စားပွဲပေါ် ပစ်တင်လိုက်တော့တာပေါ့' },
+    { id: 'st-nat-12', start_ms: 51320, end_ms: 57500, text: 'သူများအိမ်ကို ဟန်ဆောင်သုံးပြီး လိမ်ညာခဲ့သမျှ အကုန်ဗူးပေါ်သလို ပေါ်သွားခဲ့ပြီ' },
+    { id: 'st-nat-13', start_ms: 57620, end_ms: 63800, text: 'နောက်ဆုံးမှာတော့ သတို့သားက မင်္ဂလာပွဲဖျက်ပြီး လှည့်ထွက်သွားချိန်မှာပဲ' },
+    { id: 'st-nat-14', start_ms: 63920, end_ms: 70000, text: 'သတို့သမီးက ကိုယ်ဝန်ရှိနေပြီဆိုပြီး အော်ဟစ်တားမယ်လို့ ဘယ်သူမှ မထင်ထားခဲ့ဘူးလေ' }
+  ],
   drama: [
     { id: 'st-drama-1', start_ms: 100, end_ms: 3200, text: 'သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ' },
     { id: 'st-drama-2', start_ms: 3320, end_ms: 6800, text: 'ပျော်ရွှင်စရာ မင်္ဂလာဦးနေ့လေးဟာ ရုတ်တရက် မုန်တိုင်းထန်လာပါတယ်' },
@@ -2306,14 +2362,13 @@ export interface CreditCalculationOptions {
   planId?: CreditPlanId;
 }
 
+export const CREDIT_SECONDS_PER_UNIT = 70; // 1:10 (70 seconds) = 1 Credit
+
 /**
- * Calculates credit cost matching DevTools formula (`eR` in submit_form_only.js):
- * - Free Tier: 0 credits (uses 1 of 3 daily 2-minute free videos)
- * - Base rate: 1 Credit per started minute (`Math.ceil(durationSec / 60)`)
- * - Standard Voice (Thiha / Nilar): +0 Cr/min (1 Cr/min total)
- * - Pro Gemini Studio Voice (Kore, Aoede, Charon, Leda, Fenrir, Puck, Orus, Zephyr): +1 Cr/min (2 Cr/min total)
- * - Vision AI Scene Detection: +1 Cr/min
- * - STT Mode: 1 Cr/min (Transcription only) or 2 Cr/min (STT + AI Translation), with 15% discount on Creator Pro Max
+ * Calculates credit cost across all Credit Studios (Recap, Translate, Long-Form, STT):
+ * - Free Tier: 0 credits (uses daily free quota)
+ * - Credit Mode: Flat 1 Credit per started 1:10 (70 seconds) across all AI voices
+ *   (0:01–1:10 = 1 Cr, 1:11–2:20 = 2 Cr, 2:21–3:30 = 3 Cr, ...)
  */
 export function calculateCreditCost(
   durationSec: number,
@@ -2322,9 +2377,8 @@ export function calculateCreditCost(
 ): number {
   if (isFreeTier) return 0;
   if (!Number.isFinite(durationSec) || durationSec <= 0) return 1;
-  // Flat rate across all AI voices: 1 minute = 1 Credit
-  const minutes = Math.max(1, Math.ceil(durationSec / 60));
-  return minutes;
+  // Flat rate across all Credit Studios & AI voices: 1:10 (70 seconds) = 1 Credit
+  return Math.max(1, Math.ceil(durationSec / CREDIT_SECONDS_PER_UNIT));
 }
 
 export interface CreditPlanDefinition {
@@ -2371,21 +2425,21 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
     credits: 100,
     baseCredits: 100,
     bonusCredits: 0,
-    minutesIncluded: 100,
-    standardMinutes: 100,
-    hoursLabel: '1.7 hrs (၁၀၀ မိနစ်)',
+    minutesIncluded: 117,
+    standardMinutes: 117,
+    hoursLabel: '1.9 hrs (၁၁၇ မိနစ်)',
     maxVideoDurationMin: 15,
     maxVideoDurationLabel: 'Up to 15 mins / video',
     storageDays: 14,
     priceMmk: '15,000 MMK',
     priceUsd: '$4.99',
-    costPerMinMmk: '~150 MMK / min',
-    perMinMmk: 150,
+    costPerMinMmk: '~128 MMK / min (1 Cr = 1:10)',
+    perMinMmk: 128,
     ttsAccessLabel: 'All 10 AI Voices (Thiha, Nilar + 8 Studio Voices)',
-    sttRatePerMin: '1 Cr / min (~150 MMK/min)',
-    sttRateLabel: '1 Cr / min (~150 MMK/min) · SRT, VTT, TXT Export',
+    sttRatePerMin: '1 Cr / 1:10 (~128 MMK/min)',
+    sttRateLabel: '1 Cr / 1:10 (~128 MMK/min) · SRT, VTT, TXT Export',
     featuresMy: [
-      '100 Credits / လ (ဗီဒီယို အရှည် ၁၀၀ မိနစ်စာ)',
+      '100 Credits / လ (1 Credit = 1:10 မိနစ် — စုစုပေါင်း ၁၁၇ မိနစ်စာ)',
       'Channel Watermark & Logo (ကိုယ်ပိုင် Channel နာမည် / Logo ထည့်သွင်းအသုံးပြုနိုင်သည်)',
       'ဗီဒီယို တစ်ပုဒ်လျှင် အများဆုံး ၁၅ မိနစ် အထိ ထုတ်ယူနိုင်မည်',
       'AI Voice အသံအစုံ (Thiha, Nilar + Studio Pro အသံ ၁၀ မျိုးလုံး ပွင့်မည်)',
@@ -2393,7 +2447,7 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
       '၁၄ ရက် Cloud History သိမ်းဆည်းမှု'
     ],
     featuresEn: [
-      '100 Credits / month (100 mins standard video)',
+      '100 Credits / month (1 Credit = 1:10 · 117 mins standard video)',
       'Channel Watermark & Logo (Custom @ChannelName & logo burn-in)',
       'Up to 15 minutes max duration per video',
       'All 10 AI Voices Unlocked (Thiha, Nilar + 8 Gemini Studio Voices)',
@@ -2401,12 +2455,12 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
       '14-day Cloud Storage'
     ],
     sttFeaturesMy: [
-      'Whisper Large-V3-Turbo စာတန်းထိုး ထုတ်ယူမှု (1 Credit / 1 မိနစ်)',
+      'Whisper Large-V3-Turbo စာတန်းထိုး ထုတ်ယူမှု (1 Credit / 1:10 မိနစ်)',
       '.SRT, .VTT နှင့် .TXT ဖိုင်များ အကန့်အသတ်မရှိ ဒေါင်းလုဒ်ဆွဲနိုင်သည်',
       'မြန်မာ နှင့် အင်္ဂလိပ် စာတန်းထိုး အချိန်ကိုက် တည်းဖြတ်နိုင်သည်'
     ],
     sttFeaturesEn: [
-      'Whisper Large-V3-Turbo transcription (1 Credit / 1 min)',
+      'Whisper Large-V3-Turbo transcription (1 Credit / 1:10 min)',
       'Unlimited .SRT, .VTT, and .TXT subtitle exports',
       'Interactive timestamp & Burmese cue editor'
     ]
@@ -2422,23 +2476,23 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
     credits: 260,
     baseCredits: 230,
     bonusCredits: 30,
-    minutesIncluded: 260,
-    standardMinutes: 260,
-    hoursLabel: '4.3 hrs (၂၆၀ မိနစ်)',
+    minutesIncluded: 303,
+    standardMinutes: 303,
+    hoursLabel: '5.1 hrs (၃၀၃ မိနစ်)',
     maxVideoDurationMin: 45,
     maxVideoDurationLabel: 'Up to 45 mins / video',
     storageDays: 30,
     priceMmk: '35,000 MMK',
     priceUsd: '$11.99',
-    costPerMinMmk: '~135 MMK / min (+30 Bonus Cr)',
-    perMinMmk: 135,
+    costPerMinMmk: '~115 MMK / min (+30 Bonus Cr)',
+    perMinMmk: 115,
     popular: true,
     isPopular: true,
     ttsAccessLabel: 'All 10 AI Voices + Emotion & Pacing Control',
-    sttRatePerMin: '1 Cr / min (~135 MMK/min) + Multi-Language Translation',
-    sttRateLabel: '1 Cr / min (~135 MMK/min) + Multi-Language AI Translation',
+    sttRatePerMin: '1 Cr / 1:10 (~115 MMK/min) + Multi-Language Translation',
+    sttRateLabel: '1 Cr / 1:10 (~115 MMK/min) + Multi-Language AI Translation',
     featuresMy: [
-      '260 Credits / လ (230 Base + 🎁 30 Credits အပို — စုစုပေါင်း မိနစ် ၂၆၀ စာ)',
+      '260 Credits / လ (230 Base + 🎁 30 Credits အပို — စုစုပေါင်း ၃၀၃ မိနစ်စာ)',
       'Channel Watermark & Logo (ကိုယ်ပိုင် Channel နာမည် / Logo ထည့်သွင်းအသုံးပြုနိုင်သည်)',
       'ဗီဒီယို တစ်ပုဒ်လျှင် ၄၅ မိနစ်အထိ (Long-Form Movie Recap Studio ပွင့်မည်)',
       'Priority Cloud GPU Queue (၂ ဆ ပိုမြန်သော Server Render)',
@@ -2446,7 +2500,7 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
       'FHD 1080p + Dynamic Zoom + Film Grain (Copyright Strike ကာကွယ်မှု အပြည့်အစုံ)'
     ],
     featuresEn: [
-      '260 Credits / month (230 Base + 30 Bonus Credits · 260 mins video)',
+      '260 Credits / month (230 Base + 30 Bonus Credits · 303 mins video)',
       'Channel Watermark & Logo (Custom @ChannelName & logo burn-in)',
       'Up to 45 minutes per video + Full Long-Form Movie Recap Studio',
       'Priority Cloud GPU Rendering Queue (2x faster server encoding)',
@@ -2455,12 +2509,12 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
     ],
     sttFeaturesMy: [
       'Pro STT + AI ဘာသာပြန် စနစ် (တရုတ်/ကိုရီးယား/ဂျပန်/ထိုင်း မှ မြန်မာသို့ တိုက်ရိုက်ပြန်ဆိုမှု)',
-      '1 Credit / 1 မိနစ် (~135 MMK/min သာ ကျသင့်မည်)',
+      '1 Credit / 1:10 မိနစ် (~115 MMK/min သာ ကျသင့်မည်)',
       'စကားပြော အရှိန်နှင့် စာကြောင်းအရှည် အော်တို ချိန်ညှိပေးသည့် Smart Sync'
     ],
     sttFeaturesEn: [
       'Pro STT + Direct AI Translation (ZH/KO/JA/TH/EN to Burmese)',
-      'Effective cost ~135 MMK / min (1 Credit/min)',
+      'Effective cost ~115 MMK / min (1 Credit / 1:10)',
       'Smart Sync automatic line-length & reading-speed balancing'
     ]
   },
@@ -2475,21 +2529,21 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
     credits: 560,
     baseCredits: 500,
     bonusCredits: 60,
-    minutesIncluded: 560,
-    standardMinutes: 560,
-    hoursLabel: '9.3 hrs (၅၆၀ မိနစ်)',
+    minutesIncluded: 653,
+    standardMinutes: 653,
+    hoursLabel: '10.9 hrs (၆၅၃ မိနစ်)',
     maxVideoDurationMin: 180,
     maxVideoDurationLabel: 'Unlimited (2hr+ Full Movies)',
     storageDays: 90,
     priceMmk: '75,000 MMK',
     priceUsd: '$24.99',
-    costPerMinMmk: '~134 MMK / min (+60 Bonus Cr)',
-    perMinMmk: 134,
+    costPerMinMmk: '~115 MMK / min (+60 Bonus Cr)',
+    perMinMmk: 115,
     ttsAccessLabel: 'All 10+ Studio Voices + Multi-Speaker Dialogue & Custom Prosody',
-    sttRatePerMin: '15% STT Discount (~114 MMK/min) + Speaker Diarization',
-    sttRateLabel: '15% STT Discount (~114 MMK/min) + Speaker Diarization & Batch Export',
+    sttRatePerMin: '1 Cr / 1:10 (~115 MMK/min) + Speaker Diarization',
+    sttRateLabel: '1 Cr / 1:10 (~115 MMK/min) + Speaker Diarization & Batch Export',
     featuresMy: [
-      '560 Credits / လ (500 Base + 🎁 60 Credits အပို — စုစုပေါင်း မိနစ် ၅၆၀ စာ)',
+      '560 Credits / လ (500 Base + 🎁 60 Credits အပို — စုစုပေါင်း ၆၅၃ မိနစ်စာ)',
       'Channel Watermark & Logo (ကိုယ်ပိုင် Channel နာမည် / Logo ထည့်သွင်းအသုံးပြုနိုင်သည်)',
       'ဗီဒီယိုကြာချိန် အကန့်အသတ်မရှိ (၂ နာရီ+ ရုပ်ရှင်ကားကြီးများနှင့် Series များ)',
       'First in Processing Queue (Dedicated Ultra-Fast GPU — စောင့်ဆိုင်းရန်မလိုပါ)',
@@ -2497,7 +2551,7 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
       '4K / FHD 1080p Ultra Bitrate + Vision AI Auto Scene Cutter + ၉၀ ရက် Cloud Storage'
     ],
     featuresEn: [
-      '560 Credits / month (500 Base + 60 Bonus Credits · 560 mins video)',
+      '560 Credits / month (500 Base + 60 Bonus Credits · 653 mins video)',
       'Channel Watermark & Logo (Custom @ChannelName & logo burn-in)',
       'Unlimited Video Duration (2hr+ full movies & multi-episode series)',
       'First in Processing Queue (Dedicated Ultra-Fast Cloud GPU nodes)',
@@ -2505,12 +2559,12 @@ export const CREDIT_PLANS: CreditPlanDefinition[] = [
       '4K / FHD 1080p Ultra Bitrate + Vision AI Scene Slicing + Full Copyright Shield'
     ],
     sttFeaturesMy: [
-      'STT Credit 15% အထူးလျှော့ဈေး (~114 MMK/min သာ ကျသင့်မည်)',
+      '1 Credit / 1:10 မိနစ် (~115 MMK/min အသက်သာဆုံးနှုန်း)',
       'Multi-Speaker Diarization (ဇာတ်ကောင် တစ်ဦးချင်းစီ အသံခွဲခြားပေးသည့် စနစ်)',
       '၂ နာရီကျော် ရုပ်ရှင်ကားကြီးများ တစ်ခါတည်း .SRT / .VTT / .TXT ထုတ်ယူနိုင်သည်'
     ],
     sttFeaturesEn: [
-      '15% STT Credit Discount (~114 MMK/min lowest rate)',
+      '1 Credit / 1:10 (~115 MMK/min lowest rate)',
       'Multi-Speaker Diarization (automatic character speaker tagging)',
       'Full-length 2hr+ movie batch .SRT / .VTT / .TXT subtitle extraction'
     ]
@@ -2522,41 +2576,41 @@ export const TOP_UP_PACKS = [
     id: 'topup-60',
     name: '60 Credits Instant Pack',
     credits: 60,
-    minutes: 60,
+    minutes: 70,
     priceMmk: '6,500 MMK',
     priceUsd: '$2.49',
-    labelMy: '၁ နာရီစာ အပိုဖြည့်သွင်းမည်',
-    descMy: '၆၀ မိနစ်စာ (၁ နာရီ) ချက်ချင်းဖြည့်သွင်းမည်'
+    labelMy: '၁ နာရီ ၁၀ မိနစ်စာ အပိုဖြည့်သွင်းမည်',
+    descMy: '၇၀ မိနစ်စာ (၁ နာရီ ၁၀ မိနစ်) ချက်ချင်းဖြည့်သွင်းမည်'
   },
   {
     id: 'topup-200',
     name: '200 Credits Booster Pack',
     credits: 200,
-    minutes: 200,
+    minutes: 233,
     priceMmk: '18,000 MMK',
     priceUsd: '$6.49',
-    labelMy: '၃ နာရီ ၂၀ မိနစ်စာ အပိုဖြည့်မည်',
-    descMy: '၂၀၀ မိနစ်စာ (၃ နာရီ ၂၀ မိနစ်) ချက်ချင်းဖြည့်သွင်းမည်'
+    labelMy: '၃ နာရီ ၅၃ မိနစ်စာ အပိုဖြည့်မည်',
+    descMy: '၂၃၃ မိနစ်စာ (၃ နာရီ ၅၃ မိနစ်) ချက်ချင်းဖြည့်သွင်းမည်'
   },
   {
     id: 'topup-500',
     name: '500 Credits Pro Pack',
     credits: 500,
-    minutes: 500,
+    minutes: 583,
     priceMmk: '38,000 MMK',
     priceUsd: '$13.49',
-    labelMy: '၈ နာရီ ၂၀ မိနစ်စာ အပိုဖြည့်မည်',
-    descMy: '၅၀၀ မိနစ်စာ (၈ နာရီ ၂၀ မိနစ်) ချက်ချင်းဖြည့်သွင်းမည်'
+    labelMy: '၉ နာရီ ၄၃ မိနစ်စာ အပိုဖြည့်မည်',
+    descMy: '၅၈၃ မိနစ်စာ (၉ နာရီ ၄၃ မိနစ်) ချက်ချင်းဖြည့်သွင်းမည်'
   },
   {
     id: 'topup-1000',
     name: '1,000 Credits Studio Pack',
     credits: 1000,
-    minutes: 1000,
+    minutes: 1167,
     priceMmk: '68,000 MMK',
     priceUsd: '$23.99',
-    labelMy: '၁၆ နာရီ ၄၀ မိနစ်စာ အထူးသက်သာနှုန်း',
-    descMy: '၁,၀၀၀ မိနစ်စာ (၁၆ နာရီ ၄၀ မိနစ်) အထူးသက်သာနှုန်းဖြင့် ဖြည့်သွင်းမည်'
+    labelMy: '၁၉ နာရီ ၂၇ မိနစ်စာ အထူးသက်သာနှုန်း',
+    descMy: '၁,၁၆၇ မိနစ်စာ (၁၉ နာရီ ၂၇ မိနစ်) အထူးသက်သာနှုန်းဖြင့် ဖြည့်သွင်းမည်'
   }
 ];
 
@@ -2600,6 +2654,15 @@ export function buildSyncedRecapCues(
         'အိမ်ပိုင်ရှင်အစစ်က ပိုင်ဆိုင်မှုစာချုပ်ကို ထုတ်ပြလိုက်တော့',
         'သတို့သားက မင်္ဂလာပွဲကို ချက်ချင်းဖျက်သိမ်းသွားပါတယ်'
       ],
+      natural: [
+        'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်လဲလို့ သတို့သားက မေးချလိုက်တော့တာပေါ့',
+        'သတို့သမီးကတော့ အိမ်ပြင်လိုက်တာပါဆိုပြီး လိမ်ညာနေတုန်းမှာပဲ',
+        'အဲဒီအချိန်မှာပဲ အိမ်ရှင်မိန်းကလေး ဝင်လာပြီး အမှန်တရားကို ဖော်ထုတ်လိုက်ပါလေရော',
+        'ပရိဘောဂတွေက သူမဝယ်ထားတာမှန်း သတို့သားက လုံးဝမသိခဲ့ဘူးလေ',
+        'တကယ်တမ်းကျတော့ နှစ်သိန်းကို မောင်လေးအိမ်ဝယ်ဖို့ ယူသုံးထားတာ ဖြစ်သွားခဲ့ပြီ',
+        'အိမ်ပိုင်ရှင်အစစ်က ဂရန်စာချုပ် ထုတ်ပြလိုက်တော့ အားလုံး အရှက်ကွဲနေခဲ့ရရှာတယ်',
+        'နောက်ဆုံးမှာတော့ သတို့သားက မင်္ဂလာပွဲဖျက်ပြီး လှည့်ထွက်သွားတော့တာပေါ့'
+      ],
       drama: [
         'သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ',
         'ပျော်ရွှင်စရာ မင်္ဂလာဦးနေ့လေးဟာ မုန်တိုင်းထန်လာပါတယ်',
@@ -2639,6 +2702,13 @@ export function buildSyncedRecapCues(
         'The real owner placed the property deed on the table',
         'The groom immediately canceled the wedding and left'
       ],
+      natural: [
+        'The groom demanded to know where the 300,000 yuan went',
+        'Just as the bride claimed she renovated the house, the real owner walked in',
+        'Every single piece of furniture actually belonged to the landlord all along',
+        'Turns out the bride’s mother secretly gave 200k to her younger son',
+        'The moment the property deed hit the table, the whole scheme collapsed'
+      ],
       drama: [
         'Where did you spend the 300,000 yuan?',
         'Behind calm eyes lies a buried family secret',
@@ -2670,6 +2740,13 @@ export function buildSyncedRecapCues(
     },
     th: {
       narrator: [
+        'เงินสามแสนหยวน คุณเอาไปใช้ที่ไหนหมด',
+        'เจ้าสาวอ้างว่านำไปตกแต่งเรือนหอทั้งหมด',
+        'แต่เจ้าของบ้านตัวจริงเดินเข้ามาเปิดโปงความจริง',
+        'แม่เจ้าสาวยอมรับว่านำเงินไปดาวน์บ้านให้น้องชาย',
+        'เจ้าบ่าวยกเลิกงานแต่งทันทีและเดินจากไป'
+      ],
+      natural: [
         'เงินสามแสนหยวน คุณเอาไปใช้ที่ไหนหมด',
         'เจ้าสาวอ้างว่านำไปตกแต่งเรือนหอทั้งหมด',
         'แต่เจ้าของบ้านตัวจริงเดินเข้ามาเปิดโปงความจริง',
@@ -2713,6 +2790,13 @@ export function buildSyncedRecapCues(
         '母親は20万元を弟の頭金に使ったと認めました',
         '新郎は即座に破談を宣言して立ち去りました'
       ],
+      natural: [
+        '30万元をいったいどこに使ったんだ？',
+        '新婦は新居の改装に使ったと嘘をつきます',
+        'そこへ本当の家の持ち主が現れて暴きます',
+        '母親は20万元を弟の頭金に使ったと認めました',
+        '新郎は即座に破談を宣言して立ち去りました'
+      ],
       drama: [
         '30万元をいったいどこに使ったんだ？',
         '華やかな結婚式の裏の嘘がついに暴かれます',
@@ -2750,6 +2834,13 @@ export function buildSyncedRecapCues(
         '신부 어머니는 남동생 집 계약금으로 썼다고 말합니다',
         '신랑은 즉시 파혼을 선언하고 떠나버립니다'
       ],
+      natural: [
+        '30만 위안을 도대체 어디에 쓴 거야?',
+        '신부는 신혼집 인테리어에 썼다고 거짓말합니다',
+        '진짜 집주인이 나타나 모든 사실을 폭로합니다',
+        '신부 어머니는 남동생 집 계약금으로 썼다고 말합니다',
+        '신랑은 즉시 파혼을 선언하고 떠나버립니다'
+      ],
       drama: [
         '30만 위안을 도대체 어디에 쓴 거야?',
         '감추려 했던 거짓말이 마침내 드러납니다',
@@ -2781,6 +2872,14 @@ export function buildSyncedRecapCues(
     },
     zh: {
       narrator: [
+        '三十万你到底花哪去了？',
+        '新娘谎称用来装修了这套婚房',
+        '真正的房东林知夏走出来当众揭穿',
+        '丈母娘承认拿二十万给弟弟付了首付',
+        '林知夏直接拍出房产证书揭穿骗婚',
+        '新郎看清真相后当场悔婚转身离开'
+      ],
+      natural: [
         '三十万你到底花哪去了？',
         '新娘谎称用来装修了这套婚房',
         '真正的房东林知夏走出来当众揭穿',
@@ -3070,6 +3169,210 @@ export function resolveSubtitleFontMeta(
     };
   }
   return base;
+}
+
+/**
+ * Checks whether a subtitle string genuinely matches the expected target script/language
+ * so failed translations that echo back untranslated Burmese or another wrong script are detected.
+ */
+export function doesTextMatchSubtitleLanguage(
+  text: string,
+  targetLang: TargetLanguageCode
+): boolean {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return false;
+  const hasMyanmar = /[\u1000-\u109F]/.test(trimmed);
+  const hasThai = /[\u0E00-\u0E7F]/.test(trimmed);
+  const hasKorean = /[\uAC00-\uD7AF\u1100-\u11FF]/.test(trimmed);
+  const hasHan = /[\u4E00-\u9FFF]/.test(trimmed);
+  const hasKana = /[\u3040-\u30FF]/.test(trimmed);
+  const hasLatin = /[A-Za-z]/.test(trimmed);
+
+  switch (targetLang) {
+    case 'my':
+      return hasMyanmar;
+    case 'th':
+      return hasThai && !hasMyanmar;
+    case 'ko':
+      return hasKorean && !hasMyanmar;
+    case 'zh':
+      return hasHan && !hasMyanmar && !hasKana;
+    case 'ja':
+      return (hasKana || hasHan) && !hasMyanmar;
+    case 'en':
+      return hasLatin && !hasMyanmar && !hasThai && !hasKorean && !hasHan && !hasKana;
+    default:
+      return !hasMyanmar;
+  }
+}
+
+/**
+ * Returns true if the majority of non-empty cues do NOT match the requested subtitle language
+ * (e.g., cues are still in Burmese when English/Thai/Korean/Chinese/Japanese is selected).
+ */
+export function needsSubtitleTranslation(
+  cues: SubtitleCue[],
+  targetLang: TargetLanguageCode
+): boolean {
+  if (!Array.isArray(cues) || cues.length === 0) return false;
+  const nonEmpty = cues.filter((c) => String(c?.text || '').trim().length > 0);
+  if (nonEmpty.length === 0) return false;
+  let matching = 0;
+  for (const cue of nonEmpty) {
+    if (doesTextMatchSubtitleLanguage(cue.text, targetLang)) {
+      matching++;
+    }
+  }
+  return matching / nonEmpty.length < 0.6;
+}
+
+/**
+ * Tolerantly parses LLM subtitle translation output into an array aligned 1-to-1 with `expectedCount`.
+ * Supports:
+ *  - `{ items: [{ i: 1, t: "..." }] }` (index-aligned, survives dropped/extra items)
+ *  - `{ lines: ["...", ...] }` or raw JSON string array `["...", ...]`
+ *  - Markdown-fenced JSON or JS-quoted JSON
+ *  - Plain numbered lines (`1. ...`)
+ */
+export function parseTranslatedSubtitleChunkOutput(
+  raw: unknown,
+  expectedCount: number
+): Array<string | null> {
+  const out: Array<string | null> = Array.from({ length: expectedCount }, () => null);
+  if (expectedCount <= 0 || raw == null) return out;
+
+  const cleanLine = (v: unknown): string | null => {
+    if (typeof v !== 'string') return null;
+    const s = v
+      .replace(/^\s*\d+\s*[\.\)\:\-]\s*/, '')
+      .replace(/\r?\n/g, ' ')
+      .trim();
+    return s.length > 0 ? s : null;
+  };
+
+  const applyParsedObject = (obj: any): boolean => {
+    if (!obj) return false;
+    if (Array.isArray(obj)) {
+      let filled = 0;
+      for (let idx = 0; idx < Math.min(expectedCount, obj.length); idx++) {
+        const entry = obj[idx];
+        if (entry && typeof entry === 'object' && 't' in entry) {
+          const itemIdx = typeof entry.i === 'number' ? entry.i - 1 : idx;
+          const txt = cleanLine(entry.t);
+          if (itemIdx >= 0 && itemIdx < expectedCount && txt) {
+            out[itemIdx] = txt;
+            filled++;
+          }
+        } else {
+          const txt = cleanLine(entry);
+          if (txt) {
+            out[idx] = txt;
+            filled++;
+          }
+        }
+      }
+      return filled > 0;
+    }
+    if (typeof obj === 'object') {
+      if (Array.isArray(obj.items)) {
+        let filled = 0;
+        for (let idx = 0; idx < obj.items.length; idx++) {
+          const entry = obj.items[idx];
+          const itemIdx =
+            entry && typeof entry === 'object' && typeof entry.i === 'number'
+              ? entry.i - 1
+              : idx;
+          const txt = cleanLine(
+            entry && typeof entry === 'object' ? entry.t ?? entry.text ?? entry.line : entry
+          );
+          if (itemIdx >= 0 && itemIdx < expectedCount && txt) {
+            out[itemIdx] = txt;
+            filled++;
+          }
+        }
+        if (filled > 0) return true;
+      }
+      if (Array.isArray(obj.lines)) {
+        let filled = 0;
+        for (let idx = 0; idx < Math.min(expectedCount, obj.lines.length); idx++) {
+          const txt = cleanLine(obj.lines[idx]);
+          if (txt) {
+            out[idx] = txt;
+            filled++;
+          }
+        }
+        if (filled > 0) return true;
+      }
+      if (Array.isArray(obj.translations)) {
+        let filled = 0;
+        for (let idx = 0; idx < Math.min(expectedCount, obj.translations.length); idx++) {
+          const txt = cleanLine(obj.translations[idx]);
+          if (txt) {
+            out[idx] = txt;
+            filled++;
+          }
+        }
+        if (filled > 0) return true;
+      }
+    }
+    return false;
+  };
+
+  if (typeof raw === 'object') {
+    if (applyParsedObject(raw)) return out;
+  }
+
+  const rawStr = String(raw || '')
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!rawStr) return out;
+
+  // 1. Direct JSON parse or extracted JSON object/array block
+  const jsonCandidates: string[] = [rawStr];
+  const objStart = rawStr.indexOf('{');
+  const objEnd = rawStr.lastIndexOf('}');
+  if (objStart >= 0 && objEnd > objStart) {
+    jsonCandidates.push(rawStr.slice(objStart, objEnd + 1));
+  }
+  const arrStart = rawStr.indexOf('[');
+  const arrEnd = rawStr.lastIndexOf(']');
+  if (arrStart >= 0 && arrEnd > arrStart) {
+    jsonCandidates.push(rawStr.slice(arrStart, arrEnd + 1));
+  }
+
+  for (const cand of jsonCandidates) {
+    try {
+      const parsed = JSON.parse(cand);
+      if (applyParsedObject(parsed)) return out;
+    } catch {}
+  }
+
+  // 2. Fallback: numbered plain-text lines (e.g. "1. Translated line")
+  const rawLines = rawStr.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let numberedHits = 0;
+  for (const line of rawLines) {
+    const m = line.match(/^(\d+)\s*[\.\)\:\-]\s*(.+)$/);
+    if (m) {
+      const idx = Number(m[1]) - 1;
+      const txt = m[2].replace(/^["']|["'],?$/g, '').trim();
+      if (idx >= 0 && idx < expectedCount && txt) {
+        out[idx] = txt;
+        numberedHits++;
+      }
+    }
+  }
+  if (numberedHits > 0) return out;
+
+  // 3. Fallback: exact line count plain text
+  if (rawLines.length === expectedCount) {
+    for (let idx = 0; idx < expectedCount; idx++) {
+      const txt = cleanLine(rawLines[idx]);
+      if (txt) out[idx] = txt;
+    }
+  }
+
+  return out;
 }
 
 /* ============================================================================
@@ -4623,3 +4926,167 @@ export function buildSafeFetchedVideoFilename(
   const safeBase = sanitizeMp4DownloadName(rawTitle || '', `${cleanTag}_${localUploadId.slice(-6)}`);
   return safeBase;
 }
+
+/**
+ * Checks whether an HTTP response body/status or error object explicitly indicates an invalid/revoked Gemini API key.
+ */
+export function isGeminiApiKeyExplicitlyInvalid(
+  errOrBody: unknown,
+  httpStatus?: number
+): boolean {
+  const raw =
+    typeof errOrBody === 'string'
+      ? errOrBody
+      : errOrBody && typeof errOrBody === 'object' && 'message' in errOrBody
+      ? String((errOrBody as { message?: unknown }).message || '')
+      : String(errOrBody || '');
+  const lower = raw.toLowerCase();
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('invalid api key') ||
+    lower.includes('api key expired') ||
+    lower.includes('key_invalid') ||
+    lower.includes('unregistered callers')
+  ) {
+    return true;
+  }
+  if (
+    (httpStatus === 400 || httpStatus === 401 || httpStatus === 403) &&
+    (lower.includes('api key') || lower.includes('permission_denied') || lower.includes('unauthenticated'))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export interface GeminiTestConnectionInput {
+  modelsEndpointOk: boolean;
+  modelsEndpointStatus: number;
+  modelsEndpointBody: string;
+  generateSucceeded: boolean;
+  lastGenerateError?: unknown;
+  latencyMs: number;
+}
+
+export interface GeminiTestConnectionClassification {
+  geminiOk: boolean;
+  geminiMessage: string;
+}
+
+/**
+ * Classifies Gemini API key test-connection outcomes so transient 503 High Demand spikes do not falsely mark a valid key as invalid.
+ */
+export function classifyGeminiTestConnectionResult(
+  input: GeminiTestConnectionInput
+): GeminiTestConnectionClassification {
+  if (input.modelsEndpointOk || input.generateSucceeded) {
+    return {
+      geminiOk: true,
+      geminiMessage: `Gemini API ချိတ်ဆက်မှု အောင်မြင်ပါသည် (${input.latencyMs}ms)`
+    };
+  }
+  if (
+    isGeminiApiKeyExplicitlyInvalid(input.modelsEndpointBody, input.modelsEndpointStatus) ||
+    isGeminiApiKeyExplicitlyInvalid(input.lastGenerateError)
+  ) {
+    return {
+      geminiOk: false,
+      geminiMessage: 'Gemini API Key မမှန်ကန်ပါ သို့မဟုတ် သက်တမ်းကုန်နေပါသည် (API_KEY_INVALID)'
+    };
+  }
+  if (isTransientModelOverloadError(input.lastGenerateError) || input.modelsEndpointStatus === 503) {
+    return {
+      geminiOk: true,
+      geminiMessage: `Gemini API Key မှန်ကန်ပါသည် (လက်ရှိ Server 503 High Demand ဖြစ်နေသော်လည်း အလိုအလျောက် Retry ဖြင့် သုံးနိုင်ပါသည် - ${input.latencyMs}ms)`
+    };
+  }
+  const quotaCheck = isApiKeyQuotaOrLimitError(input.lastGenerateError || input.modelsEndpointBody);
+  if (quotaCheck.isQuotaLimit || input.modelsEndpointStatus === 429) {
+    return {
+      geminiOk: false,
+      geminiMessage: 'Gemini API Key Quota ပြည့်နေပါသည် (429 Rate Limit)'
+    };
+  }
+  const rawErrText =
+    input.lastGenerateError && typeof input.lastGenerateError === 'object' && 'message' in input.lastGenerateError
+      ? String((input.lastGenerateError as { message?: unknown }).message || '')
+      : String(input.lastGenerateError || input.modelsEndpointBody || '');
+  const fallbackInfo = detectGeminiFailureMessage(rawErrText, true, true);
+  return {
+    geminiOk: false,
+    geminiMessage: fallbackInfo.messageMy || 'Gemini API ချိတ်ဆက်၍ မရပါ'
+  };
+}
+
+/**
+ * Determines whether a 429 quota error on one Gemini model (e.g. gemini-3-flash-preview) should allow trying
+ * another model (e.g. gemini-3.1-flash-lite-preview or gemini-2.5-flash) on the same API key before rotating keys.
+ */
+export function shouldAllowSameKeyModelFallbackOnQuota(
+  err: unknown,
+  hasMoreModels: boolean
+): boolean {
+  if (!hasMoreModels) return false;
+  if (isGeminiApiKeyExplicitlyInvalid(err)) return false;
+  const check = isApiKeyQuotaOrLimitError(err);
+  return check.isQuotaLimit;
+}
+
+export interface SiteOnlineNotification {
+  id: string;
+  message: string;
+  updatedAt: number;
+  active: boolean;
+}
+
+export const SITE_NOTIFICATION_DISMISSED_STORAGE_KEY = 'ttak_dismissed_site_notification_ids';
+const MAX_DISMISSED_SITE_NOTIFICATION_IDS = 30;
+
+/**
+ * Safely parses stored dismissed website notification IDs from localStorage JSON.
+ */
+export function parseDismissedSiteNotificationIds(rawJson: string | null | undefined): string[] {
+  if (!rawJson || typeof rawJson !== 'string') return [];
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .slice(-MAX_DISMISSED_SITE_NOTIFICATION_IDS);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Appends a dismissed notification ID without duplicates, keeping the list bounded.
+ */
+export function addDismissedSiteNotificationId(
+  existingIds: string[],
+  notificationId: string
+): string[] {
+  const cleanId = String(notificationId || '').trim();
+  if (!cleanId) return existingIds.slice(-MAX_DISMISSED_SITE_NOTIFICATION_IDS);
+  const filtered = existingIds.filter((id) => id !== cleanId);
+  filtered.push(cleanId);
+  return filtered.slice(-MAX_DISMISSED_SITE_NOTIFICATION_IDS);
+}
+
+/**
+ * Determines whether the website update notification banner should be visible to the user.
+ * Returns true only when an active notification has non-empty text and its unique ID has not been dismissed.
+ */
+export function shouldShowSiteNotification(
+  notification: SiteOnlineNotification | null | undefined,
+  dismissedIds: string[]
+): boolean {
+  if (!notification || !notification.active) return false;
+  const id = String(notification.id || '').trim();
+  const message = String(notification.message || '').trim();
+  if (!id || !message) return false;
+  return !dismissedIds.includes(id);
+}
+
+
+
