@@ -51,6 +51,7 @@ import {
   buildCinematicTranslateSystemPrompt,
   isTransientPollHttpStatus,
   computeNextPollDelayMs,
+  sanitizeRecapProgressMessage,
   maskApiKeyString,
   TELEGRAM_CHANNEL_URL,
   TELEGRAM_ADMIN_HANDLE,
@@ -353,7 +354,7 @@ export const SttStudioView: React.FC<{
             setSttProgress(Math.max(38, Math.min(98, stData.progress)));
           }
           if (stData.stage_message) {
-            setSttStatusMsg(String(stData.stage_message));
+            setSttStatusMsg(sanitizeRecapProgressMessage(String(stData.stage_message)));
           }
           if (stData.status === 'done' && stData.result) {
             finalPayload = stData.result;

@@ -1044,6 +1044,7 @@ import {
   doesTextMatchSubtitleLanguage,
   needsSubtitleTranslation,
   parseTranslatedSubtitleChunkOutput,
+  sanitizeRecapProgressMessage,
   buildChronologicalSceneLockGuide,
   computeAudioScriptWindows,
   sliceTimedTranscriptForWindow,
@@ -1053,12 +1054,13 @@ import {
   shouldAutoRedirectAuthenticatedRoot
 } from './recapEngine.ts';
 
-test('resolveSubtitleFontMeta selects native fonts for Burmese, Korean, English, Thai, and Chinese subtitles', () => {
+test('resolveSubtitleFontMeta selects native fonts for Burmese, Korean, English, Thai, Chinese, and Japanese subtitles', () => {
   assert.equal(resolveSubtitleFontMeta('Yati_Round', 'my').assFontName, 'Padauk');
   assert.equal(resolveSubtitleFontMeta('Yati_Round', 'ko').assFontName, 'Noto Sans KR');
   assert.equal(resolveSubtitleFontMeta('Yati_Round', 'en', 'Subtitles here').assFontName, 'DejaVu Sans');
   assert.equal(resolveSubtitleFontMeta('Yati_Round', 'th').assFontName, 'Noto Sans Thai');
-  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'zh').assFontName, 'Unifont');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'zh').assFontName, 'Noto Sans SC');
+  assert.equal(resolveSubtitleFontMeta('Yati_Round', 'ja').assFontName, 'Noto Sans JP');
 });
 
 test('buildChronologicalSceneLockGuide and Documentary preset enforce 1:1 scene-timestamp lock across 146.89s video', () => {
@@ -1438,6 +1440,29 @@ test('Multilingual subtitle helpers detect untranslated Burmese and parse indexe
   const numbered = parseTranslatedSubtitleChunkOutput('1. 안녕하세요\n2. 감사합니다', 2);
   assert.deepEqual(numbered, ['안녕하세요', '감사합니다']);
 });
+
+test('sanitizeRecapProgressMessage removes all AI, Gemini, Whisper, and model names while preserving clean English progress', () => {
+  const samples = [
+    'Switching to backup AI model (gemini-3.1-flash-lite)...',
+    'Gemini AI busy (503) — optimizing payload & retrying with backup model...',
+    'Listening to original audio with AI...',
+    'Transcribing dialogue with Whisper AI...',
+    'Writing time-synced script & subtitles with AI...',
+    'Synthesizing AI voiceover...',
+    'Starting AI recap job...',
+    'gemini-4-hydrogen quota reached — switching to backup Gemini model...',
+    'Gemini limit/busy — generating synced script via backup AI engine...'
+  ];
+  for (const s of samples) {
+    const cleaned = sanitizeRecapProgressMessage(s);
+    assert.ok(cleaned.length >= 6, `Expected non-empty clean string for: ${s}`);
+    assert.equal(/\b(AI|Gemini|Whisper|Groq|Cloudflare)\b/i.test(cleaned), false, `Found forbidden word in: ${cleaned}`);
+    assert.equal(/gemini-[\w.-]+/i.test(cleaned), false, `Found model ID in: ${cleaned}`);
+  }
+  assert.equal(sanitizeRecapProgressMessage('Syncing voiceover & video...'), 'Syncing voiceover & video...');
+  assert.equal(sanitizeRecapProgressMessage('Finalizing recap video...'), 'Finalizing recap video...');
+});
+
 
 
 

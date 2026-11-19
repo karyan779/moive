@@ -58,6 +58,7 @@ import {
   extractJobIdFromVideoUrl,
   resolveEffectiveVideoDurationSec,
   parseAndNormalizeVideoSourceUrl,
+  sanitizeRecapProgressMessage,
   type RecapMode,
   type TranslateAudioMode,
   type VoiceGender,
@@ -954,7 +955,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
       if (isFreeTier) {
         setRenderProgress(10);
-        setRenderMessage('Extracting audio on device with mediabunny...');
+        setRenderMessage('Extracting audio...');
         await new Promise((r) => setTimeout(r, 220));
       } else {
         setRenderProgress(10);
@@ -1030,7 +1031,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       };
 
       setRenderProgress(37);
-      setRenderMessage('Starting AI recap job...');
+      setRenderMessage('Starting recap...');
 
       const submitAndPollRecapJob = async () => {
         const response = await fetch('/api/recap/free/generate-assets', {
@@ -1113,7 +1114,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               setRenderProgress((prev) => Math.max(prev, Math.min(98, stData.progress)));
             }
             if (stData.stage_message) {
-              setRenderMessage(String(stData.stage_message));
+              setRenderMessage(sanitizeRecapProgressMessage(String(stData.stage_message)));
             }
             if (stData.status === 'done' && stData.result) {
               finalPayload = stData.result;
@@ -1160,11 +1161,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
           throw firstPassErr;
         }
         setRenderProgress(58);
-        setRenderMessage(
-          uiLang === 'my'
-            ? 'Gemini Server အသုံးပြုသူများနေသဖြင့် စက္ကန့်အနည်းငယ်စောင့်ပြီး အလိုအလျောက် ပြန်စမ်းနေပါသည်...'
-            : 'Gemini AI busy (503) — automatically retrying in a few seconds...'
-        );
+        setRenderMessage('Server busy — retrying automatically...');
         await new Promise((r) => setTimeout(r, 3500));
         data = await submitAndPollRecapJob();
       }

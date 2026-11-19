@@ -1511,10 +1511,15 @@ function writeAssSubtitleFile(
     samplePreviewLight: false
   };
 
+  const cueSampleText = (cues || [])
+    .map((c) => (c?.text || '').trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(' ');
   const fontMeta = resolveSubtitleFontMeta(
     cfg.fontStyle,
     cfg.subtitleLanguage,
-    cues?.[0]?.text || ''
+    cueSampleText
   );
   const scaleFactor = vidW / 540;
   const fontSizePx = computeAssSubtitleFontSize(cfg.fontSize || 40, vidW, vidH);
@@ -4781,7 +4786,7 @@ async function startServer() {
     }
 
     // 1b. Speech-to-Text pre-pass (strict 35s overall ceiling so 48% NEVER stalls indefinitely)
-    onProgress(48, 'Listening to original audio with AI...');
+    onProgress(48, 'Listening to original audio...');
     let groqTranscript = '';
     let sttProviderUsed: 'cloudflare-workers-ai' | 'groq' | 'none' = 'none';
     if (!isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
@@ -4810,7 +4815,7 @@ async function startServer() {
               onProgress(52, 'Checking speech timing & continuing to script...');
             }
           } else if (step === 'groq_pool') {
-            onProgress(53, 'Transcribing dialogue with Whisper AI...');
+            onProgress(53, 'Transcribing dialogue...');
             const sttRes = await transcribeAudioWithGroqPool(extractedAudioBuffer!, sttModel);
             if (sttRes?.text) {
               groqTranscript = sttRes.text;
@@ -4834,7 +4839,7 @@ async function startServer() {
     }
 
     // 2. Generate Script & Continuous Scene-Matched Subtitle Cues
-    onProgress(58, 'Writing time-synced script & subtitles with AI...');
+    onProgress(58, 'Writing script & subtitles...');
     const poolState = loadApiKeyPoolState();
     const hasHealthyPoolGeminiKey = poolState.keys.some(
       (k) => k.provider === 'gemini' && k.enabled && k.apiKey.trim().length > 0
@@ -5167,12 +5172,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
 
             if (wave.waveIdx > 0) {
               const backoffMs = computeGeminiBackoffDelayMs(wave.waveIdx);
-              onProgress(
-                60,
-                wave.waveIdx === 1
-                  ? 'Gemini AI busy (503) — optimizing payload & retrying with backup model...'
-                  : 'High demand on Gemini AI — final smart retry in progress...'
-              );
+              onProgress(60, 'Server busy — retrying...');
               await new Promise((r) => setTimeout(r, backoffMs));
             }
 
@@ -5192,9 +5192,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                   if (wave.waveIdx === 0 && (modelIdx > 0 || attemptIdx > 0)) {
                     onProgress(
                       60,
-                      modelIdx > 0
-                        ? `Switching to backup AI model (${targetModel})...`
-                        : 'Retrying AI script generation...'
+                      modelIdx > 0 ? 'Processing script...' : 'Retrying script generation...'
                     );
                   }
 
@@ -5268,10 +5266,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                       console.warn(
                         `[Gemini Script] Model ${targetModel} hit 429 quota (${keyErrInfo.reason}); trying backup model on same key...`
                       );
-                      onProgress(
-                        60,
-                        `${targetModel} quota reached — switching to backup Gemini model...`
-                      );
+                      onProgress(60, 'Processing script...');
                       break;
                     }
                     throw err;
@@ -5649,7 +5644,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         transcriptContextForRescue.length >= 30
       ) {
         try {
-          onProgress(63, 'Gemini limit/busy — generating synced script via backup AI engine...');
+          onProgress(63, 'Generating synced script...');
           const rescueLangLabel =
             targetLanguage === 'my'
               ? 'Burmese (မြန်မာဘာသာ စကားပြောဟန်)'
@@ -5855,7 +5850,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
     let voiceoverWavBuffer: Buffer | null = null;
     const voiceDef = VOICE_OPTIONS.find((v) => v.id === voiceGender) || VOICE_OPTIONS[0];
     if (!isCaptionsOnlyMode) {
-      onProgress(74, 'Synthesizing AI voiceover...');
+      onProgress(74, 'Generating voiceover...');
       const useGeminiPrimary =
         !isFreeMode &&
         (ttsEngine === 'gemini-3.8-flash-lite-tts' ||

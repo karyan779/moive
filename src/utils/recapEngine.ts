@@ -3144,12 +3144,24 @@ export function resolveSubtitleFontMeta(
       letterSpacing: '0em'
     };
   }
-  if (lang === 'zh' || lang === 'ja' || /[\u4E00-\u9FFF\u3040-\u30FF]/.test(text)) {
+  if (lang === 'ja' || (/[\u3040-\u30FF]/.test(text) && lang !== 'zh')) {
     return {
       ...base,
-      cssFontFamily: '"Noto Sans SC", "Noto Sans JP", "Unifont", sans-serif',
-      assFontName: 'Unifont',
-      pangoFontDesc: 'Unifont',
+      cssFontFamily: '"Noto Sans JP", "Hiragino Kaku Gothic ProN", sans-serif',
+      assFontName: 'Noto Sans JP',
+      pangoFontDesc: 'Noto Sans JP Bold',
+      pangoAssScale: 0.72,
+      assBold: -1,
+      fontWeight: 700,
+      letterSpacing: '0em'
+    };
+  }
+  if (lang === 'zh' || /[\u4E00-\u9FFF]/.test(text)) {
+    return {
+      ...base,
+      cssFontFamily: '"Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif',
+      assFontName: 'Noto Sans SC',
+      pangoFontDesc: 'Noto Sans SC Bold',
       pangoAssScale: 0.72,
       assBold: -1,
       fontWeight: 700,
@@ -3373,6 +3385,67 @@ export function parseTranslatedSubtitleChunkOutput(
   }
 
   return out;
+}
+
+/**
+ * Strips any internal AI, Gemini, Whisper, Groq, Cloudflare, or model-name references
+ * from recap progress and retry messages so the user only sees clean, simple English stage labels.
+ */
+export function sanitizeRecapProgressMessage(rawMsg: string): string {
+  const trimmed = String(rawMsg || '').trim();
+  if (!trimmed) return 'Processing...';
+
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.includes('switching to backup') ||
+    lower.includes('quota reached') ||
+    lower.includes('backup model') ||
+    lower.includes('backup ai') ||
+    lower.includes('backup gemini')
+  ) {
+    if (lower.includes('503') || lower.includes('busy') || lower.includes('high demand')) {
+      return 'Server busy — retrying...';
+    }
+    return 'Processing script...';
+  }
+  if (lower.includes('503') || lower.includes('high demand') || (lower.includes('busy') && lower.includes('retry'))) {
+    return 'Server busy — retrying...';
+  }
+  if (lower.includes('listening to original audio')) {
+    return 'Listening to original audio...';
+  }
+  if (lower.includes('transcribing') && lower.includes('whisper')) {
+    return 'Transcribing dialogue...';
+  }
+  if (lower.includes('writing') && lower.includes('script') && lower.includes('ai')) {
+    return 'Writing script & subtitles...';
+  }
+  if (lower.includes('synthesizing') && lower.includes('voiceover')) {
+    return 'Generating voiceover...';
+  }
+  if (lower.includes('starting ai recap')) {
+    return 'Starting recap...';
+  }
+  if (lower.includes('retrying ai script')) {
+    return 'Retrying script generation...';
+  }
+  if (lower.includes('generating synced script') && (lower.includes('gemini') || lower.includes('ai'))) {
+    return 'Generating synced script...';
+  }
+
+  // General fallback scrub: remove parenthesized model IDs, vendor names, and standalone "AI"
+  const scrubbed = trimmed
+    .replace(/\(\s*(?:gemini|whisper|groq|llama|claude|gpt)[^)]*\)/gi, '')
+    .replace(/\b(?:gemini[-\w.]*|whisper[-\w.]*|groq|cloudflare|workers\s+ai|mediabunny)\b/gi, '')
+    .replace(/\bwith\s+AI\b/gi, '')
+    .replace(/\bvia\s+AI\b/gi, '')
+    .replace(/\bAI\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([.,!?;:])/g, '$1')
+    .replace(/\s+\.{3}$/, '...')
+    .trim();
+
+  return scrubbed.length >= 3 ? scrubbed : 'Processing...';
 }
 
 /* ============================================================================

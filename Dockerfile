@@ -1,6 +1,6 @@
 FROM node:22-bookworm
 
-# Install FFmpeg, Python3 + Pango/Cairo for Burmese subtitle rendering, and Burmese fonts
+# Install FFmpeg, Python3 + Pango/Cairo for multilingual subtitle rendering, and backup system fonts
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     python3 \
@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y \
     python3-gi-cairo \
     gir1.2-pango-1.0 \
     fonts-sil-padauk \
+    fonts-noto-cjk \
+    fonts-noto-core \
+    fonts-dejavu-core \
     fontconfig \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
