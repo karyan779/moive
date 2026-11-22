@@ -56,6 +56,7 @@ import {
   TELEGRAM_CHANNEL_URL,
   TELEGRAM_ADMIN_HANDLE,
   TELEGRAM_ADMIN_URL,
+  getClientAuthHeaders,
   type RecapJobRecord,
   type CreditPlanId,
   type CreditPlanDefinition,
@@ -174,7 +175,10 @@ export const SttStudioView: React.FC<{
   uiLang: 'my' | 'en';
   proCredits: number;
   activePlanId: CreditPlanId | 'free';
-  onDeductCredits: (amount: number) => void;
+  onDeductCredits: (
+    amount: number,
+    serverDeductedInfo?: { serverDeducted?: boolean; remainingCredits?: number }
+  ) => void;
   onNavigateToWallet: () => void;
 }> = ({ uiLang, proCredits, activePlanId, onDeductCredits, onNavigateToWallet }) => {
   const sttFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -276,7 +280,7 @@ export const SttStudioView: React.FC<{
 
       const res = await fetch('/api/recap/free/generate-assets', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
         body: JSON.stringify({
           asyncMode: true,
           isFreeMode: false,
@@ -386,7 +390,11 @@ export const SttStudioView: React.FC<{
         setCues(data.cues);
         setSttProgress(100);
         setSttStatusMsg('Done!');
-        onDeductCredits(sttCreditCost);
+        onDeductCredits(sttCreditCost, {
+          serverDeducted: Boolean(data.server_deducted),
+          remainingCredits:
+            typeof data.remaining_credits === 'number' ? data.remaining_credits : undefined
+        });
         playUiSound('success');
       } else {
         throw new Error(
@@ -778,7 +786,9 @@ export const WalletView: React.FC<{
 
   const fetchUserPayments = async () => {
     try {
-      const res = await fetch(`/api/user/payments?userId=${encodeURIComponent(userId)}`);
+      const res = await fetch(`/api/user/payments?userId=${encodeURIComponent(userId)}`, {
+        headers: getClientAuthHeaders()
+      });
       const data = await res.json();
       if (data.ok && Array.isArray(data.payments)) {
         setUserPayments(data.payments);
@@ -806,7 +816,7 @@ export const WalletView: React.FC<{
             {proCredits} Pro Credits Available (~{Math.round((proCredits * 70) / 60)} Minutes of Video)
           </h2>
           <p className="text-xs text-stone-500 dark:text-slate-400">
-            1 Credit = 1:10 Min (70s) across all Credit Studios &amp; STT · Plus 5 Free Videos/Day (Max 2:30m each) in Free Mode
+            1 Credit = 1:10 Min (70s) across all Credit Studios &amp; STT · Plus 5 Free Videos/Day (Max 2:40m each) in Free Mode
           </p>
         </div>
 
@@ -1118,7 +1128,7 @@ export const WalletView: React.FC<{
               </p>
               <ul className="space-y-1 text-stone-600 dark:text-slate-300">
                 <li>• တစ်ရက်လျှင် ဗီဒီယို <strong>5 ပုဒ်</strong> အခမဲ့ ထုတ်ယူနိုင်သည် (5 Videos / Day)</li>
-                <li>• ဗီဒီယို ၁ ပုဒ်လျှင် အများဆုံး <strong>2:30 မိနစ် (150 စက္ကန့်)</strong> အထိ ရသည်</li>
+                <li>• ဗီဒီယို ၁ ပုဒ်လျှင် အများဆုံး <strong>2:40 မိနစ် (160 စက္ကန့်)</strong> အထိ ရသည်</li>
                 <li>• AI Voice TTS: <strong>Thiha (Male)</strong> နှင့် <strong>Nilar (Female)</strong> ၂ မျိုး သုံးနိုင်သည်</li>
                 <li>• On-device WebCodecs 720p HD Export</li>
               </ul>
@@ -1603,7 +1613,7 @@ export const WalletView: React.FC<{
                       try {
                         const res = await fetch('/api/payments/submit-slip', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
                           body: JSON.stringify({
                             userId: userId || 'UID-84920',
                             planName: qrModalItem.name,
@@ -1621,13 +1631,12 @@ export const WalletView: React.FC<{
                           setPaymentStep('success');
                           fetchUserPayments();
                         } else {
+                          playUiSound('blocked');
                           setTransferMsg(data.error || 'Failed to submit slip');
                         }
                       } catch {
-                        // Fallback activate
-                        playUiSound('success');
-                        setPaymentStep('success');
-                        fetchUserPayments();
+                        playUiSound('blocked');
+                        setTransferMsg('Server နှင့် ချိတ်ဆက်၍ မရပါ။ ထပ်မံကြိုးစားပါ။');
                       } finally {
                         setIsSubmittingTransfer(false);
                       }

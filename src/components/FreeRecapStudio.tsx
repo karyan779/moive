@@ -59,6 +59,7 @@ import {
   resolveEffectiveVideoDurationSec,
   parseAndNormalizeVideoSourceUrl,
   sanitizeRecapProgressMessage,
+  getClientAuthHeaders,
   type RecapMode,
   type TranslateAudioMode,
   type VoiceGender,
@@ -95,7 +96,11 @@ interface FreeRecapStudioProps {
   activeTab: RightInspectorTab;
   onChangeTab: (tab: RightInspectorTab) => void;
   historyJobs: RecapJobRecord[];
-  onSaveJob: (job: RecapJobRecord, creditCostUsed?: number) => void;
+  onSaveJob: (
+    job: RecapJobRecord,
+    creditCostUsed?: number,
+    serverDeductedInfo?: { serverDeducted?: boolean; remainingCredits?: number }
+  ) => void;
   onDeleteJob: (jobId: string) => void;
   freeRemaining?: number;
   freeLimit?: number;
@@ -1036,7 +1041,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       const submitAndPollRecapJob = async () => {
         const response = await fetch('/api/recap/free/generate-assets', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
           body: JSON.stringify(requestPayload)
         });
 
@@ -1236,7 +1241,11 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         autoFlowLogs: logs
       };
       playUiSound('success');
-      onSaveJob(newJob, creditCost);
+      onSaveJob(newJob, creditCost, {
+        serverDeducted: Boolean(data.server_deducted),
+        remainingCredits:
+          typeof data.remaining_credits === 'number' ? data.remaining_credits : undefined
+      });
     } catch (err) {
       playUiSound('error');
       const errMsg =
@@ -1284,7 +1293,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         const exportFreeKeys = isFreeTier ? loadFreeUserApiKeys() : { geminiKey: '', groqKey: '' };
         const exportRes = await fetch('/api/recap/render-export', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
           body: JSON.stringify({
             asyncMode: true,
             jobId: lastJobId,
@@ -1535,8 +1544,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     <div className="flex flex-col gap-0.5 min-w-0">
                       <span className="font-bold text-teal-700 dark:text-teal-300 truncate">
                         {uiLang === 'my'
-                          ? `Free Mode · တစ်ရက် ${freeLimit} ပုဒ် (၂:၃၀ မိနစ်)`
-                          : `Free Mode · ${freeLimit}/day (Max 2:30m)`}
+                          ? `Free Mode · တစ်ရက် ${freeLimit} ပုဒ် (၂:၄၀ မိနစ်)`
+                          : `Free Mode · ${freeLimit}/day (Max 2:40m)`}
                       </span>
                       <span className="text-[10px] text-stone-500 dark:text-slate-400 tabular-nums">
                         {uiLang === 'my'
@@ -2237,6 +2246,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                         >
                           <option value="narrator">Fast Recap (အမြန်ဆွဲဆောင် ပြောဟန်)</option>
                           <option value="natural">Natural Flow (သဘာဝ အပြောဟန်)</option>
+                          <option value="hybrid">Hybrid Dialogue (ဇာတ်ကြောင်းပြော + ဇာတ်ကောင်စကားပြော)</option>
                           <option value="drama">Storytelling (ရုပ်ရှင်ဇာတ်လမ်း ပြောဟန်)</option>
                           <option value="casual">Gen Z (လူငယ်ဆန်ဆန် သွက်လက်ပြောဟန်)</option>
                           <option value="news">News (သတင်းကြေညာ တင်ဆက်ဟန်)</option>
@@ -3536,8 +3546,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   <p className="mt-1.5 text-[11px] font-medium text-stone-400 dark:text-slate-500 text-center">
                     {isFreeTier
                       ? uiLang === 'my'
-                        ? `Free Mode: တစ်ရက် ${freeLimit} ပုဒ် · ဗီဒီယို ၁ ပုဒ် အများဆုံး 2:30 မိနစ် (150s)`
-                        : `Free Mode: ${freeLimit} videos/day · Max 2:30 mins (150s) per video`
+                        ? `Free Mode: တစ်ရက် ${freeLimit} ပုဒ် · ဗီဒီယို ၁ ပုဒ် အများဆုံး 2:40 မိနစ် (160s)`
+                        : `Free Mode: ${freeLimit} videos/day · Max 2:40 mins (160s) per video`
                       : uiLang === 'my'
                         ? `Credit Mode: 1 Credit = 1:10 မိနစ် (70s) · FHD 1080p & AI အသံအစုံ ၁၀ မျိုး`
                         : `Credit Mode: 1 Credit = 1:10 (70s) · FHD 1080p & All 10 AI Voices`}
@@ -3617,8 +3627,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   }
                 >
                   {videoDuration > FREE_MAX_DURATION_SEC
-                    ? `${videoDuration}s video (Exceeds Free 150s / 2:30m limit — Switch to Credit Mode)`
-                    : `${videoDuration}s video · 720p · Free (${freeRemaining}/${freeLimit} left today, max 2:30m)`}
+                    ? `${videoDuration}s video (Exceeds Free 160s / 2:40m limit — Switch to Credit Mode)`
+                    : `${videoDuration}s video · 720p · Free (${freeRemaining}/${freeLimit} left today, max 2:40m)`}
                 </span>
               ) : (
                 <span>
@@ -3743,7 +3753,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       ? freeRemaining <= 0
                         ? 'Daily Limit Reached (0/3)'
                         : videoDuration > FREE_MAX_DURATION_SEC
-                          ? 'Exceeds 2:30m Free Limit'
+                          ? 'Exceeds 2:40m Free Limit'
                           : t.generateBtn
                       : `${t.generateBtn} · ${creditCost} cr`}
                 </span>
@@ -3767,8 +3777,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     ? `${videoDuration}s · Done`
                     : isFreeTier
                       ? videoDuration > FREE_MAX_DURATION_SEC
-                        ? `${videoDuration}s (Exceeds Free 2:30m limit)`
-                        : `${videoDuration}s video · 720p · Free (${freeRemaining}/${freeLimit} left, max 2:30m)`
+                        ? `${videoDuration}s (Exceeds Free 2:40m limit)`
+                        : `${videoDuration}s video · 720p · Free (${freeRemaining}/${freeLimit} left, max 2:40m)`
                       : `${videoDuration}s video · ~${creditCost} credit${creditCost !== 1 ? 's' : ''}`}
               </span>
               {isDone && cues.length > 0 && (
@@ -3942,7 +3952,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       ? freeRemaining <= 0
                         ? 'Daily Limit Reached (0/3)'
                         : videoDuration > FREE_MAX_DURATION_SEC
-                          ? 'Exceeds 2:30m Free Limit'
+                          ? 'Exceeds 2:40m Free Limit'
                           : t.generateBtn
                       : `${t.generateBtn} · ${creditCost} cr`}
                 </span>
@@ -4309,8 +4319,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   : `Daily Free Recap Limit Reached (${freeLimit} / ${freeLimit})`
                 : limitModalType === 'duration_limit'
                   ? uiLang === 'my'
-                    ? 'Free Mode တွင် 2:30 မိနစ် (150s) အထိသာ ရပါသည်'
-                    : 'Free Mode Limit: Max 2:30 Minutes (150s) per Video'
+                    ? 'Free Mode တွင် 2:40 မိနစ် (160s) အထိသာ ရပါသည်'
+                    : 'Free Mode Limit: Max 2:40 Minutes (160s) per Video'
                   : uiLang === 'my'
                     ? 'Credit မလုံလောက်ပါ (Credit ဖြည့်သွင်းပါ)'
                     : 'Server Recap Requires Credits'}
@@ -4319,12 +4329,12 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             <p className="mt-2 text-xs leading-relaxed text-stone-500 dark:text-slate-400">
               {limitModalType === 'daily_limit'
                 ? uiLang === 'my'
-                  ? `Free Mode ဖြင့် တစ်ရက်လျှင် 2:30 မိနစ်အောက် ဗီဒီယို ${freeLimit} ပုဒ် ထုတ်ယူနိုင်ပြီး ယနေ့အတွက် ပြည့်သွားပါပြီ။ အကန့်အသတ်မဲ့ ဆက်လက်ထုတ်ယူရန် Starter Pack, Creator Pro သို့မဟုတ် Creator Pro Max Plan ကို ရွေးချယ်ပါ။`
-                  : `You've used all ${freeLimit} free recaps for today (max 2:30 minutes each). Upgrade to Starter Pack, Creator Pro, or Creator Pro Max to continue generating immediately.`
+                  ? `Free Mode ဖြင့် တစ်ရက်လျှင် 2:40 မိနစ်အောက် ဗီဒီယို ${freeLimit} ပုဒ် ထုတ်ယူနိုင်ပြီး ယနေ့အတွက် ပြည့်သွားပါပြီ။ အကန့်အသတ်မဲ့ ဆက်လက်ထုတ်ယူရန် Starter Pack, Creator Pro သို့မဟုတ် Creator Pro Max Plan ကို ရွေးချယ်ပါ။`
+                  : `You've used all ${freeLimit} free recaps for today (max 2:40 minutes each). Upgrade to Starter Pack, Creator Pro, or Creator Pro Max to continue generating immediately.`
                 : limitModalType === 'duration_limit'
                   ? uiLang === 'my'
-                    ? `သင်တင်ထားသော ဗီဒီယိုသည် ${formatDuration(videoDuration)} (${videoDuration}s) ရှိပြီး Free Mode ကန့်သတ်ချက် 2:30 မိနစ် (150s) ထက် ကျော်လွန်နေပါသည်။ Credit Mode တွင် ~${calculateCreditCost(videoDuration, false)} Credits (1:10 = 1 Credit) ဖြင့် FHD 1080p + AI အသံအစုံဖြင့် ထုတ်ယူနိုင်ပါသည်။`
-                    : `Your video is ${formatDuration(videoDuration)} (${videoDuration}s), which exceeds the 2:30-minute (150s) Free Mode limit. Switch to Credit Studio (~${calculateCreditCost(videoDuration, false)} credits · 1:10 = 1 Credit) or upgrade your Credit Plan.`
+                    ? `သင်တင်ထားသော ဗီဒီယိုသည် ${formatDuration(videoDuration)} (${videoDuration}s) ရှိပြီး Free Mode ကန့်သတ်ချက် 2:40 မိနစ် (160s) ထက် ကျော်လွန်နေပါသည်။ Credit Mode တွင် ~${calculateCreditCost(videoDuration, false)} Credits (1:10 = 1 Credit) ဖြင့် FHD 1080p + AI အသံအစုံဖြင့် ထုတ်ယူနိုင်ပါသည်။`
+                    : `Your video is ${formatDuration(videoDuration)} (${videoDuration}s), which exceeds the 2:40-minute (160s) Free Mode limit. Switch to Credit Studio (~${calculateCreditCost(videoDuration, false)} credits · 1:10 = 1 Credit) or upgrade your Credit Plan.`
                   : uiLang === 'my'
                     ? `ဤဗီဒီယိုအတွက် ${creditCost} Credits လိုအပ်ပြီး သင့်လက်ကျန်မှာ ${proCredits} Credits ဖြစ်ပါသည်။ Wallet တွင် Plan ဝယ်ယူပါ သို့မဟုတ် Credit ဖြည့်သွင်းပါ။`
                     : `This video requires ${creditCost} credits, and your current balance is ${proCredits} credits. Top up credits or choose a Credit Plan in Wallet.`}

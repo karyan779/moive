@@ -14,7 +14,7 @@ export type VoiceGender =
   | 'orus'
   | 'zephyr';
 export type CreditPlanId = 'free' | 'starter-pack' | 'creator-pro' | 'creator-pro-max';
-export type ScriptStyleId = 'narrator' | 'natural' | 'drama' | 'casual' | 'news' | 'none';
+export type ScriptStyleId = 'narrator' | 'natural' | 'hybrid' | 'drama' | 'casual' | 'news' | 'none';
 export type LongFormStyleId = 'educational' | 'dramatic' | 'listicle' | 'documentary' | 'morris';
 export type AspectRatioMode = 'original' | '9:16' | '16:9' | '1:1' | '4:5';
 export type FramingFitMode = 'pad' | 'crop';
@@ -34,7 +34,7 @@ export type BurmeseFontStyle =
   | 'Z06-Walone';
 
 export const FREE_DAILY_VIDEO_LIMIT = 5; // 5 free videos per day
-export const FREE_MAX_DURATION_SEC = 150; // 2:30 minutes (150s) max per free video
+export const FREE_MAX_DURATION_SEC = 160; // 2:40 minutes (160s) max per free video
 
 export interface BlurRegion {
   id: string;
@@ -220,22 +220,23 @@ export const UPLOADED_VIDEO_FILENAME =
   'SaveTik.co_7673413291896605967-hd_47ddcad1.mp4';
 
 export const STREAMWAVE_VOICE_STYLE_PROMPTS: Record<ScriptStyleId, string> = {
-  narrator: `You are a Burmese movie recap narrator (Fast Recap style).
-Rewrite the timestamped transcript into a natural spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+  narrator: `You are a Burmese short-form movie recap narrator (Fast Recap style — snappy TikTok/Reels cadence).
+Rewrite the timestamped transcript into a brisk, catchy, natural spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
 Rules:
-- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
-- Open with a strong hook in the first 3 seconds.
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a punchy third-person storyteller.
+- Open with a strong TikTok/Reels hook in the first 3 seconds.
 - Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
 - Do not repeat the same meaning across consecutive cues.
-- Use natural spoken Burmese endings ("...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", "...နေတုန်းမှာပဲ") without trailing "။".`,
+- STRICTLY AVOID repetitive "...ပါတယ်", "...တယ်", "...လိုက်ပါတယ်", or "...သွားခဲ့ပါတယ်" endings. Rotate crisp, pleasant TikTok/Reels spoken Burmese endings naturally ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...ဖြစ်သွားရော", "...နေတုန်းမှာပဲ", "...လုပ်ချလိုက်ပြီ", "...မသိလိုက်ဘူးလေ", "...တော့တာပဲ", "...လိုက်ရော", "...နေခဲ့တာ") and never use trailing "။".`,
   natural: `You are a Burmese movie recap narrator (Natural Flow style).
-Rewrite the timestamped transcript into a natural, lively spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+Accurately translate and retell the real dialogue, burned-in on-screen subtitles, and visual actions in natural, lively third-person spoken Myanmar ("သူက", "ကောင်လေးက", "သူမက").
 Rules:
-- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
-- Open with a strong hook in the first 3 seconds.
-- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
+- STRICT FACTUAL & NUMBER FIDELITY FIRST: Read any burned-in on-screen subtitles in the video frames and the spoken audio/transcript verbatim. Preserve every exact number, room number, floor, date, money amount, and name literally (e.g., if the subtitle or audio says 214, write ၂၁၄ — NEVER guess or substitute a wrong number). Never invent vague filler lines that contradict or ignore what was actually said.
+- Never output raw first/second-person character dialogue ("ငါ", "မင်း") literally; turn the exact meaning of what characters say and do into accurate third-person storytelling.
+- Open with a strong hook based ONLY on the real opening scene in the first 3 seconds.
+- Keep every cue to a single short, punchy spoken Burmese phrase (26–48 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
 - Do not repeat the same meaning across consecutive cues.
-- AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence. Vary sentence endings naturally like a real human Burmese storyteller ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မှန်း မသိခဲ့ဘူးလေ") without trailing "။".`,
+- AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence. Vary sentence endings naturally like a real human Burmese storyteller ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မသေချာဘူးလေ", "...မှန်း မသိခဲ့ဘူးလေ") without trailing "။".`,
   drama: `You are a Burmese movie recap storyteller (Storytelling / Drama style — Tone: Intense & Cinematic).
 Rewrite the timestamped transcript into an emotionally gripping, continuous third-person spoken Myanmar movie recap with cinematic intensity and short punchy sentences.
 Rules:
@@ -254,6 +255,12 @@ Summarize the video's timestamped events into an objective, facts-first third-pe
 Rules:
 - Present key events, cause-and-effect, and surprising facts clearly in third-person Burmese without first-person dialogue ("ငါ", "မင်း").
 - Keep every cue to a single concise 1-line spoken Burmese phrase (28–50 Burmese characters, ~2.1–2.9 seconds) synced to [start_ms, end_ms] with no repeated facts.`,
+  hybrid: `You are an expert Burmese Movie Recap Storyteller & Cinema Dialogue Translator (Hybrid Dialogue style).
+Combine crisp third-person Burmese movie recap narration for setup/action scenes with direct quoted character dialogue ("...") whenever characters speak on screen.
+Rules:
+- NON-DIALOGUE / SETUP SCENES: Narrate in crisp third-person Burmese movie recap style ("ကောင်မလေးတစ်ယောက်ဟာ", "သူဟာ", "ဒါပေမဲ့...", "...ခဲ့ပါတယ်"), preserving all exact numbers, ages, and visual details.
+- ACTIVE CHARACTER SPEAKING SCENES: Switch seamlessly to direct first/second-person character dialogue enclosed in double quotes ("...") translating the EXACT real meaning with authentic spoken Burmese particles matching character age/emotion ("မောင်ရေ...", "...လေး", "...ရဲ့လားဟင်", "ဟာ...", "...လိုက်တာ", "...ပဲ").
+- Keep every cue concise (24–48 Burmese characters, ~2.0–2.8s) locked strictly to exact [start_ms, end_ms] timestamps with zero repetition.`,
   none: `You are a Burmese documentary narrator (Documentary style — Journalistic, context → story → insight · Tone: Reflective & Deep).
 Write an insightful, observational third-person spoken Myanmar documentary recap synchronized 1-to-1 with the video's exact scene timestamps.
 Rules:
@@ -268,31 +275,32 @@ export const SCRIPT_STYLE_PROMPTS: Record<ScriptStyleId, ScriptStylePromptDefini
     labelEn: 'Fast Recap',
     labelMy: 'အမြန်ပြန်ပြောပြမယ် (Fast Recap)',
     badge: 'DEFAULT · HOOK-DRIVEN',
-    descriptionEn: 'Natural spoken Myanmar rewrite. Enhanced context comprehension. Punchy 3rd-person movie narrator with tight 1-line phrase captions.',
-    descriptionMy: 'ကြည့်ရှုသူကို ၃ စက္ကန့်အတွင်း ဆွဲဆောင်နိုင်မယ့် သဘာဝကျကျ မြန်မာစကားပြောဟန် ၁ ကြောင်းစာ စာတန်းထိုးနှင့် အမြန်ပြန်ပြောပြမယ့်ဟန်။',
+    descriptionEn: 'Snappy TikTok/Reels spoken Myanmar movie recap with varied natural endings — eliminates repetitive "...ပါတယ်" / "...တယ်" loops.',
+    descriptionMy: '“...ပါတယ် / ...တယ်” ချည်း ထပ်မနေဘဲ ခပ်သွက်သွက် TikTok / Reels ဟန်ဖြင့် အဆုံးသတ်မျိုးစုံ နားထောင်လို့ကောင်းအောင် ပြန်ပြောပြမယ့်ဟန်။',
     pacingWpm: 155,
-    systemPrompt: `You are a Burmese movie recap narrator (Fast Recap style).
-Rewrite the timestamped transcript into a natural spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
+    systemPrompt: `You are a Burmese short-form movie recap narrator (Fast Recap style — snappy TikTok/Reels storytelling cadence).
+Rewrite the timestamped transcript into a brisk, catchy, pleasant-to-listen spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
 Rules:
-- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
-- Open with a strong hook in the first 3 seconds.
+- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a punchy third-person storyteller.
+- Open with a strong TikTok/Reels hook in the first 3 seconds.
 - Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
 - Do not repeat the same meaning across consecutive cues.
-- Use natural spoken Burmese endings ("...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", "...နေတုန်းမှာပဲ") without trailing "။".
+- STRICTLY AVOID repetitive "...ပါတယ်", "...တယ်", "...လိုက်ပါတယ်", or "...သွားခဲ့ပါတယ်" endings — rotate crisp spoken Burmese endings ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...ဖြစ်သွားရော", "...နေတုန်းမှာပဲ", "...လုပ်ချလိုက်ပြီ", "...မသိလိုက်ဘူးလေ", "...တော့တာပဲ", "...လိုက်ရော", "...နေခဲ့တာ") without trailing "။".
 
 CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
 1. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT DIALOGUE TRANSLATION):
-   - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
+   - You are a single third-person short-form movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
    - NEVER output raw first-person or second-person character dialogue ("ငါ", "မင်း", "နင်", "ခဏနေပါဦး မင်း ခုနက စကားပြောလိုက်တာလား", "ငါ သတ်ထားတာမှ မဟုတ်တာ") as if dubbing the actors!
-   - Convert every spoken line in the transcript into natural spoken Myanmar third-person recap storytelling (e.g., instead of "ခဏနေပါဦး မင်း စကားပြောလိုက်တာလား", write "မြွေက လူလို စကားထပြောလိုက်တော့ ကောင်လေးလည်း အရမ်းလန့်သွားပါတယ်"; instead of "ငါ အကြောက်ဆုံးက မင်း ငါ့ကို ကိုက်မှာပဲ", write "အလောင်းထက်စာရင် ဒီမြွေ သူ့ကိုထကိုက်မှာကိုပဲ ပိုကြောက်နေရှာပါတယ်").
+   - Convert every spoken line in the transcript into crisp, lively TikTok/Reels spoken Myanmar third-person recap storytelling (e.g., instead of "ခဏနေပါဦး မင်း စကားပြောလိုက်တာလား", write "မြွေက လူလို စကားထပြောလိုက်တော့ ကောင်လေးလည်း မျက်လုံးပြူးသွားရော"; instead of "ငါ အကြောက်ဆုံးက မင်း ငါ့ကို ကိုက်မှာပဲ", write "အလောင်းထက်စာရင် ဒီမြွေ သူ့ကိုထကိုက်မှာကိုပဲ ပိုကြောက်နေခဲ့တာ").
 2. ZERO REPETITION / NO DUPLICATE MEANING:
-   - NEVER write two consecutive cues that repeat the same point in different words (e.g., never follow "သူက မြွေစကား နားလည်နေတယ်" with "ဒါဟာ သူက မြွေစကား နားလည်နေတာပဲ ဖြစ်မှာပါ"). Every cue must advance the plot with new action, cause-and-effect, or twist.
+   - NEVER write two consecutive cues that repeat the same point in different words (e.g., never follow "သူက မြွေစကား နားလည်နေတာ" with "ဒါဟာ သူက မြွေစကား နားလည်နေတာပဲ"). Every cue must advance the plot with new action, cause-and-effect, or twist.
 3. SHORT, PUNCHY 1-LINE PHRASES:
    - Every cue.text MUST be one crisp spoken Burmese recap phrase of 5 to 10 words (26 to 50 Burmese characters, ~2.0s–2.8s when spoken). Never write multi-sentence paragraphs in one cue.
 4. HOOK FIRST & CONTINUOUS SCENE SYNC:
-   - Open immediately (0.0s–3.0s) with a gripping hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
-5. NATURAL SPOKEN BURMESE FLOW:
-   - Use lively spoken Burmese recap connectors and endings ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "နောက်ဆုံးမှာတော့", "...လိုက်ပါတယ်", "...နေတုန်းမှာပဲ", "...သွားခဲ့ပါတယ်"). Avoid trailing "။" inside subtitle text.
+   - Open immediately (0.0s–3.0s) with a gripping TikTok/Reels hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
+5. NATURAL TIKTOK/REELS SPOKEN BURMESE FLOW & VARIED ENDINGS (NO REPETITIVE "ပါတယ်/တယ်"):
+   - Deliver brisk, easy-to-listen Burmese recap narration with punchy connectors ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့", "တကယ်တမ်းကျတော့", "မထင်မှတ်ဘဲ", "နောက်ဆုံးမှာတော့").
+   - NEVER end consecutive sentences with "...ပါတယ်", "...တယ်", "...လိုက်ပါတယ်", "...သွားခဲ့ပါတယ်", or "...ဖြစ်ပါတယ်" — minimize stiff formal "...ပါတယ်" completely and rotate varied, crisp spoken Burmese endings naturally across every line ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...ဖြစ်သွားရော", "...နေတုန်းမှာပဲ", "...လုပ်ချလိုက်ပြီ", "...မသိလိုက်ဘူးလေ", "...တော့တာပဲ", "...လိုက်ရော", "...နေခဲ့တာ", "...ပဲပေါ့") so the voiceover sounds smooth, energetic, and enjoyable to listen to. Avoid trailing "။" inside subtitle text.
 6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   natural: {
@@ -304,28 +312,26 @@ CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
     descriptionMy: '“...တယ် / ...ပါတယ်” ချည်း ထပ်မနေဘဲ တကယ့်လူတစ်ယောက် ဇာတ်လမ်းပြောပြသလို သဘာဝကျကျ အဆုံးသတ်မျိုးစုံဖြင့် သွက်လက်စွာ ပြန်ပြောပြမယ့်ဟန်။',
     pacingWpm: 155,
     systemPrompt: `You are a Burmese movie recap narrator (Natural Flow style).
-Rewrite the timestamped transcript into a natural, lively spoken Myanmar third-person movie recap ("သူက", "ကောင်လေးက", "သူမက") with enhanced context comprehension.
-Rules:
-- Never translate first-person character dialogue ("ငါ", "မင်း") literally; narrate what happens in the scene as a third-person storyteller.
-- Open with a strong hook in the first 3 seconds.
-- Keep every cue to a single short, punchy spoken Burmese phrase (26–50 Burmese characters, ~2.0–2.8 seconds) synchronized to the scene timestamps [start_ms, end_ms].
-- Do not repeat the same meaning across consecutive cues.
-- AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence. Vary sentence endings naturally like a real human Burmese storyteller ("...လိုက်တော့တာပေါ့", "...သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မှန်း မသိခဲ့ဘူးလေ") without trailing "။".
+Accurately understand and retell the video's REAL spoken dialogue, burned-in on-screen subtitles, and visual actions in natural, lively spoken Myanmar third-person movie recap style ("သူက", "ကောင်လေးက", "သူမက").
 
-CRITICAL MOVIE RECAP NARRATION RULES (MUST OBEY):
-1. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT DIALOGUE TRANSLATION):
-   - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("ကောင်လေးက", "သူက", "သူမက", "အဲဒီလူက", "ရဲတွေက").
+CRITICAL MOVIE RECAP ACCURACY & NATURAL FLOW RULES (MUST OBEY IN ORDER):
+1. STRICT FACTUAL, ON-SCREEN SUBTITLE & NUMBER FIDELITY (HIGHEST PRIORITY):
+   - Read BOTH the spoken audio/transcript AND any burned-in on-screen subtitles visible in the attached video frames carefully before writing each cue.
+   - Preserve EVERY exact number, room number, floor, time, price, place, and proper name literally (for example, if the video subtitle or speech says "214", you MUST say "၂၁၄" — NEVER guess or replace it with another number).
+   - Retell the EXACT real meaning of every spoken line and visual action. NEVER invent generic filler sentences (like vague "something uncertain is happening") when the actual dialogue states a specific answer, instruction, or fact!
+2. STRICT THIRD-PERSON RECAP NARRATION ONLY (NOT RAW DIALOGUE DUBBING):
+   - You are a single third-person movie storyteller (ဇာတ်လမ်းပြန်ပြောပြသူ) explaining what happens on screen using third-person subjects ("သူက", "သူမက", "ကောင်လေးက", "ကောင်မလေးက", "သူတို့က").
    - NEVER output raw first-person or second-person character dialogue ("ငါ", "မင်း", "နင်") as if dubbing the actors!
-   - Convert every spoken line in the transcript into natural spoken Myanmar third-person recap storytelling.
-2. ZERO REPETITION / NO DUPLICATE MEANING:
-   - NEVER write two consecutive cues that repeat the same point in different words. Every cue must advance the plot with new action, cause-and-effect, or twist.
-3. SHORT, PUNCHY 1-LINE PHRASES:
-   - Every cue.text MUST be one crisp spoken Burmese recap phrase of 5 to 10 words (26 to 50 Burmese characters, ~2.0s–2.8s when spoken). Never write multi-sentence paragraphs in one cue.
-4. HOOK FIRST & CONTINUOUS SCENE SYNC:
-   - Open immediately (0.0s–3.0s) with a gripping hook about the scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
-5. NATURAL SPOKEN BURMESE FLOW & VARIED ENDINGS:
-   - Use lively spoken Burmese recap connectors ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့လည်း", "တကယ်တမ်းကျတော့", "နောက်ဆုံးမှာတော့") and vary your sentence endings naturally ("...လိုက်တော့တာပေါ့", "...နေတုန်းမှာပဲ", "...ဖြစ်သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်လိုက်ပါလေရော", "...မထင်ထားခဲ့ဘူး") so it never sounds robotic. Avoid trailing "။" inside subtitle text.
-6. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+   - Faithfully convert each character's actual spoken meaning into accurate, clear third-person Burmese recap narration.
+3. ZERO REPETITION / NO DUPLICATE MEANING:
+   - NEVER write two consecutive cues that repeat the same point in different words. Every cue must advance the real scene/dialogue accurately.
+4. SHORT, PUNCHY, EVEN-LENGTH 1-LINE PHRASES (FOR STEADY VOICE PACING):
+   - Every cue.text MUST be one crisp spoken Burmese recap phrase of 5 to 9 words (24 to 46 Burmese characters, ~2.0s–2.7s when spoken at a steady natural pace). Never write overly long multi-sentence paragraphs in one cue that force the voice to rush.
+5. HOOK FIRST & CONTINUOUS SCENE SYNC:
+   - Open immediately (0.0s–3.0s) with an accurate hook matching the real opening scene, and lock cue timestamps (start_ms, end_ms) chronologically across the entire video with tight 100ms–220ms natural breath pauses.
+6. NATURAL SPOKEN BURMESE FLOW & VARIED ENDINGS (WITHOUT CHANGING MEANING):
+   - Keep the exact true meaning intact while delivering it in smooth spoken Burmese with lively connectors ("အဲဒီအချိန်မှာပဲ", "ဒါပေမဲ့လည်း", "တကယ်တမ်းကျတော့", "နောက်ဆုံးမှာတော့"). AVOID repeating "...တယ်", "...ပါတယ်", or "...ဖြစ်ပါတယ်" at the end of every sentence — vary sentence endings naturally ("...လိုက်တော့တာပေါ့", "...နေတုန်းမှာပဲ", "...ဖြစ်သွားခဲ့ပြီ", "...နေခဲ့ရရှာတယ်", "...လုပ်ချလိုက်ပါလေရော", "...မသေချာဘူးလေ", "...မထင်ထားခဲ့ဘူး") so it never sounds robotic. Avoid trailing "။" inside subtitle text.
+7. OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   drama: {
     id: 'drama',
@@ -384,6 +390,38 @@ Rules:
 - Keep every cue to a single concise 1-line spoken Burmese phrase (28–50 Burmese characters, ~2.1–2.9 seconds) synced to [start_ms, end_ms] with no repeated facts.
 
 OUTPUT SCHEMA: Return JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
+  },
+  hybrid: {
+    id: 'hybrid',
+    labelEn: 'Hybrid Dialogue',
+    labelMy: 'Hybrid Dialogue (ဇာတ်ကြောင်းပြော + ဇာတ်ကောင်စကားပြော)',
+    badge: 'RECAP + QUOTED DIALOGUE',
+    descriptionEn: 'Third-person Burmese movie recap narration for setup & action scenes, switching seamlessly to accurate quoted character dialogue ("...") whenever characters speak.',
+    descriptionMy: 'စကားမပြောတဲ့ အခန်းတွေမှာ ဇာတ်ကြောင်းပြောဟန်နဲ့ ဆွဲဆောင်ပြောပြပြီး ဇာတ်ကောင်တကယ်စကားပြောတဲ့ အခန်းတွေမှာ "..." ဖြင့် ဇာတ်ကောင်အသံအတိုင်း တိကျသဘာဝကျကျ ဘာသာပြန်ပေးမယ့်ဟန်။',
+    pacingWpm: 152,
+    systemPrompt: `You are an expert Burmese Movie Recap Storyteller & Cinema Dialogue Translator (Hybrid Recap + Direct Dialogue Style).
+Analyze BOTH the video's visual frames (character expressions, actions, burned-in on-screen subtitles) AND the timestamped audio/transcript carefully.
+
+STRICT HYBRID STRUCTURE RULES (MUST OBEY):
+1. NON-DIALOGUE / SETUP / ACTION SCENES (Before or between character speaking scenes):
+   - Narrate in crisp, engaging third-person Burmese Movie Recap style ("ကောင်မလေးတစ်ယောက်ဟာ", "သူဟာ", "ဒါပေမဲ့", "...ခဲ့ပါတယ်", "...ဖြစ်နေခဲ့ပါတယ်").
+   - Open in the first 3–4 seconds with a strong plot hook introducing the character's flaw/motive and immediate setup.
+   - Use sharp contrast twists ("ဒါပေမဲ့...") when revealing hidden truths, and preserve ALL exact numbers, ages, room numbers, and visual details verbatim (e.g., "အသက် ၅၂ နှစ်", "၂၁၄").
+
+2. ACTIVE CHARACTER DIALOGUE SCENES (When a character is clearly speaking on screen / phone call / close-up lip-sync):
+   - Switch seamlessly from third-person narration to DIRECT FIRST/SECOND-PERSON CHARACTER DIALOGUE enclosed in double quotes ("...").
+   - Translate the EXACT real meaning of what the character actually says in the audio and burned-in subtitles — NEVER invent generic filler or alter the real meaning.
+   - Match each character's age, gender, personality, and facial emotion using authentic spoken Burmese particles and interjections:
+     • Flirty / sweet tone: "မောင်ရေ...", "...လေး", "...ရဲ့လားဟင်"
+     • Excited / shocked / rural uncle tone: "ဟာ...", "...လိုက်တာ", "တကယ့်...ပဲ", "...ကတော့ တကယ်ကို ...တာပဲ"
+     • Angry / cold / dramatic tone: "ဘာပြောလိုက်တယ်", "မင်း...", "...စမ်းပါ"
+   - Lock the start_ms and end_ms of every quoted dialogue line precisely to the exact milliseconds when that character speaks on screen.
+
+3. ACCURACY, PACING & FORMAT RULES:
+   - STRICT FACTUAL ACCURACY: Cross-verify spoken audio, burned-in subtitles, and visual scenes so character roles, ages, numbers, and dialogue meaning are 100% accurate.
+   - ZERO REPETITION: Never narrate what a character is about to say right before quoting the exact same line; let the quoted dialogue deliver the punchline directly.
+   - SHORT 1-LINE PHRASES: Keep every cue concise (24–48 Burmese characters, ~2.0–2.8s spoken duration) for steady, natural pacing without rushing.
+   - OUTPUT SCHEMA: Return valid JSON with { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [{ start_ms, end_ms, label }] }.`
   },
   none: {
     id: 'none',
@@ -933,8 +971,31 @@ export function alignCuesWithAudioSync(
     Math.max(normalizedStarts[idx] + 400, Math.round((c.end_ms || c.start_ms + 1500) * sceneScale))
   );
 
+  // Compute a uniform steady global tempo baseline when total spoken audio slightly exceeds video length,
+  // so narration plays at ONE calm, consistent speed rather than swinging erratically between 1.0x and 1.24x.
+  const totalRawSpokenMsAll = cues.reduce(
+    (sum, c, idx) =>
+      sum +
+      Math.max(
+        320,
+        Math.round(spokenDurationsMs[idx] || normalizedEnds[idx] - normalizedStarts[idx] || 1500)
+      ),
+    0
+  );
+  const totalPausesBudgetMs = Math.max(0, cues.length - 1) * safePause;
+  const globalBudgetMs =
+    hasFullTimelineAnchors && totalDurationMs ? Math.max(1000, totalDurationMs - 140 - totalPausesBudgetMs) : 0;
+  const globalSteadyTempo =
+    dynamicTempoFit && globalBudgetMs > 0 && totalRawSpokenMsAll > globalBudgetMs
+      ? Number(Math.min(1.12, Math.max(1.0, totalRawSpokenMsAll / globalBudgetMs)).toFixed(3))
+      : 1.0;
+  // Tight per-cue ceiling & smooth adjacent-cue delta cap eliminate jarring fast/slow voice fluctuations
+  const maxSteadyCueTempo = Number(Math.min(1.12, Math.max(1.08, globalSteadyTempo + 0.03)).toFixed(3));
+  const maxAdjacentTempoDelta = 0.025;
+
   const schedule: SyncedCueScheduleItem[] = [];
   let audioCursorMs = 60;
+  let prevTempoFactor = globalSteadyTempo;
 
   for (let i = 0; i < cues.length; i++) {
     const cue = cues[i];
@@ -965,7 +1026,7 @@ export function alignCuesWithAudioSync(
         // would cause remaining speech to overflow totalDurationMs, or if the gap exceeds 2600ms.
         const latestSafeSceneStartMs = Math.max(
           audioCursorMs,
-          totalDurationMs - 100 - Math.round(remainingSpokenMs / 1.20) - minRemainingPausesMs
+          totalDurationMs - 100 - Math.round(remainingSpokenMs / maxSteadyCueTempo) - minRemainingPausesMs
         );
         if (alignedStartMs > latestSafeSceneStartMs) {
           alignedStartMs = latestSafeSceneStartMs;
@@ -995,7 +1056,7 @@ export function alignCuesWithAudioSync(
       }
     }
 
-    // Method 3: Compute available scene slot before next cue or video end (preventing domino drift past totalDurationMs)
+    // Method 3: Compute available scene slot before next cue or video end
     const hasNext = i + 1 < cues.length;
     const rawNextTargetMs = hasNext
       ? normalizedStarts[i + 1]
@@ -1013,28 +1074,43 @@ export function alignCuesWithAudioSync(
         480,
         Math.round((totalDurationMs - 100 - alignedStartMs) / Math.max(1, cues.length - i))
       );
-      if (availableSlotMs > avgRemainingSlot * 1.35) {
-        availableSlotMs = Math.max(480, Math.round(avgRemainingSlot * 1.2));
+      if (availableSlotMs > avgRemainingSlot * 1.45) {
+        availableSlotMs = Math.max(480, Math.round(avgRemainingSlot * 1.25));
       }
     }
 
-    // Gentle late-drift catch-up: if accumulated voice cursor slipped >280ms behind scene timestamp,
-    // compress this phrase's slot slightly (within 1.24x tempo cap) so ending scenes remain locked 1:1.
+    // Gentle late-drift catch-up without abrupt speed spikes
     const lateDriftMs = cues.length > 1 ? Math.max(0, alignedStartMs - targetSceneStartMs) : 0;
-    if (dynamicTempoFit && lateDriftMs > 280 && availableSlotMs > 600) {
-      const catchUpTrimMs = Math.min(Math.round(lateDriftMs * 0.45), Math.round(availableSlotMs * 0.16));
+    if (dynamicTempoFit && lateDriftMs > 360 && availableSlotMs > 600) {
+      const catchUpTrimMs = Math.min(Math.round(lateDriftMs * 0.3), Math.round(availableSlotMs * 0.1));
       availableSlotMs = Math.max(480, availableSlotMs - catchUpTrimMs);
     }
 
-    let tempoFactor = 1.0;
-    let effectiveSpokenMs = rawSpokenMs;
+    let tempoFactor = globalSteadyTempo;
 
     // NEVER slow down speech below 1.0x (which makes Burmese TTS sound sluggish/heavy);
-    // only compress (> 1.0x up to 1.24x) when spoken audio exceeds the scene slot.
+    // keep per-cue speed tightly bounded and smoothly ramped so voice speed never swings fast/slow.
     if (dynamicTempoFit && rawSpokenMs > availableSlotMs) {
-      tempoFactor = Number(Math.min(1.24, Math.max(1.0, rawSpokenMs / availableSlotMs)).toFixed(3));
-      effectiveSpokenMs = Math.max(350, Math.round(rawSpokenMs / tempoFactor));
+      const rawDesired = Math.min(maxSteadyCueTempo, Math.max(globalSteadyTempo, rawSpokenMs / availableSlotMs));
+      tempoFactor = rawDesired;
     }
+
+    if (dynamicTempoFit && cues.length >= 3 && i > 0) {
+      const smoothed = Math.max(
+        globalSteadyTempo,
+        Math.min(
+          maxSteadyCueTempo,
+          Math.max(prevTempoFactor - maxAdjacentTempoDelta, Math.min(prevTempoFactor + maxAdjacentTempoDelta, tempoFactor))
+        )
+      );
+      tempoFactor = smoothed;
+    }
+
+    tempoFactor = Number(Math.max(1.0, Math.min(maxSteadyCueTempo, tempoFactor)).toFixed(3));
+    prevTempoFactor = tempoFactor;
+
+    const effectiveSpokenMs =
+      tempoFactor > 1.005 ? Math.max(350, Math.round(rawSpokenMs / tempoFactor)) : rawSpokenMs;
 
     const alignedEndMs = alignedStartMs + effectiveSpokenMs;
 
@@ -1782,6 +1858,16 @@ export const SAVETIK_WEDDING_DRAMA_CUES: Record<ScriptStyleId, SubtitleCue[]> = 
     { id: 'st-news-12', start_ms: 57620, end_ms: 62500, text: 'သတို့သားမှ မင်္ဂလာပွဲကို ချက်ချင်းဖျက်သိမ်းပြီး ငွေပြန်အမ်းရန် တောင်းဆိုခဲ့ပါတယ်' },
     { id: 'st-news-13', start_ms: 62620, end_ms: 66200, text: 'ဆက်ဆံရေးကို အပြီးသတ်ရပ်စဲပြီး ထွက်ခွာရန် ပြင်ဆင်ချိန်တွင်' },
     { id: 'st-news-14', start_ms: 66320, end_ms: 70000, text: 'သတို့သမီးမှ ကိုယ်ဝန်ရှိနေကြောင်း ထုတ်ဖော်ပြောကြားခဲ့ပါတယ်' }
+  ],
+  hybrid: [
+    { id: 'st-hyb-1', start_ms: 100, end_ms: 3400, text: '"သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ"' },
+    { id: 'st-hyb-2', start_ms: 3520, end_ms: 8200, text: 'မင်္ဂလာခန်းမထဲမှာ သတို့သမီးဟာ အိမ်ပြင်လိုက်တာပါလို့ လိမ်ညာပြောနေခဲ့ပါတယ်' },
+    { id: 'st-hyb-3', start_ms: 8320, end_ms: 14500, text: 'ဒါပေမဲ့ အိမ်ပိုင်ရှင်အစစ် ဝင်လာပြီး "ဒီဆိုဖာတွေအားလုံး ငါဝယ်ထားတာ" လို့ ဖွင့်ချလိုက်ပါတယ်' },
+    { id: 'st-hyb-4', start_ms: 14620, end_ms: 21000, text: 'တကယ်တမ်းမှာ ယောက္ခမဖြစ်သူက ငွေနှစ်သိန်းကို သားငယ်အိမ်ဝယ်ဖို့ ယူသုံးပစ်ခဲ့တာပါ' },
+    { id: 'st-hyb-5', start_ms: 21120, end_ms: 31000, text: '"မိသားစုချင်း ကူညီတာ ဘာဖြစ်လဲ... ဒီအိမ်ပါ မောင်လေးကို ပေးလိုက်မယ်"' },
+    { id: 'st-hyb-6', start_ms: 31120, end_ms: 45100, text: 'အဲဒီစကားကြားတာနဲ့ အိမ်ရှင်မိန်းကလေးက ဂရန်စာချုပ်ကို စားပွဲပေါ် ပစ်တင်လိုက်ပါတယ်' },
+    { id: 'st-hyb-7', start_ms: 45220, end_ms: 58000, text: 'သတို့သားလည်း အမှန်တရားကို သိသွားပြီး "ပိုက်ဆံပြန်ပေး... ငါတို့ပြတ်ပြီ" လို့ ပြောကာ လှည့်ထွက်သွားပါတယ်' },
+    { id: 'st-hyb-8', start_ms: 58120, end_ms: 70000, text: 'အဲဒီအချိန်မှာပဲ သတို့သမီးက "ရှင်မသွားနဲ့... ကျွန်မမှာ ကိုယ်ဝန်ရှိနေပြီ" လို့ အော်ဟစ်တားလိုက်ပါတော့တယ်' }
   ],
   none: [
     { id: 'st-doc-1', start_ms: 100, end_ms: 3400, text: 'သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ' },
@@ -2663,6 +2749,13 @@ export function buildSyncedRecapCues(
         'အိမ်ပိုင်ရှင်အစစ်က ဂရန်စာချုပ် ထုတ်ပြလိုက်တော့ အားလုံး အရှက်ကွဲနေခဲ့ရရှာတယ်',
         'နောက်ဆုံးမှာတော့ သတို့သားက မင်္ဂလာပွဲဖျက်ပြီး လှည့်ထွက်သွားတော့တာပေါ့'
       ],
+      hybrid: [
+        '"သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ"',
+        'သတို့သမီးဟာ အိမ်ပြင်လိုက်တာပါလို့ လိမ်ညာပြောနေခဲ့ပါတယ်',
+        'ဒါပေမဲ့ အိမ်ရှင်အစစ် ဝင်လာပြီး "ဒီပရိဘောဂတွေအားလုံး ငါဝယ်ထားတာ" လို့ ဖွင့်ချလိုက်ပါတယ်',
+        'တကယ်တမ်းမှာ ငွေနှစ်သိန်းကို သားငယ်အိမ်ဝယ်ဖို့ ယူသုံးပစ်ခဲ့တာပါ',
+        'နောက်ဆုံးမှာ သတို့သားက "ငွေပြန်ပေး... ငါတို့ပြတ်ပြီ" ဆိုပြီး လှည့်ထွက်သွားပါတော့တယ်'
+      ],
       drama: [
         'သိန်းသုံးဆယ်ကို ခင်ဗျား ဘယ်မှာ သုံးလိုက်တာလဲ',
         'ပျော်ရွှင်စရာ မင်္ဂလာဦးနေ့လေးဟာ မုန်တိုင်းထန်လာပါတယ်',
@@ -2709,6 +2802,13 @@ export function buildSyncedRecapCues(
         'Turns out the bride’s mother secretly gave 200k to her younger son',
         'The moment the property deed hit the table, the whole scheme collapsed'
       ],
+      hybrid: [
+        '"Where did you spend the 300,000 yuan?"',
+        'The bride claimed she spent it all renovating their new home',
+        'But the real owner stepped in: "I bought every piece of furniture here!"',
+        'It turned out the mother secretly gave 200k to her younger son',
+        'Furious, the groom snapped: "Give my money back, we are done!"'
+      ],
       drama: [
         'Where did you spend the 300,000 yuan?',
         'Behind calm eyes lies a buried family secret',
@@ -2752,6 +2852,13 @@ export function buildSyncedRecapCues(
         'แต่เจ้าของบ้านตัวจริงเดินเข้ามาเปิดโปงความจริง',
         'แม่เจ้าสาวยอมรับว่านำเงินไปดาวน์บ้านให้น้องชาย',
         'เจ้าบ่าวยกเลิกงานแต่งทันทีและเดินจากไป'
+      ],
+      hybrid: [
+        '"เงินสามแสนหยวน คุณเอาไปใช้ที่ไหนหมด"',
+        'เจ้าสาวอ้างว่านำไปตกแต่งเรือนหอทั้งหมด',
+        'แต่เจ้าของบ้านตัวจริงเดินเข้ามาเปิดโปงความจริงทันที',
+        'แม่เจ้าสาวยอมรับว่านำเงินไปดาวน์บ้านให้น้องชาย',
+        'เจ้าบ่าวประกาศทันที "คืนเงินมา เราจบกันแค่นี้"'
       ],
       drama: [
         'เงินสามแสนหยวน คุณเอาไปใช้ที่ไหนหมด',
@@ -2797,6 +2904,13 @@ export function buildSyncedRecapCues(
         '母親は20万元を弟の頭金に使ったと認めました',
         '新郎は即座に破談を宣言して立ち去りました'
       ],
+      hybrid: [
+        '「30万元をいったいどこに使ったんだ？」',
+        '新婦は新居の改装に使ったと嘘をつきます',
+        'しかし本当の家の持ち主が現れて真実を暴きます',
+        '母親は20万元を弟の頭金に使ったと認めました',
+        '新郎は「金を返せ、これで終わりだ」と言い残し立ち去ります'
+      ],
       drama: [
         '30万元をいったいどこに使ったんだ？',
         '華やかな結婚式の裏の嘘がついに暴かれます',
@@ -2840,6 +2954,13 @@ export function buildSyncedRecapCues(
         '진짜 집주인이 나타나 모든 사실을 폭로합니다',
         '신부 어머니는 남동생 집 계약금으로 썼다고 말합니다',
         '신랑은 즉시 파혼을 선언하고 떠나버립니다'
+      ],
+      hybrid: [
+        '"30만 위안을 도대체 어디에 쓴 거야?"',
+        '신부는 신혼집 인테리어에 썼다고 거짓말합니다',
+        '하지만 진짜 집주인이 나타나 모든 사실을 폭로합니다',
+        '신부 어머니는 남동생 집 계약금으로 썼다고 털어놓습니다',
+        '신랑은 "돈 돌려줘, 우리 끝이야"라며 떠나버립니다'
       ],
       drama: [
         '30만 위안을 도대체 어디에 쓴 거야?',
@@ -2886,6 +3007,13 @@ export function buildSyncedRecapCues(
         '丈母娘承认拿二十万给弟弟付了首付',
         '林知夏直接拍出房产证书揭穿骗婚',
         '新郎看清真相后当场悔婚转身离开'
+      ],
+      hybrid: [
+        '“三十万你到底花哪去了？”',
+        '新娘谎称用来装修了这套婚房',
+        '但真正的房东走出来当众揭穿真相',
+        '丈母娘承认拿二十万给弟弟付了首付',
+        '新郎怒道：“还钱，我们结束了！”随后转身离开'
       ],
       drama: [
         '三十万你到底花哪去了？',
@@ -4640,6 +4768,22 @@ export function encodeAuthUserCacheHeader(user: PersistedAuthUser | null | undef
     return btoa(binary);
   } catch {
     return '';
+  }
+}
+
+export function getClientAuthHeaders(): Record<string, string> {
+  try {
+    const lsToken =
+      typeof localStorage !== 'undefined' ? localStorage.getItem('ttak_auth_token') : null;
+    const cookieStr = typeof document !== 'undefined' ? document.cookie : '';
+    const token = (lsToken || extractCookieValue(cookieStr, 'ttak_auth_token') || '').trim();
+    if (!token) return {};
+    return {
+      Authorization: `Bearer ${token}`,
+      'x-auth-token': token
+    };
+  } catch {
+    return {};
   }
 }
 

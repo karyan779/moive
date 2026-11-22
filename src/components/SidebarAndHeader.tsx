@@ -338,7 +338,7 @@ export const SidebarAndHeader: React.FC<SidebarAndHeaderProps> = ({
               <div className="flex items-center justify-between mb-1.5">
                 <span className="text-[11px] font-semibold text-stone-800 dark:text-slate-200 flex items-center gap-1.5">
                   <Crown className="size-3.5 text-amber-500" />
-                  <span>Free (2:30m max)</span>
+                  <span>Free (2:40m max)</span>
                 </span>
                 <span className="text-[11px] font-mono font-bold tabular-nums text-stone-900 dark:text-white">
                   {freeRemaining} / {freeLimit}

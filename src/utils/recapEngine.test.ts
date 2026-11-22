@@ -18,6 +18,7 @@ import {
   getVoicePreviewSampleText,
   alignCuesWithAudioSync,
   SCRIPT_STYLE_PROMPTS,
+  STREAMWAVE_VOICE_STYLE_PROMPTS,
   FREE_DAILY_VIDEO_LIMIT,
   FREE_MAX_DURATION_SEC,
   VOICE_OPTIONS,
@@ -121,7 +122,7 @@ test('clampBlurRegion prevents out-of-bounds watermark boxes', () => {
 
 test('calculateCreditCost computes flat 1 credit per 1:10 (70 seconds) across all AI voices, and 0 for free recap', () => {
   assert.equal(FREE_DAILY_VIDEO_LIMIT, 5);
-  assert.equal(FREE_MAX_DURATION_SEC, 150);
+  assert.equal(FREE_MAX_DURATION_SEC, 160);
   assert.equal(CREDIT_SECONDS_PER_UNIT, 70);
 
   assert.equal(calculateCreditCost(45, true), 0);
@@ -191,6 +192,10 @@ test('splitCuesIntoShortPhrases and buildSyncedRecapCues generate crisp 1-line n
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('SHORT, PUNCHY 1-LINE PHRASES'));
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('STRICT THIRD-PERSON RECAP NARRATION ONLY'));
   assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('ZERO REPETITION'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('TikTok/Reels'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('NO REPETITIVE "ပါတယ်/တယ်"'));
+  assert.ok(SCRIPT_STYLE_PROMPTS.narrator.systemPrompt.includes('...ဖြစ်သွားရော'));
+  assert.ok(STREAMWAVE_VOICE_STYLE_PROMPTS.narrator.includes('STRICTLY AVOID repetitive "...ပါတယ်"'));
 
   // Verify new Natural Flow ('natural') script style prompt and cues
   assert.equal(SCRIPT_STYLE_PROMPTS.natural.labelEn, 'Natural Flow');
@@ -1462,6 +1467,61 @@ test('sanitizeRecapProgressMessage removes all AI, Gemini, Whisper, and model na
   assert.equal(sanitizeRecapProgressMessage('Syncing voiceover & video...'), 'Syncing voiceover & video...');
   assert.equal(sanitizeRecapProgressMessage('Finalizing recap video...'), 'Finalizing recap video...');
 });
+
+test('Natural Flow prompt enforces exact number/on-screen subtitle accuracy and alignCuesWithAudioSync keeps steady voice speed without fast-slow swings', () => {
+  // 1) Natural Flow prompt must require exact number & on-screen subtitle fidelity alongside varied Burmese endings
+  const naturalPrompt = SCRIPT_STYLE_PROMPTS.natural.systemPrompt;
+  assert.ok(naturalPrompt.includes('burned-in on-screen subtitles'));
+  assert.ok(naturalPrompt.includes('exact number'));
+  assert.ok(naturalPrompt.includes('NEVER invent generic filler'));
+  assert.ok(naturalPrompt.includes('...လိုက်တော့တာပေါ့'));
+
+  // 2) 212s (3:32) recap with alternating short & long spoken cues must NOT swing abruptly between 1.00x and 1.24x
+  const totalMs = 212_000;
+  const cues212 = Array.from({ length: 72 }, (_, idx) => {
+    const startMs = Math.round((idx / 72) * 208_000) + 100;
+    return {
+      id: `nf-${idx + 1}`,
+      start_ms: startMs,
+      end_ms: startMs + 2500,
+      text: `အခန်း ၂၁၄ ဇာတ်ဝင်ခန်း ${idx + 1}`
+    };
+  });
+  const alternatingSpokenMs = cues212.map((_, idx) => (idx % 2 === 0 ? 3450 : 1850));
+  const steadySchedule = alignCuesWithAudioSync(cues212, alternatingSpokenMs, 100, true, totalMs, 220);
+
+  assert.equal(steadySchedule.length, 72);
+  for (let i = 0; i < steadySchedule.length; i++) {
+    assert.ok(
+      steadySchedule[i].tempoFactor >= 1.0 && steadySchedule[i].tempoFactor <= 1.12,
+      `Cue ${i} tempoFactor ${steadySchedule[i].tempoFactor} exceeded steady 1.0x–1.12x range`
+    );
+    if (i > 0) {
+      const delta = Math.abs(steadySchedule[i].tempoFactor - steadySchedule[i - 1].tempoFactor);
+      assert.ok(
+        delta <= 0.03,
+        `Adjacent cue speed swing too large between cue ${i - 1} (${steadySchedule[i - 1].tempoFactor}) and cue ${i} (${steadySchedule[i].tempoFactor})`
+      );
+    }
+  }
+});
+
+test('Hybrid Dialogue Script Style registers cleanly with Burmese narrator + quoted dialogue rules without altering existing styles', () => {
+  const hybrid = SCRIPT_STYLE_PROMPTS.hybrid;
+  assert.equal(hybrid.id, 'hybrid');
+  assert.equal(hybrid.labelEn, 'Hybrid Dialogue');
+  assert.ok(hybrid.labelMy.includes('ဇာတ်ကြောင်းပြော + ဇာတ်ကောင်စကားပြော'));
+  assert.ok(hybrid.descriptionMy.includes('"..."'));
+  assert.ok(hybrid.systemPrompt.includes('STRICT HYBRID STRUCTURE RULES'));
+  assert.ok(hybrid.systemPrompt.includes('DIRECT FIRST/SECOND-PERSON CHARACTER DIALOGUE'));
+  assert.ok(hybrid.systemPrompt.includes('NON-DIALOGUE / SETUP / ACTION SCENES'));
+
+  const synced = buildSyncedRecapCues(30, 'hybrid', 'my', 'Demo Clip');
+  assert.ok(synced.cues.length >= 4);
+  assert.ok(synced.cues.some((c) => c.text.includes('"')));
+});
+
+
 
 
 

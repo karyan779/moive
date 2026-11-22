@@ -25,6 +25,8 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import {
+  FREE_MAX_DURATION_SEC,
+  calculateCreditCost,
   SCRIPT_STYLE_PROMPTS,
   VOICE_OPTIONS,
   SAVETIK_WEDDING_DRAMA_CUES,
@@ -596,7 +598,7 @@ function synthesizeCadenceWavBuffer(
 ): Buffer {
   const sampleRate = 24000;
   const totalSamples = Math.min(
-    sampleRate * 150,
+    sampleRate * 300,
     Math.max(sampleRate * 4, Math.floor(durationSec * sampleRate))
   );
   const pcm = Buffer.alloc(totalSamples * 2);
@@ -733,7 +735,7 @@ async function synthesizeGeminiProVoiceWavBuffer(
       let durationMs = Math.max(400, Math.round((Math.max(0, finalWav.length - 44) / (24000 * 2)) * 1000));
 
       if (maxDurationSec && durationMs > maxDurationSec * 1000 * 1.05) {
-        const stretchFactor = Math.min(1.28, Number((durationMs / (maxDurationSec * 1000)).toFixed(3)));
+        const stretchFactor = Math.min(1.12, Number((durationMs / (maxDurationSec * 1000)).toFixed(3)));
         if (stretchFactor > 1.02) {
           const fitWav = path.join(JOBS_TEMP_DIR, `${jobId}_gem_fit.wav`);
           try {
@@ -885,7 +887,7 @@ async function synthesizeGeminiProVoiceCuesWavBuffer(
     let pcm = audio.pcm;
 
     if (item.tempoFactor > 1.02) {
-      const clampedTempo = Math.max(1.0, Math.min(1.26, item.tempoFactor));
+      const clampedTempo = Math.max(1.0, Math.min(1.12, item.tempoFactor));
       const inRaw = path.join(JOBS_TEMP_DIR, `${jobId}_gblk_in_${i}.pcm`);
       const outStretch = path.join(JOBS_TEMP_DIR, `${jobId}_gblk_out_${i}.pcm`);
       try {
@@ -1118,14 +1120,16 @@ async function synthesizeNeuralSpokenWavBuffer(
     const placedChunks: Array<{ startSample: number; pcm: Buffer }> = [];
     let maxEndMs = 0;
     let liveCursorMs = 60;
+    let maxAppliedCueTempo = 1.0;
 
     for (let i = 0; i < syncSchedule.length; i++) {
       const item = syncSchedule[i];
       let pcm = rawPcmSegments[i];
 
-      // Method 3 (Dynamic Tempo Fit): smoothly compress (>1.02x) via FFmpeg `atempo` when a phrase exceeds its slot (never slow down <1.0x)
-      if (pcm && pcm.length > 4 && item.tempoFactor > 1.02) {
-        const clampedTempo = Math.max(1.0, Math.min(1.26, item.tempoFactor));
+      // Method 3 (Steady Tempo Fit): smoothly compress within <=1.12x via FFmpeg `atempo` so voice never rushes abruptly
+      if (pcm && pcm.length > 4 && item.tempoFactor > 1.015) {
+        const clampedTempo = Math.max(1.0, Math.min(1.12, item.tempoFactor));
+        maxAppliedCueTempo = Math.max(maxAppliedCueTempo, clampedTempo);
         const inRaw = path.join(JOBS_TEMP_DIR, `${jobId}_stretch_in_${i}.pcm`);
         const outStretch = path.join(JOBS_TEMP_DIR, `${jobId}_stretch_out_${i}.pcm`);
         try {
@@ -1211,10 +1215,11 @@ async function synthesizeNeuralSpokenWavBuffer(
     }
 
     // If multi-cue narration slightly exceeded video duration, smoothly fit masterPcm within totalDurationSec
-    // so the ending sentence never gets cut off when muxed into MP4.
+    // with a bounded combined tempo ceiling (<=1.15x) so voice never double-stacks into rushed speech.
     const capMs = requestedTotalMs > 1500 ? requestedTotalMs - 80 : 0;
-    if (finalSyncedCues.length > 1 && capMs > 0 && rawSpokenEndMs > requestedTotalMs + 40) {
-      const fitFactor = Number(Math.min(1.32, rawSpokenEndMs / capMs).toFixed(3));
+    const maxSafeMasterFit = Number(Math.max(1.0, Math.min(1.12, 1.15 / Math.max(1.0, maxAppliedCueTempo))).toFixed(3));
+    if (finalSyncedCues.length > 1 && capMs > 0 && rawSpokenEndMs > requestedTotalMs + 40 && maxSafeMasterFit > 1.01) {
+      const fitFactor = Number(Math.min(maxSafeMasterFit, rawSpokenEndMs / capMs).toFixed(3));
       const spokenSamples = Math.min(masterPcm.length / 2, Math.ceil((rawSpokenEndMs / 1000) * sampleRate));
       const trimmedIn = path.join(JOBS_TEMP_DIR, `${jobId}_fit_in.pcm`);
       const fittedOut = path.join(JOBS_TEMP_DIR, `${jobId}_fit_out.pcm`);
@@ -3968,6 +3973,19 @@ async function startServer() {
   // Supports non-blocking `asyncMode: true` with `/api/recap/render-status/:exportId` polling to prevent Cloudflare 100s 524 timeouts!
   app.post('/api/recap/render-export', async (req, res) => {
     try {
+      const exportAuthUser = resolveAuthenticatedUser(req);
+      if (exportAuthUser) {
+        const exportBan = isUserBanned(exportAuthUser.email, exportAuthUser.userId);
+        if (exportBan) {
+          clearAuthSessionCookies(res);
+          res.status(403).json({
+            ok: false,
+            banned: true,
+            error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          });
+          return;
+        }
+      }
       pruneOldExportJobs();
       const {
         jobId,
@@ -4280,7 +4298,7 @@ async function startServer() {
     res.json({
       ok: true,
       engine: 'TTAK MOVIE RECAP WebCodecs + FFmpeg Audio Mixer',
-      freeMaxDurationSec: 150,
+      freeMaxDurationSec: FREE_MAX_DURATION_SEC,
       freeDailyLimit: 5,
       creditSecondsPerUnit: 70,
       workersAiConfigured: Boolean(loadCloudflareWorkersAiConfig()),
@@ -4710,8 +4728,8 @@ async function startServer() {
 
         const extractedMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_extracted.mp3`);
         const maxExtractSec = isFreeMode
-          ? 150
-          : Math.max(150, Math.min(3600, Math.ceil(probedDuration || 600)));
+          ? FREE_MAX_DURATION_SEC
+          : Math.max(300, Math.min(3600, Math.ceil(probedDuration || 600)));
         const audioBitrate = maxExtractSec > 240 ? '32k' : '48k';
         try {
           await execFileAsync('ffmpeg', [
@@ -4740,9 +4758,18 @@ async function startServer() {
       }
     }
 
+    if (isFreeMode && probedDuration > FREE_MAX_DURATION_SEC + 2) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: `Free Mode တွင် ဗီဒီယို ၁ ပုဒ်လျှင် အများဆုံး 2:40 မိနစ် (${FREE_MAX_DURATION_SEC}s) အထိသာ ရပါသည်။`,
+        errorEn: `Free Mode limit is max 2:40 minutes (${FREE_MAX_DURATION_SEC}s) per video.`
+      };
+    }
+
     const isTranslateMode = mode === 'translate' || Boolean(isSttOnly);
     const isCaptionsOnlyMode = isTranslateMode && (translateAudio === 'captions-only' || Boolean(isSttOnly));
-    const safeDuration = Math.max(6, Math.min(isFreeMode ? 150 : 10800, probedDuration));
+    const safeDuration = Math.max(6, Math.min(isFreeMode ? FREE_MAX_DURATION_SEC : 10800, probedDuration));
     const styleDef = SCRIPT_STYLE_PROMPTS[scriptStyle] || SCRIPT_STYLE_PROMPTS.narrator;
     const systemInstruction =
       customPrompt?.trim() ||
@@ -4921,7 +4948,7 @@ async function startServer() {
 
             const absStart = Math.max(0, segStartSec + relStartSec);
             const durArg = String(Math.max(2, Number((passDurSec + 0.35).toFixed(2))));
-            const selectExpr = `select='isnan(prev_selected_t)+gte(t-prev_selected_t,${intervalSec})+gt(scene,${sceneThreshold})*gte(t-prev_selected_t,${minCutGapSec})',scale=440:-2,showinfo`;
+            const selectExpr = `select='isnan(prev_selected_t)+gte(t-prev_selected_t,${intervalSec})+gt(scene,${sceneThreshold})*gte(t-prev_selected_t,${minCutGapSec})',scale=640:-2,showinfo`;
 
             let stderrOut = '';
             try {
@@ -4940,7 +4967,7 @@ async function startServer() {
                 '-frames:v',
                 String(maxPassFrames),
                 '-q:v',
-                '6',
+                '4',
                 outPattern
               ]);
               stderrOut = res.stderr || '';
@@ -4965,11 +4992,11 @@ async function startServer() {
                   '-i',
                   srcVideoPath,
                   '-vf',
-                  `fps=1/${fallbackInterval},scale=440:-2,showinfo`,
+                  `fps=1/${fallbackInterval},scale=640:-2,showinfo`,
                   '-frames:v',
                   String(maxPassFrames),
                   '-q:v',
-                  '6',
+                  '4',
                   outPattern
                 ]);
                 stderrOut = res.stderr || '';
@@ -5066,12 +5093,12 @@ async function startServer() {
             totalWins > 1
               ? `\nVideo Segment: Part ${winIndex + 1} of ${totalWins} (Global video time ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')} to ${Math.floor(winEndSec / 60)}:${String(Math.round(winEndSec % 60)).padStart(2, '0')}; output cue timestamps MUST be relative to this segment from 0ms to ${Math.round(winDurSec * 1000)}ms).${
                   winIndex > 0
-                    ? `\nCONTINUATION & CHARACTER CONSISTENCY RULE: This is Part ${winIndex + 1} starting at ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')}. Keep exact character roles from earlier segments (e.g. Principal "ကျောင်းအုပ်ကြီး", Teacher "ဆရာ", Student "ကျောင်းသူလေး") and do NOT restart the opening hook!${prevSummaryHint ? ` Previous story context: "${prevSummaryHint}" — continue seamlessly without repeating.` : ''}`
+                    ? `\nCONTINUATION & FACTUAL CONSISTENCY RULE: This is Part ${winIndex + 1} starting at ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')}. Keep exact character identities, room numbers, locations, and plot facts consistent with earlier segments and do NOT restart the opening hook!${prevSummaryHint ? ` Previous story context: "${prevSummaryHint}" — continue seamlessly without repeating.` : ''}`
                     : '\nSEGMENT 1 RULE: Narrate ONLY the events in this first segment. Do NOT guess or invent how the movie ends later!'
                 }`
               : '';
           const visualKeyframeNotice = hasVisualKeyframes
-            ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES ATTACHED: Timestamped scene frames [Visual Scene Frame at MM:SS (XXXXms)] and audio cover ONLY this exact segment. Narrate strictly what is ACTUALLY visible in the frames and heard in the audio at each matching timestamp—never jump ahead to later scenes, never repeat earlier hooks, and never invent unrelated filler!`
+            ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES & BURNED-IN SUBTITLES ATTACHED: Timestamped scene frames [Visual Scene Frame at MM:SS (XXXXms)] and audio cover ONLY this exact segment. CAREFULLY READ any burned-in on-screen subtitles (Chinese/Korean/Japanese/Thai/English text at the bottom of the frames) together with the spoken audio & transcript so exact numbers, room numbers, names, and dialogue meanings are 100% accurate—never guess wrong numbers, never jump ahead, and never invent unrelated filler!`
             : '';
 
           if (isTranslateMode) {
@@ -5093,17 +5120,38 @@ CRITICAL DIALOGUE & TIMING RULES:
 - ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 4 to 12 words, 20 to 54 characters).' : phraseLengthRule}`;
           }
 
+          const isHybridDialogueStyle = scriptStyle === 'hybrid';
+          if (isHybridDialogueStyle) {
+            return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
+STT Engine: ${sttModel}.
+Mode: Hybrid Movie Recap + Direct Quoted Character Dialogue (${styleDef.labelEn}).
+Target Language: ${langLabel}.
+Video Title / Filename: ${title || 'Dramatic Movie Clip'}.
+${winContext ? `Timestamped Source Transcript / Scene Timeline for THIS segment (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] timestamps and visual keyframes from 0ms to ${Math.round(winDurSec * 1000)}ms — cross-verify with the attached audio, visual frames, and any burned-in on-screen subtitles so character roles, ages, numbers, and dialogue meaning stay 100% accurate):\n${winContext}${winSceneGuide}` : 'Examine the attached timestamped visual keyframes (including any burned-in on-screen subtitles) and audio segment carefully, covering 0ms to ' + Math.round(winDurSec * 1000) + 'ms.'}
+
+CRITICAL HYBRID RECAP + DIRECT DIALOGUE RULES:
+- STRICT FACTUAL, NUMBER & ON-SCREEN SUBTITLE ACCURACY: Translate and narrate ONLY the real dialogue, burned-in on-screen subtitles, visual scenes, exact ages/numbers/room numbers, and character actions present in THIS segment. NEVER substitute wrong numbers and NEVER invent generic filler!${visualKeyframeNotice}${timelineAnchorNote}
+- SCENE SPLIT RULE (NON-DIALOGUE vs ACTIVE SPEECH):
+  1) Before or between character speaking scenes (setup, actions, reveals, twists): Narrate in crisp third-person Burmese Movie Recap style ("ကောင်မလေးတစ်ယောက်ဟာ", "သူဟာ", "ဒါပေမဲ့...", "...ခဲ့ပါတယ်").
+  2) Whenever a character is clearly speaking on screen (phone call, lip-sync, direct reaction): Switch seamlessly to DIRECT FIRST/SECOND-PERSON CHARACTER DIALOGUE wrapped in double quotes ("...") translating the exact real meaning with natural colloquial Burmese particles matching their age, gender, and emotion ("မောင်ရေ...", "...လေး", "...ရဲ့လားဟင်", "ဟာ...", "...လိုက်တာ", "...ပဲ").
+- STRICT 1:1 SCENE-TIMESTAMP LOCK: Lock every narration cue and every quoted dialogue line precisely to the exact milliseconds when that scene or spoken line happens (0ms to ${Math.floor(winDurSec * 1000 - 100)}ms)!
+- ZERO REPETITION: Never narrate what a character is about to say right before quoting the same line.
+- Generate approximately ${winCueCount} non-overlapping cues in ${langLabel} spanning this entire ${winDurSec}s segment from ~80ms up to ${Math.floor(winDurSec * 1000 - 100)}ms!
+- All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (0 to ${Math.round(winDurSec * 1000)}) and strictly increasing.
+- ${phraseLengthRule}`;
+          }
+
           return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
 Mode: Movie Recap (${styleDef.labelEn}) — STRICT THIRD-PERSON MOVIE STORYTELLER (NOT DIALOGUE TRANSLATION).
 Target Language: ${langLabel}.
 Video Title / Filename: ${title || 'Dramatic Movie Clip'}.
-${winContext ? `Timestamped Source Transcript / Scene Timeline for THIS segment (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] timestamps and visual keyframes from 0ms to ${Math.round(winDurSec * 1000)}ms — cross-verify with the attached audio & visual frames to keep exact character roles like Principal/Teacher/Student consistent throughout the entire video, and convert dialogue + visual action into accurate 3rd-person narration!):\n${winContext}${winSceneGuide}` : 'Examine the attached timestamped visual keyframes and audio segment carefully, and narrate ONLY what actually happens and is spoken in this segment in third-person movie recap style from 0ms to ' + Math.round(winDurSec * 1000) + 'ms.'}
+${winContext ? `Timestamped Source Transcript / Scene Timeline for THIS segment (LOCK every cue's start_ms & end_ms directly to these exact [MM:SS - MM:SS] timestamps and visual keyframes from 0ms to ${Math.round(winDurSec * 1000)}ms — cross-verify with the attached audio, visual frames, and any burned-in on-screen subtitles so exact numbers, room numbers, character roles, and dialogue meaning stay 100% accurate throughout the video, converting dialogue + visual action into accurate 3rd-person narration!):\n${winContext}${winSceneGuide}` : 'Examine the attached timestamped visual keyframes (including any burned-in on-screen subtitles) and audio segment carefully, and narrate ONLY what actually happens and is spoken in this segment in third-person movie recap style from 0ms to ' + Math.round(winDurSec * 1000) + 'ms.'}
 
 CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
-- STRICT FACTUAL ACCURACY TO SOURCE VIDEO FRAMES, AUDIO & TRANSCRIPT: Translate and narrate ONLY the real dialogue, visual scenes, plot events, numbers, and character actions present in THIS segment. Never invent unrelated storylines!${visualKeyframeNotice}${timelineAnchorNote}
-- CHARACTER CONSISTENCY ACROSS ENTIRE TIMELINE: Maintain the exact same character identities and roles (e.g., if a character is introduced as the School Principal "ကျောင်းအုပ်ကြီး" or Teacher "ဆရာ" at 0:00, keep calling them "ကျောင်းအုပ်ကြီး" / "ဆရာ" when they reappear at 1:09 — never switch them to a factory boss or unrelated person!).
-- STRICT THIRD-PERSON RECAP NARRATION ONLY: You are a movie recap narrator telling the story to viewers in third person ("ကောင်လေးက", "သူက", "သူမက", "ကျောင်းအုပ်ကြီးက", "ဆရာက"). NEVER write first-person or second-person character dialogue ("ငါ", "မင်း", "နင်") as if dubbing the actors! Always convert character dialogue into reported third-person Burmese recap narration.
+- STRICT FACTUAL, NUMBER & ON-SCREEN SUBTITLE ACCURACY: Translate and narrate ONLY the real dialogue, burned-in on-screen subtitles, visual scenes, plot events, exact numbers/room numbers, and character actions present in THIS segment. NEVER substitute wrong numbers (e.g., if the frame or audio says 214, write ၂၁၄) and NEVER invent generic filler storylines!${visualKeyframeNotice}${timelineAnchorNote}
+- CHARACTER & FACT CONSISTENCY ACROSS ENTIRE TIMELINE: Maintain the exact same character identities, relationships, room numbers, and locations established in the video without contradicting earlier scenes.
+- STRICT THIRD-PERSON RECAP NARRATION ONLY: You are a movie recap narrator telling the story to viewers in third person ("သူက", "သူမက", "ကောင်လေးက", "ကောင်မလေးက", "သူတို့က"). NEVER write first-person or second-person character dialogue ("ငါ", "မင်း", "နင်") as if dubbing the actors! Always convert character dialogue into accurate reported third-person Burmese recap narration.
 - STRICT 1:1 SCENE-TIMESTAMP LOCK: A cue at start_ms: T MUST ONLY narrate the visual/audio scene happening at timestamp T in this segment (0ms to ${Math.floor(winDurSec * 1000 - 100)}ms)!
 - ZERO REPETITION: Never write two consecutive cues with the same meaning.
 - Generate approximately ${winCueCount} non-overlapping spoken recap cues in ${langLabel} spanning this entire ${winDurSec}s segment from ~80ms up to ${Math.floor(winDurSec * 1000 - 100)}ms!
@@ -5528,13 +5576,19 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
               if (winCues.length === 0) {
                 throw new Error(`Zero cues parsed for window ${win.index + 1}`);
               }
-              storyContextHint = [
-                winCues[0]?.text,
-                winCues[Math.floor(winCues.length / 2)]?.text,
-                winCues[winCues.length - 1]?.text
-              ]
-                .filter(Boolean)
-                .join(' -> ');
+              const numberCues = winCues
+                .map((c) => c.text)
+                .filter((t) => /[0-9၀-၉]/.test(t))
+                .slice(-2);
+              const recentContextBits = Array.from(
+                new Set([
+                  winCues[0]?.text,
+                  ...numberCues,
+                  winCues[winCues.length - 2]?.text,
+                  winCues[winCues.length - 1]?.text
+                ])
+              ).filter(Boolean);
+              storyContextHint = recentContextBits.join(' -> ');
               stitchedCues.push(...winCues);
             }
 
@@ -5659,7 +5713,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                       : 'English';
           const rescueUserPrompt = `Video Duration: ${safeDuration}s (${Math.round(safeDuration * 1000)}ms).
 Target Language: ${rescueLangLabel}.
-Mode: ${isTranslateMode ? 'Dialogue Translation' : `Movie Recap (${styleDef.labelEn}) - STRICT 3rd-person movie storytelling`}.
+Mode: ${isTranslateMode ? 'Dialogue Translation' : scriptStyle === 'hybrid' ? 'Movie Recap (Hybrid Dialogue) - 3rd-person narration for setup scenes + direct quoted character dialogue ("...") for active speech' : `Movie Recap (${styleDef.labelEn}) - STRICT 3rd-person movie storytelling`}.
 Timestamped Source Speech Transcript:
 ${transcriptContextForRescue}
 
@@ -6116,6 +6170,103 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
   // TTAK MOVIE RECAP Free Recap & Studio Auto-Flow Asset Generator + Audio/Video Mixer
   // Supports `asyncMode: true` + `/api/recap/job-status/:jobId` polling so long 3+ min videos never hit Cloudflare's 100s timeout!
   app.post('/api/recap/free/generate-assets', async (req, res) => {
+    const authUser = resolveAuthenticatedUser(req);
+    if (!authUser) {
+      res.status(401).json({
+        ok: false,
+        error: 'အကောင့်ဝင်ရောက်ပြီးမှသာ အသုံးပြုနိုင်ပါသည် (Please sign in first)',
+        error_en: 'Authentication required. Please sign in first.'
+      });
+      return;
+    }
+
+    const banRecord = isUserBanned(authUser.email, authUser.userId);
+    if (banRecord) {
+      clearAuthSessionCookies(res);
+      res.status(403).json({
+        ok: false,
+        banned: true,
+        error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။',
+        error_en: 'Your account has been permanently banned by the administrator.'
+      });
+      return;
+    }
+
+    const isFreeReq = Boolean(req.body?.isFreeMode);
+    const reqDurationSec = Math.max(1, Number(req.body?.durationSec) || 15);
+    const reqVoiceGender = req.body?.voiceGender as VoiceGender | undefined;
+
+    if (isFreeReq) {
+      if (reqDurationSec > FREE_MAX_DURATION_SEC + 2) {
+        res.status(400).json({
+          ok: false,
+          error: `Free Mode တွင် ဗီဒီယို ၁ ပုဒ်လျှင် အများဆုံး 2:40 မိနစ် (${FREE_MAX_DURATION_SEC}s) အထိသာ ရပါသည်။`,
+          error_en: `Free Mode limit is max 2:40 minutes (${FREE_MAX_DURATION_SEC}s) per video.`
+        });
+        return;
+      }
+      const freeSnap = getUserFreeUsageSnapshot(authUser.userId);
+      if (freeSnap.freeRemaining <= 0) {
+        res.status(429).json({
+          ok: false,
+          error: `ယနေ့ Free Mode ကန့်သတ်ချက် (${freeSnap.freeLimit} ပုဒ်) ပြည့်သွားပါပြီ။ Credit Mode သို့ ပြောင်းလဲအသုံးပြုပါ။`,
+          error_en: `Daily Free Mode limit (${freeSnap.freeLimit} videos/day) reached.`
+        });
+        return;
+      }
+    } else {
+      const preRequiredCredits = calculateCreditCost(reqDurationSec, false, {
+        voiceGender: reqVoiceGender
+      });
+      const balSnap = getEffectiveUserBalance(authUser.userId, authUser.email);
+      if (balSnap.credits < preRequiredCredits) {
+        res.status(402).json({
+          ok: false,
+          error: `Credit မလုံလောက်ပါ (${preRequiredCredits} Credits လိုအပ်ပြီး လက်ကျန် ${balSnap.credits} Credits ဖြစ်ပါသည်)။ Wallet တွင် Credit ဖြည့်သွင်းပါ။`,
+          error_en: `Insufficient credits (${preRequiredCredits} required, ${balSnap.credits} available).`
+        });
+        return;
+      }
+    }
+
+    const suppressTelegram =
+      isSyntheticTestUser(authUser.userId, authUser.email) ||
+      req.headers['x-test-suppress-telegram'] === '1';
+
+    const finalizeCreditModeCompletion = (payload: Record<string, any>) => {
+      if (isFreeReq) return;
+      const effectiveDur = Math.max(1, Number(payload?.duration_sec) || reqDurationSec);
+      const finalCost = Math.max(
+        1,
+        calculateCreditCost(effectiveDur, false, { voiceGender: reqVoiceGender })
+      );
+      const deductionRes = chargeUserCreditsForGeneration(authUser.userId, authUser.email, finalCost);
+      const usageAfter = recordUserPaidUsage(authUser.userId);
+      payload.server_deducted = true;
+      payload.server_credits_deducted = deductionRes.deducted;
+      payload.remaining_credits = deductionRes.remainingCredits;
+      payload.paid_videos_today = usageAfter.paidVideosToday;
+      payload.total_paid_videos = usageAfter.totalPaidVideos;
+
+      if (!suppressTelegram) {
+        const modeLabel = req.body?.isSttOnly
+          ? 'Auto Subtitles (STT)'
+          : req.body?.mode === 'translate'
+            ? 'Credit Translate'
+            : 'Credit Recap';
+        notifyCreditModeVideoGenerated({
+          userId: authUser.userId,
+          email: authUser.email,
+          name: authUser.name,
+          creditsDeducted: deductionRes.deducted,
+          remainingCredits: deductionRes.remainingCredits,
+          durationSec: effectiveDur,
+          modeLabel,
+          usage: usageAfter
+        }).catch(() => {});
+      }
+    };
+
     pruneOldRecapJobs();
     const startTime = Date.now();
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -6150,6 +6301,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
           const cur = recapGenerationJobs.get(jobId);
           if (!cur) return;
           if (outcome.ok) {
+            finalizeCreditModeCompletion(outcome.payload);
             cur.status = 'done';
             cur.progress = 100;
             cur.stageMessage = 'Done!';
@@ -6193,6 +6345,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         });
         return;
       }
+      finalizeCreditModeCompletion(outcome.payload);
       res.json(outcome.payload);
     } catch (error) {
       console.error('Error in /api/recap/free/generate-assets:', error);
@@ -8340,13 +8493,28 @@ Strict Video-Scan & Title Rules:
   // ============================================================================
   const TELEGRAM_BOT_TOKEN = '8931773634:AAH2f3iOB5rDU3CgTH2nQ3guS1HyqJZXYjM';
   const TELEGRAM_ADMIN_CHAT_ID = '1981253384';
+  const OWNER_ADMIN_EMAIL = (process.env.OWNER_ADMIN_EMAIL || 'aungkyawbk96@gmail.com')
+    .trim()
+    .toLowerCase();
   const PAYMENT_FILE = path.join(JOBS_TEMP_DIR, 'payment_submissions.json');
   const USER_BALANCES_FILE = path.join(JOBS_TEMP_DIR, 'user_balances.json');
+  const BANNED_USERS_FILE = path.join(JOBS_TEMP_DIR, 'banned_users.json');
+  const CRACK_REMEDIATION_FILE = path.join(JOBS_TEMP_DIR, 'crack_remediation_v1.json');
+  const ADMIN_CREDENTIAL_FILE = path.join(JOBS_TEMP_DIR, 'admin_credential.json');
 
   interface UserBalanceRecord {
     credits: number;
     activePlanId?: string;
     lastUpdated: number;
+  }
+
+  interface BannedUserRecord {
+    id: string;
+    email?: string;
+    userId?: string;
+    reason: string;
+    bannedAt: number;
+    bannedBy: string;
   }
 
   function loadUserBalances(): Record<string, UserBalanceRecord> {
@@ -8368,20 +8536,362 @@ Strict Video-Scan & Title Rules:
     }
   }
 
-  function grantUserCredits(userId: string, credits: number, planName?: string): number {
+  function loadBannedUsers(): BannedUserRecord[] {
+    try {
+      if (fs.existsSync(BANNED_USERS_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(BANNED_USERS_FILE, 'utf-8'));
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      console.warn('Error reading banned users:', e);
+    }
+    return [];
+  }
+
+  function saveBannedUsers(list: BannedUserRecord[]) {
+    try {
+      fs.writeFileSync(BANNED_USERS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+    } catch (e) {
+      console.warn('Error saving banned users:', e);
+    }
+  }
+
+  function resolveUserAndBalanceKeys(identifier: string) {
+    const raw = String(identifier || '').trim();
+    const lower = raw.toLowerCase();
+    const users = loadUsers();
+    const matchedUser = users.find(
+      (u) =>
+        u.userId.toLowerCase() === lower ||
+        u.email.toLowerCase() === lower
+    );
+    const canonicalUserId = matchedUser?.userId || (raw.toUpperCase().startsWith('UID-') ? raw : '');
+    const email = matchedUser?.email?.toLowerCase() || (lower.includes('@') ? lower : '');
     const balances = loadUserBalances();
-    const current = balances[userId]?.credits || 0;
-    const newTotal = current + credits;
-    balances[userId] = {
+    const keySet = new Set<string>();
+    if (canonicalUserId) keySet.add(canonicalUserId);
+    if (raw) keySet.add(raw);
+    if (email) keySet.add(email);
+    for (const k of Object.keys(balances)) {
+      const kl = k.toLowerCase();
+      if ((canonicalUserId && kl === canonicalUserId.toLowerCase()) || (email && kl === email) || (lower && kl === lower)) {
+        keySet.add(k);
+      }
+    }
+    return {
+      raw,
+      matchedUser,
+      canonicalUserId: canonicalUserId || email || raw,
+      email,
+      balanceKeys: Array.from(keySet)
+    };
+  }
+
+  function getEffectiveUserBalance(userId: string, email?: string): UserBalanceRecord {
+    const balances = loadUserBalances();
+    const resolved = resolveUserAndBalanceKeys(userId || email || '');
+    const targetEmail = (email || resolved.email || '').trim().toLowerCase();
+    const matchedKeys = new Set<string>(resolved.balanceKeys);
+    if (userId) matchedKeys.add(userId);
+    if (targetEmail) matchedKeys.add(targetEmail);
+
+    let totalCredits = 0;
+    let activePlanId = 'free';
+    let lastUpdated = 0;
+    for (const k of matchedKeys) {
+      const rec = balances[k];
+      if (!rec) continue;
+      if (typeof rec.credits === 'number' && Number.isFinite(rec.credits) && rec.credits > 0) {
+        totalCredits += Math.floor(rec.credits);
+      }
+      if (rec.activePlanId && rec.activePlanId !== 'free') {
+        activePlanId = rec.activePlanId;
+      }
+      if (rec.lastUpdated && rec.lastUpdated > lastUpdated) {
+        lastUpdated = rec.lastUpdated;
+      }
+    }
+    return {
+      credits: Math.max(0, totalCredits),
+      activePlanId: totalCredits > 0 ? activePlanId : 'free',
+      lastUpdated: lastUpdated || Date.now()
+    };
+  }
+
+  function isUserBanned(email?: string, userId?: string): BannedUserRecord | null {
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanUid = String(userId || '').trim().toLowerCase();
+    if (!cleanEmail && !cleanUid) return null;
+
+    let resolvedEmail = cleanEmail;
+    let resolvedUid = cleanUid;
+    if (!resolvedEmail && resolvedUid) {
+      const u = loadUsers().find((x) => x.userId.toLowerCase() === resolvedUid);
+      if (u?.email) resolvedEmail = u.email.toLowerCase();
+    } else if (!resolvedUid && resolvedEmail) {
+      const u = loadUsers().find((x) => x.email.toLowerCase() === resolvedEmail);
+      if (u?.userId) resolvedUid = u.userId.toLowerCase();
+    }
+
+    const list = loadBannedUsers();
+    return (
+      list.find((b) => {
+        const bEmail = (b.email || '').trim().toLowerCase();
+        const bUid = (b.userId || '').trim().toLowerCase();
+        return (
+          (Boolean(resolvedEmail) && bEmail === resolvedEmail) ||
+          (Boolean(resolvedUid) && bUid === resolvedUid)
+        );
+      }) || null
+    );
+  }
+
+  function revokeAllSessionsForUser(userId?: string, email?: string) {
+    try {
+      const sessions = loadSessions();
+      const lowerUid = (userId || '').trim().toLowerCase();
+      const lowerEmail = (email || '').trim().toLowerCase();
+      const users = loadUsers();
+      const matched = users.find(
+        (u) =>
+          (lowerUid && u.userId.toLowerCase() === lowerUid) ||
+          (lowerEmail && u.email.toLowerCase() === lowerEmail)
+      );
+      const targetUid = (matched?.userId || userId || '').trim().toLowerCase();
+      let changed = false;
+      for (const [tok, sess] of Object.entries(sessions)) {
+        if (targetUid && String(sess.userId || '').toLowerCase() === targetUid) {
+          revokeSessionToken(tok);
+          delete sessions[tok];
+          changed = true;
+        }
+      }
+      if (changed) saveSessions(sessions);
+    } catch {}
+  }
+
+  function banUserAccount(
+    identifier: string,
+    reason = 'Admin Permanent Ban',
+    bannedBy = 'Admin'
+  ): { ok: boolean; record?: BannedUserRecord; alreadyBanned?: boolean; error?: string } {
+    const resolved = resolveUserAndBalanceKeys(identifier);
+    const cleanEmail = resolved.email || (resolved.raw.includes('@') ? resolved.raw.toLowerCase() : '');
+    const cleanUid = resolved.matchedUser?.userId || (resolved.raw.toUpperCase().startsWith('UID-') ? resolved.raw : '');
+    if (!cleanEmail && !cleanUid) {
+      return { ok: false, error: 'မှန်ကန်သော Gmail သို့မဟုတ် UID ထည့်သွင်းပါ' };
+    }
+    if (cleanEmail && cleanEmail === OWNER_ADMIN_EMAIL) {
+      return { ok: false, error: 'Owner Admin အကောင့်ကို Ban ၍ မရပါ' };
+    }
+
+    const list = loadBannedUsers();
+    const existing = list.find(
+      (b) =>
+        (cleanEmail && (b.email || '').toLowerCase() === cleanEmail) ||
+        (cleanUid && (b.userId || '').toLowerCase() === cleanUid.toLowerCase())
+    );
+    if (existing) {
+      if (cleanEmail && !existing.email) existing.email = cleanEmail;
+      if (cleanUid && !existing.userId) existing.userId = cleanUid;
+      existing.reason = reason.trim() || existing.reason;
+      existing.bannedAt = Date.now();
+      existing.bannedBy = bannedBy;
+      saveBannedUsers(list);
+      revokeAllSessionsForUser(cleanUid, cleanEmail);
+      return { ok: true, record: existing, alreadyBanned: true };
+    }
+
+    const record: BannedUserRecord = {
+      id: `ban_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      email: cleanEmail || undefined,
+      userId: cleanUid || undefined,
+      reason: reason.trim() || 'Admin Permanent Ban',
+      bannedAt: Date.now(),
+      bannedBy
+    };
+    list.unshift(record);
+    saveBannedUsers(list);
+    revokeAllSessionsForUser(cleanUid, cleanEmail);
+    return { ok: true, record, alreadyBanned: false };
+  }
+
+  function unbanUserAccount(identifier: string): { ok: boolean; removedCount: number; targetLabel: string } {
+    const resolved = resolveUserAndBalanceKeys(identifier);
+    const lowerRaw = resolved.raw.toLowerCase();
+    const lowerEmail = resolved.email.toLowerCase();
+    const lowerUid = (resolved.matchedUser?.userId || '').toLowerCase();
+    const list = loadBannedUsers();
+    const next = list.filter((b) => {
+      const bEmail = (b.email || '').toLowerCase();
+      const bUid = (b.userId || '').toLowerCase();
+      const matches =
+        (lowerRaw && (bEmail === lowerRaw || bUid === lowerRaw || b.id.toLowerCase() === lowerRaw)) ||
+        (lowerEmail && bEmail === lowerEmail) ||
+        (lowerUid && bUid === lowerUid);
+      return !matches;
+    });
+    const removedCount = list.length - next.length;
+    if (removedCount > 0) saveBannedUsers(next);
+    return {
+      ok: removedCount > 0,
+      removedCount,
+      targetLabel: resolved.email || resolved.matchedUser?.userId || resolved.raw
+    };
+  }
+
+  function grantUserCredits(identifier: string, credits: number, planName?: string): number {
+    const safeAdd = Math.floor(Number(credits));
+    if (!Number.isFinite(safeAdd) || safeAdd <= 0) {
+      return getEffectiveUserBalance(identifier).credits;
+    }
+    const resolved = resolveUserAndBalanceKeys(identifier);
+    const balances = loadUserBalances();
+    const currentTotal = getEffectiveUserBalance(resolved.canonicalUserId, resolved.email).credits;
+    const newTotal = currentTotal + safeAdd;
+    const canonicalKey = resolved.matchedUser?.userId || resolved.canonicalUserId || identifier.trim();
+
+    for (const k of resolved.balanceKeys) {
+      if (k !== canonicalKey && balances[k]) {
+        delete balances[k];
+      }
+    }
+    balances[canonicalKey] = {
       credits: newTotal,
-      activePlanId: planName || balances[userId]?.activePlanId || 'starter-pack',
+      activePlanId: planName || balances[canonicalKey]?.activePlanId || 'starter-pack',
       lastUpdated: Date.now()
     };
     saveUserBalances(balances);
     return newTotal;
   }
 
-  // Persistent User Accounts, Sessions & Daily Free Mode Usage Tracking
+  function chargeUserCreditsForGeneration(
+    userId: string,
+    email: string,
+    amount: number
+  ): { prevCredits: number; remainingCredits: number; deducted: number } {
+    const safeAmt = Math.max(1, Math.floor(Number(amount) || 1));
+    const resolved = resolveUserAndBalanceKeys(userId || email);
+    const balances = loadUserBalances();
+    const prevCredits = getEffectiveUserBalance(userId, email).credits;
+    const remainingCredits = Math.max(0, prevCredits - safeAmt);
+    const canonicalKey = resolved.matchedUser?.userId || userId || resolved.canonicalUserId;
+
+    for (const k of resolved.balanceKeys) {
+      if (k !== canonicalKey && balances[k]) {
+        delete balances[k];
+      }
+    }
+    balances[canonicalKey] = {
+      credits: remainingCredits,
+      activePlanId:
+        remainingCredits > 0 ? balances[canonicalKey]?.activePlanId || 'starter-pack' : 'free',
+      lastUpdated: Date.now()
+    };
+    saveUserBalances(balances);
+    return {
+      prevCredits,
+      remainingCredits,
+      deducted: Math.max(0, prevCredits - remainingCredits)
+    };
+  }
+
+  function deductOrZeroUserCredits(
+    identifier: string,
+    amountOrAll: number | 'all',
+    reason = 'Admin Credit Deduction',
+    actor = 'Admin'
+  ): {
+    ok: boolean;
+    error?: string;
+    targetLabel: string;
+    targetUserId: string;
+    targetEmail: string;
+    prevCredits: number;
+    newCredits: number;
+    deducted: number;
+  } {
+    const resolved = resolveUserAndBalanceKeys(identifier);
+    if (!resolved.raw) {
+      return {
+        ok: false,
+        error: 'Gmail သို့မဟုတ် User ID ထည့်သွင်းပါ',
+        targetLabel: '',
+        targetUserId: '',
+        targetEmail: '',
+        prevCredits: 0,
+        newCredits: 0,
+        deducted: 0
+      };
+    }
+
+    const isAll = amountOrAll === 'all';
+    const parsedAmt = isAll ? 0 : Math.floor(Number(amountOrAll));
+    if (!isAll && (!Number.isFinite(parsedAmt) || parsedAmt < 1 || parsedAmt > 1000000)) {
+      return {
+        ok: false,
+        error: 'နုတ်ယူမည့် Credit ပမာဏသည် ၁ နှင့်အထက် ဂဏန်းဖြစ်ရပါမည်',
+        targetLabel: resolved.email || resolved.canonicalUserId,
+        targetUserId: resolved.matchedUser?.userId || resolved.canonicalUserId,
+        targetEmail: resolved.email,
+        prevCredits: 0,
+        newCredits: 0,
+        deducted: 0
+      };
+    }
+
+    const balances = loadUserBalances();
+    const prevCredits = getEffectiveUserBalance(resolved.canonicalUserId, resolved.email).credits;
+    const deductAmt = isAll ? prevCredits : Math.min(prevCredits, parsedAmt);
+    const newCredits = Math.max(0, prevCredits - deductAmt);
+    const canonicalKey = resolved.matchedUser?.userId || resolved.canonicalUserId;
+
+    for (const k of resolved.balanceKeys) {
+      if (k !== canonicalKey && balances[k]) {
+        delete balances[k];
+      }
+    }
+    balances[canonicalKey] = {
+      credits: newCredits,
+      activePlanId: newCredits > 0 ? balances[canonicalKey]?.activePlanId || 'starter-pack' : 'free',
+      lastUpdated: Date.now()
+    };
+    saveUserBalances(balances);
+
+    const auditRecord: PaymentRecord = {
+      id: `deduct_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`,
+      userId: canonicalKey,
+      planName: `Credit Revoked (-${deductAmt} Cr)`,
+      credits: -deductAmt,
+      amountMmk: `0 MMK (${actor})`,
+      walletType: 'Admin Revoke',
+      walletAccountName: actor,
+      walletPhone: 'REVOKE',
+      senderPhone: resolved.email || canonicalKey,
+      txnId: `REV${Math.floor(100000 + Math.random() * 900000)}`,
+      status: 'rejected',
+      rejectionReason: reason,
+      createdAt: Date.now(),
+      telegramDelivered: true
+    };
+    const allPayments = loadPayments();
+    allPayments.unshift(auditRecord);
+    savePayments(allPayments);
+
+    return {
+      ok: true,
+      targetLabel: resolved.email
+        ? `${resolved.matchedUser?.userId ? `${resolved.matchedUser.userId} · ` : ''}${resolved.email}`
+        : canonicalKey,
+      targetUserId: resolved.matchedUser?.userId || canonicalKey,
+      targetEmail: resolved.email,
+      prevCredits,
+      newCredits,
+      deducted: deductAmt
+    };
+  }
+
+  // Persistent User Accounts, Sessions & Daily Free/Credit Mode Usage Tracking
   const USERS_FILE = path.join(JOBS_TEMP_DIR, 'users.json');
   const SESSIONS_FILE = path.join(JOBS_TEMP_DIR, 'user_sessions.json');
   const USER_USAGE_FILE = path.join(JOBS_TEMP_DIR, 'user_daily_usage.json');
@@ -8417,6 +8927,7 @@ Strict Video-Scan & Title Rules:
   interface UserDailyUsageRecord {
     dateKey: string;
     freeVideosUsedToday: number;
+    paidVideosToday?: number;
     totalFreeVideos: number;
     totalPaidVideos: number;
     lastUsedAt: number;
@@ -8493,6 +9004,7 @@ Strict Video-Scan & Title Rules:
     const usageMap = loadUserUsageMap();
     const rec = usageMap[userId];
     const freeUsedToday = rec && rec.dateKey === todayKey ? Math.max(0, rec.freeVideosUsedToday || 0) : 0;
+    const paidVideosToday = rec && rec.dateKey === todayKey ? Math.max(0, rec.paidVideosToday || 0) : 0;
     const freeRemaining = Math.max(0, FREE_DAILY_VIDEO_LIMIT_SERVER - freeUsedToday);
     return {
       dateKey: todayKey,
@@ -8500,6 +9012,7 @@ Strict Video-Scan & Title Rules:
       freeRemaining,
       freeLimit: FREE_DAILY_VIDEO_LIMIT_SERVER,
       usedFreeToday: freeUsedToday > 0,
+      paidVideosToday,
       totalFreeVideos: rec?.totalFreeVideos || 0,
       totalPaidVideos: rec?.totalPaidVideos || 0,
       lastUsedAt: rec?.lastUsedAt || 0,
@@ -8511,11 +9024,12 @@ Strict Video-Scan & Title Rules:
     const todayKey = getMyanmarDateKey();
     const usageMap = loadUserUsageMap();
     const prev = usageMap[userId];
-    const prevTodayCount = prev && prev.dateKey === todayKey ? Math.max(0, prev.freeVideosUsedToday || 0) : 0;
-    const nextTodayCount = prevTodayCount + 1;
+    const prevFreeToday = prev && prev.dateKey === todayKey ? Math.max(0, prev.freeVideosUsedToday || 0) : 0;
+    const prevPaidToday = prev && prev.dateKey === todayKey ? Math.max(0, prev.paidVideosToday || 0) : 0;
     usageMap[userId] = {
       dateKey: todayKey,
-      freeVideosUsedToday: nextTodayCount,
+      freeVideosUsedToday: prevFreeToday + 1,
+      paidVideosToday: prevPaidToday,
       totalFreeVideos: (prev?.totalFreeVideos || 0) + 1,
       totalPaidVideos: prev?.totalPaidVideos || 0,
       lastUsedAt: Date.now(),
@@ -8526,42 +9040,52 @@ Strict Video-Scan & Title Rules:
   }
 
   function recordUserPaidUsage(userId: string) {
-    if (!userId) return;
+    if (!userId) return getUserFreeUsageSnapshot('');
     const todayKey = getMyanmarDateKey();
     const usageMap = loadUserUsageMap();
     const prev = usageMap[userId];
-    const prevTodayCount = prev && prev.dateKey === todayKey ? Math.max(0, prev.freeVideosUsedToday || 0) : 0;
+    const prevFreeToday = prev && prev.dateKey === todayKey ? Math.max(0, prev.freeVideosUsedToday || 0) : 0;
+    const prevPaidToday = prev && prev.dateKey === todayKey ? Math.max(0, prev.paidVideosToday || 0) : 0;
     usageMap[userId] = {
       dateKey: todayKey,
-      freeVideosUsedToday: prevTodayCount,
+      freeVideosUsedToday: prevFreeToday,
+      paidVideosToday: prevPaidToday + 1,
       totalFreeVideos: prev?.totalFreeVideos || 0,
       totalPaidVideos: (prev?.totalPaidVideos || 0) + 1,
       lastUsedAt: Date.now(),
       lastMode: 'paid'
     };
     saveUserUsageMap(usageMap);
+    return getUserFreeUsageSnapshot(userId);
   }
 
   function getWebsiteUserStats() {
     const users = loadUsers();
-    const balances = loadUserBalances();
     const payments = loadPayments();
+    const bannedUsers = loadBannedUsers();
 
     const enriched = users.map((u) => {
-      const bal = balances[u.userId] || { credits: 0, activePlanId: 'free', lastUpdated: 0 };
+      const bal = getEffectiveUserBalance(u.userId, u.email);
       const hasApprovedPayment = payments.some(
-        (p) => p.userId === u.userId && p.status === 'approved'
+        (p) =>
+          (p.userId === u.userId || p.userId.toLowerCase() === u.email.toLowerCase()) &&
+          p.status === 'approved' &&
+          p.credits > 0
       );
+      const usage = getUserFreeUsageSnapshot(u.userId);
       const isPaidUser =
         (bal.credits || 0) > 0 ||
         Boolean(bal.activePlanId && bal.activePlanId !== 'free') ||
-        hasApprovedPayment;
-      const usage = getUserFreeUsageSnapshot(u.userId);
+        hasApprovedPayment ||
+        usage.totalPaidVideos > 0;
+      const banRec = isUserBanned(u.email, u.userId);
       return {
         ...u,
         credits: bal.credits || 0,
         activePlanId: bal.activePlanId || 'free',
         isPaidUser,
+        isBanned: Boolean(banRec),
+        banReason: banRec?.reason,
         usage
       };
     });
@@ -8570,20 +9094,65 @@ Strict Video-Scan & Title Rules:
     const paidUsers = sorted.filter((u) => u.isPaidUser);
     const freeUsers = sorted.filter((u) => !u.isPaidUser);
     const activeFreeTodayUsers = sorted.filter((u) => u.usage.usedFreeToday);
+    const activePaidTodayUsers = sorted.filter((u) => u.usage.paidVideosToday > 0);
     const totalFreeVideosToday = sorted.reduce((acc, u) => acc + u.usage.freeUsedToday, 0);
+    const totalPaidVideosToday = sorted.reduce((acc, u) => acc + u.usage.paidVideosToday, 0);
+    const totalPaidVideosAllTime = sorted.reduce((acc, u) => acc + u.usage.totalPaidVideos, 0);
 
     return {
       dateKey: getMyanmarDateKey(),
       totalUsers: sorted.length,
       freeUsersCount: freeUsers.length,
       paidUsersCount: paidUsers.length,
+      bannedUsersCount: bannedUsers.length,
       activeFreeTodayCount: activeFreeTodayUsers.length,
+      activePaidTodayCount: activePaidTodayUsers.length,
       totalFreeVideosToday,
+      totalPaidVideosToday,
+      totalPaidVideosAllTime,
       users: sorted,
       freeUsers,
       paidUsers,
-      activeFreeTodayUsers
+      bannedUsers,
+      activeFreeTodayUsers,
+      activePaidTodayUsers
     };
+  }
+
+  function runOneTimeCrackRemediation() {
+    try {
+      if (fs.existsSync(CRACK_REMEDIATION_FILE)) return;
+      const offendingEmail = 'thesix070bio@gmail.com';
+      const deductRes = deductOrZeroUserCredits(
+        offendingEmail,
+        'all',
+        'Unauthorized VIP Creator Grant (+3000 Cr) revoked automatically',
+        'Security Remediation'
+      );
+      banUserAccount(
+        offendingEmail,
+        'Unauthorized Credit Exploit (VIP Creator Grant)',
+        'Security Remediation'
+      );
+      fs.writeFileSync(
+        CRACK_REMEDIATION_FILE,
+        JSON.stringify(
+          {
+            appliedAt: Date.now(),
+            target: offendingEmail,
+            deducted: deductRes.deducted
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      );
+      console.log(
+        `🛡️ [Security Remediation] Revoked ${deductRes.deducted} credits & permanently banned ${offendingEmail}`
+      );
+    } catch (err) {
+      console.warn('[Security Remediation] Warning:', err);
+    }
   }
 
   interface PaymentRecord {
@@ -8757,6 +9326,98 @@ Strict Video-Scan & Title Rules:
     }
   }
 
+  async function notifyCreditModeVideoGenerated(opts: {
+    userId: string;
+    email?: string;
+    name?: string;
+    creditsDeducted: number;
+    remainingCredits: number;
+    durationSec?: number;
+    modeLabel?: string;
+    usage: ReturnType<typeof getUserFreeUsageSnapshot>;
+  }) {
+    try {
+      const stats = getWebsiteUserStats();
+      const durSec = Math.max(0, Math.round(opts.durationSec || 0));
+      const durLabel =
+        durSec > 0
+          ? `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, '0')}`
+          : '-';
+      const safeUidForCb = String(opts.userId || '').slice(0, 40);
+      const msg = [
+        `💎 [CREDIT MODE] ဗီဒီယို ထုတ်ယူပြီးစီးမှု`,
+        `━━━━━━━━━━━━━━━━━━━`,
+        `🪪 User ID: ${opts.userId}`,
+        `📧 Gmail / Email: ${opts.email || 'Unknown'}`,
+        `🎬 Studio Mode: ${opts.modeLabel || 'Credit Recap'} (${durLabel})`,
+        `⚡ Credit နုတ်ယူမှု: -${opts.creditsDeducted} Cr (လက်ကျန်: ${opts.remainingCredits} Cr)`,
+        `📊 ယနေ့ Credit Mode ဗီဒီယို: ${opts.usage.paidVideosToday} ပုဒ်`,
+        `📈 စုစုပေါင်း Credit Mode ဗီဒီယို: ${opts.usage.totalPaidVideos} ပုဒ်`,
+        `━━━━━━━━━━━━━━━━━━━`,
+        `💎 ယနေ့ Credit Mode စုစုပေါင်း: ${stats.totalPaidVideosToday} ပုဒ် (All-time: ${stats.totalPaidVideosAllTime} ပုဒ်)`,
+        `⏰ အချိန်: ${new Date().toLocaleString('en-GB', { timeZone: 'Asia/Yangon' })}`
+      ].join('\n');
+
+      const kb: any[][] = [
+        [{ text: `💎 Paid Users & Videos (${stats.totalPaidVideosAllTime})`, callback_data: 'cmd_paid_users' }]
+      ];
+      if (safeUidForCb) {
+        kb.push([
+          { text: '➖ All Credit နုတ်', callback_data: `deductall_${safeUidForCb}` },
+          { text: '🚫 Ban အကောင့်', callback_data: `ban_${safeUidForCb}` }
+        ]);
+      }
+      await notifyTelegramAdmin(msg, null, { inline_keyboard: kb });
+    } catch (e) {
+      console.warn('notifyCreditModeVideoGenerated error:', e);
+    }
+  }
+
+  async function sendTelegramBanListReport(chatId: string) {
+    try {
+      const list = loadBannedUsers();
+      const lines: string[] = [
+        `🚫 [TTAK RECAP] Banned Accounts စာရင်း (${list.length} ဦး)`,
+        `━━━━━━━━━━━━━━━━━━━`
+      ];
+      const kb: any[][] = [];
+
+      if (list.length === 0) {
+        lines.push(`✅ လက်ရှိ Ban ထားသော Gmail / User မရှိပါ။`);
+      } else {
+        list.slice(0, 15).forEach((b, idx) => {
+          const label = [b.email, b.userId].filter(Boolean).join(' · ') || b.id;
+          const dt = new Date(b.bannedAt).toLocaleString('en-GB', { timeZone: 'Asia/Yangon' });
+          lines.push(
+            `${idx + 1}. 🚫 ${label}\n   └ Reason: ${b.reason}\n   └ By: ${b.bannedBy} (${dt})`
+          );
+          if (idx < 6) {
+            const cbTarget = (b.userId || b.id).slice(0, 48);
+            kb.push([{ text: `✅ Unban: ${label.slice(0, 28)}`, callback_data: `unban_${cbTarget}` }]);
+          }
+        });
+      }
+
+      lines.push(
+        `━━━━━━━━━━━━━━━━━━━`,
+        `📌 Commands: /ban <Gmail|UID> [reason] · /unban <Gmail|UID> · /deduct <Gmail|UID> <amount|all>`
+      );
+      kb.push([{ text: '👑 Admin Panel', callback_data: 'cmd_admin' }]);
+
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: lines.join('\n').slice(0, 4000),
+          reply_markup: { inline_keyboard: kb }
+        })
+      });
+    } catch (e) {
+      console.warn('sendTelegramBanListReport error:', e);
+    }
+  }
+
   async function sendTelegramUserStatsReport(
     chatId: string,
     filter: 'all' | 'free' | 'paid' | 'free_active' = 'all'
@@ -8775,16 +9436,17 @@ Strict Video-Scan & Title Rules:
       const titleMap: Record<typeof filter, string> = {
         all: '👥 Website Sign Up Users အားလုံး',
         free: '🆓 Free Users စာရင်း',
-        paid: '💎 Paid Users စာရင်း',
+        paid: '💎 Credit Mode / Paid Users နှင့် ဗီဒီယို စာရင်း',
         free_active: `🎬 ယနေ့ (${stats.dateKey}) Free Mode သုံးနေသူများ`
       };
 
       const lines: string[] = [
         `📊 [TTAK RECAP] ${titleMap[filter]}`,
         `━━━━━━━━━━━━━━━━━━━`,
-        `👥 စုစုပေါင်း Sign Up: ${stats.totalUsers} ဦး`,
+        `👥 စုစုပေါင်း Sign Up: ${stats.totalUsers} ဦး (🚫 Banned: ${stats.bannedUsersCount} ဦး)`,
         `🆓 Free Users: ${stats.freeUsersCount} ဦး | 💎 Paid Users: ${stats.paidUsersCount} ဦး`,
-        `🎬 ယနေ့ Free Mode သုံးနေသူ: ${stats.activeFreeTodayCount} ဦး (စုစုပေါင်း ${stats.totalFreeVideosToday} ပုဒ်)`,
+        `🎬 ယနေ့ Free Mode: ${stats.activeFreeTodayCount} ဦး (${stats.totalFreeVideosToday} ပုဒ်)`,
+        `💎 Credit Mode ဗီဒီယို: ယနေ့ ${stats.totalPaidVideosToday} ပုဒ် | စုစုပေါင်း ${stats.totalPaidVideosAllTime} ပုဒ်`,
         `━━━━━━━━━━━━━━━━━━━`
       ];
 
@@ -8793,12 +9455,14 @@ Strict Video-Scan & Title Rules:
       } else {
         const shown = targetList.slice(0, 15);
         shown.forEach((u, idx) => {
-          const typeTag = u.isPaidUser ? `💎 Paid (${u.credits} Cr)` : `🆓 Free`;
+          const banTag = u.isBanned ? ' 🚫[BANNED]' : '';
+          const typeTag = u.isPaidUser ? `💎 Paid (${u.credits} Cr)` : `🆓 Free (${u.credits} Cr)`;
+          const paidVidInfo = `💎 ဗီဒီယို: ယနေ့ ${u.usage.paidVideosToday} ပုဒ် | စုစုပေါင်း ${u.usage.totalPaidVideos} ပုဒ်`;
           const freeStatus = u.usage.usedFreeToday
-            ? `သုံးနေသည် (${u.usage.freeUsedToday}/${u.usage.freeLimit} ပုဒ်ပြီး)`
-            : `မသုံးသေးပါ (0/${u.usage.freeLimit} ပုဒ်)`;
+            ? `Free ယနေ့ ${u.usage.freeUsedToday}/${u.usage.freeLimit} ပုဒ်`
+            : `Free 0/${u.usage.freeLimit}`;
           lines.push(
-            `${idx + 1}. ${u.userId} · ${u.email}\n   └ ${typeTag} | Free Daily: ${freeStatus}`
+            `${idx + 1}. ${u.userId} · ${u.email}${banTag}\n   └ ${typeTag} | ${paidVidInfo}\n   └ ${freeStatus}`
           );
         });
         if (targetList.length > 15) {
@@ -8823,6 +9487,7 @@ Strict Video-Scan & Title Rules:
                 { text: `💎 Paid (${stats.paidUsersCount})`, callback_data: 'cmd_paid_users' }
               ],
               [
+                { text: `🚫 Ban List (${stats.bannedUsersCount})`, callback_data: 'cmd_banlist' },
                 { text: '👑 Admin Panel', callback_data: 'cmd_admin' }
               ]
             ]
@@ -8985,15 +9650,18 @@ Strict Video-Scan & Title Rules:
           callback_data: 'cmd_free_users'
         },
         {
-          text: `💎 Paid (${stats.paidUsersCount})`,
+          text: `💎 Paid Videos (${stats.totalPaidVideosAllTime})`,
           callback_data: 'cmd_paid_users'
         }
       ]);
 
-      // Owner API Keys Management Button (Telegram Admin Only)
       inlineKeyboard.push([
         {
-          text: `🔑 Owner API Keys & Limit စစ်မည်`,
+          text: `🚫 Ban List (${stats.bannedUsersCount})`,
+          callback_data: 'cmd_banlist'
+        },
+        {
+          text: `🔑 API Keys`,
           callback_data: 'cmd_keys'
         }
       ]);
@@ -9017,9 +9685,10 @@ Strict Video-Scan & Title Rules:
       let messageText = [
         `👑 [TTAK RECAP] ADMIN CONTROL PANEL`,
         `━━━━━━━━━━━━━━━━━━━`,
-        `👥 Website Sign Up စုစုပေါင်း: ${stats.totalUsers} ဦး`,
+        `👥 Website Sign Up စုစုပေါင်း: ${stats.totalUsers} ဦး (🚫 Banned: ${stats.bannedUsersCount} ဦး)`,
         `🆓 Free Users: ${stats.freeUsersCount} ဦး | 💎 Paid Users: ${stats.paidUsersCount} ဦး`,
-        `🎬 ယနေ့ Free Mode သုံးနေသူ: ${stats.activeFreeTodayCount} ဦး (ဗီဒီယို ${stats.totalFreeVideosToday} ပုဒ်)`,
+        `🎬 ယနေ့ Free Mode: ${stats.activeFreeTodayCount} ဦး (ဗီဒီယို ${stats.totalFreeVideosToday} ပုဒ်)`,
+        `💎 Credit Mode ဗီဒီယို: ယနေ့ ${stats.totalPaidVideosToday} ပုဒ် | စုစုပေါင်း ${stats.totalPaidVideosAllTime} ပုဒ်`,
         `━━━━━━━━━━━━━━━━━━━`,
         `📊 စစ်ဆေးရန် ပြေစာများ (Pending): ${pending.length} ခု`,
         `✅ အတည်ပြုပြီး (Approved): ${approvedCount} ခု`,
@@ -9027,7 +9696,7 @@ Strict Video-Scan & Title Rules:
         `  • Wave: 09772350006 (KAUNG HTET)`,
         `  • KBZ: 09797407339 (Ma Pyone Pyone)`,
         `━━━━━━━━━━━━━━━━━━━`,
-        `🔍 Bot Commands: /keys · /addgemini · /addgroq · /resetkeys · /users · /user <UID> · /notify <msg> · /clearnotify`
+        `🔍 Bot Commands: /paid · /deduct <Gmail|UID> <amt|all> · /ban <Gmail|UID> · /unban <Gmail|UID> · /banlist · /users · /user <UID|Gmail> · /keys · /help`
       ].join('\n');
 
       if (pending.length > 0) {
@@ -9052,6 +9721,18 @@ Strict Video-Scan & Title Rules:
     }
   }
 
+  function isTelegramAdminSender(msg: any): boolean {
+    const chatId = String(msg?.chat?.id || '');
+    const fromId = String(msg?.from?.id || '');
+    return chatId === TELEGRAM_ADMIN_CHAT_ID && fromId === TELEGRAM_ADMIN_CHAT_ID;
+  }
+
+  function isTelegramAdminCallback(cb: any): boolean {
+    const chatId = String(cb?.message?.chat?.id || '');
+    const fromId = String(cb?.from?.id || '');
+    return chatId === TELEGRAM_ADMIN_CHAT_ID && fromId === TELEGRAM_ADMIN_CHAT_ID;
+  }
+
   // Handle incoming Telegram Updates (Messages & Button Clicks)
   async function handleTelegramUpdate(update: any) {
     try {
@@ -9059,10 +9740,11 @@ Strict Video-Scan & Title Rules:
       const incomingMessage = update.message || update.edited_message;
       if (incomingMessage) {
         const chatId = String(incomingMessage.chat?.id);
+        const isAdminSender = isTelegramAdminSender(incomingMessage);
         const text = (incomingMessage.text || '').trim();
         const cmd = text.split(/\s+/)[0].split('@')[0].toLowerCase();
 
-        if (cmd === '/id' || (chatId !== TELEGRAM_ADMIN_CHAT_ID && cmd === '/start')) {
+        if (cmd === '/id' || !isAdminSender) {
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -9074,7 +9756,7 @@ Strict Video-Scan & Title Rules:
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && (cmd === '/admin' || cmd === '/start' || cmd === '/pending')) {
+        if (isAdminSender && (cmd === '/admin' || cmd === '/start' || cmd === '/pending')) {
           await sendTelegramAdminDashboard(chatId);
           return;
         }
@@ -9427,7 +10109,10 @@ Strict Video-Scan & Title Rules:
           }
 
           const detailBlocks = matched.slice(0, 5).map((u) => {
-            const typeText = u.isPaidUser ? `💎 Paid User (${u.credits} Credits)` : `🆓 Free User (0 Credits)`;
+            const typeText = u.isPaidUser ? `💎 Paid User (${u.credits} Credits)` : `🆓 Free User (${u.credits} Credits)`;
+            const banLine = u.isBanned
+              ? `🚫 Account Status: BANNED (${u.banReason || 'Admin Ban'})`
+              : `✅ Account Status: Active`;
             const dailyStatus = u.usage.usedFreeToday
               ? `✅ ယနေ့ Free Mode သုံးနေသည် (${u.usage.freeUsedToday}/${u.usage.freeLimit} ပုဒ် ပြီး, ကျန် ${u.usage.freeRemaining} ပုဒ်)`
               : `⏸️ ယနေ့ Free Mode မသုံးသေးပါ (0/${u.usage.freeLimit} ပုဒ်)`;
@@ -9435,25 +10120,210 @@ Strict Video-Scan & Title Rules:
               `🪪 User ID: ${u.userId}`,
               `👤 Name: ${u.name}`,
               `📧 Gmail / Email: ${u.email}`,
+              banLine,
               `🏷️ အမျိုးအစား: ${typeText}`,
+              `💎 Credit Mode ဗီဒီယို: ယနေ့ ${u.usage.paidVideosToday} ပုဒ် | စုစုပေါင်း ${u.usage.totalPaidVideos} ပုဒ်`,
               `🎬 Free Daily (${u.usage.dateKey}): ${dailyStatus}`,
-              `📈 စုစုပေါင်း: Free ${u.usage.totalFreeVideos} ပုဒ် | Paid ${u.usage.totalPaidVideos} ပုဒ်`,
+              `📈 စုစုပေါင်း Free: ${u.usage.totalFreeVideos} ပုဒ်`,
               `📅 Sign Up: ${new Date(u.createdAt).toLocaleString('en-GB', { timeZone: 'Asia/Yangon' })}`
             ].join('\n');
           });
+
+          const firstMatch = matched[0];
+          const actionRow: any[] = [
+            { text: '➖ All Credit နုတ်', callback_data: `deductall_${firstMatch.userId.slice(0, 40)}` },
+            firstMatch.isBanned
+              ? { text: '✅ Unban', callback_data: `unban_${firstMatch.userId.slice(0, 40)}` }
+              : { text: '🚫 Ban အကောင့်', callback_data: `ban_${firstMatch.userId.slice(0, 40)}` }
+          ];
 
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               chat_id: chatId,
-              text: `🔍 [User စစ်ဆေးချက်]\n━━━━━━━━━━━━━━━━━━━\n${detailBlocks.join('\n━━━━━━━━━━━━━━━━━━━\n')}`
+              text: `🔍 [User စစ်ဆေးချက်]\n━━━━━━━━━━━━━━━━━━━\n${detailBlocks.join('\n━━━━━━━━━━━━━━━━━━━\n')}`,
+              reply_markup: { inline_keyboard: [actionRow] }
             })
           });
           return;
         }
 
-        if (chatId === TELEGRAM_ADMIN_CHAT_ID && cmd === '/help') {
+        // Deduct / Revoke User Credits from Telegram Bot (Admin ONLY)
+        if (
+          isAdminSender &&
+          (cmd === '/deduct' || cmd === '/revokecredit' || cmd === '/removecredit')
+        ) {
+          const rest = text.replace(/^\/(?:deduct|revokecredit|removecredit)(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim();
+          const parts = rest.split(/\s+/).filter(Boolean);
+          const targetId = parts[0] || '';
+          const rawAmt = (parts[1] || '').toLowerCase();
+          const reason = parts.slice(2).join(' ').trim() || 'Telegram Admin Deduction';
+
+          if (!targetId || !rawAmt) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: [
+                  `➖ Credit ပြန်နုတ်ယူနည်း:`,
+                  `/deduct <Gmail သို့မဟုတ် UID> <ပမာဏ သို့မဟုတ် all> [အကြောင်းပြချက်]`,
+                  ``,
+                  `ဥပမာ:`,
+                  `• /deduct thesix070bio@gmail.com 3000 Crack`,
+                  `• /deduct thesix070bio@gmail.com all`,
+                  `• /deduct UID-84920 500`
+                ].join('\n')
+              })
+            });
+            return;
+          }
+
+          const amountOrAll: number | 'all' = rawAmt === 'all' ? 'all' : parseInt(rawAmt, 10);
+          const result = deductOrZeroUserCredits(targetId, amountOrAll, reason, 'Telegram Admin');
+          if (!result.ok) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `❌ ${result.error || 'Credit နုတ်ယူ၍ မရပါ'}`
+              })
+            });
+            return;
+          }
+
+          const cbTarget = (result.targetUserId || targetId).slice(0, 44);
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: [
+                `➖ [CREDIT REVOKED] Credit နုတ်ယူပြီးပါပြီ!`,
+                `━━━━━━━━━━━━━━━━━━━`,
+                `👤 User: ${result.targetLabel}`,
+                `📉 ယခင် Balance: ${result.prevCredits} Cr`,
+                `✂️ နုတ်ယူမှု: -${result.deducted} Cr`,
+                `💰 လက်ကျန် Balance: ${result.newCredits} Cr`,
+                `📝 Reason: ${reason}`
+              ].join('\n'),
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '🚫 ဤအကောင့်ကို Ban မည်', callback_data: `ban_${cbTarget}` },
+                    { text: '👑 Admin Panel', callback_data: 'cmd_admin' }
+                  ]
+                ]
+              }
+            })
+          });
+          return;
+        }
+
+        // Permanently Ban Gmail / UID from Telegram Bot (Admin ONLY)
+        if (isAdminSender && cmd === '/ban') {
+          const rest = text.replace(/^\/ban(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim();
+          const parts = rest.split(/\s+/).filter(Boolean);
+          const targetId = parts[0] || '';
+          const reason = parts.slice(1).join(' ').trim() || 'Telegram Admin Permanent Ban';
+
+          if (!targetId) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: [
+                  `🚫 Gmail / UID အပြီး Ban နည်း:`,
+                  `/ban <Gmail သို့မဟုတ် UID> [အကြောင်းပြချက်]`,
+                  ``,
+                  `ဥပမာ:`,
+                  `• /ban thesix070bio@gmail.com Credit Crack`,
+                  `• /ban UID-84920 Abuse`
+                ].join('\n')
+              })
+            });
+            return;
+          }
+
+          const banRes = banUserAccount(targetId, reason, 'Telegram Admin');
+          if (!banRes.ok || !banRes.record) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `❌ ${banRes.error || 'Ban ပြုလုပ်၍ မရပါ'}`
+              })
+            });
+            return;
+          }
+
+          const label = [banRes.record.email, banRes.record.userId].filter(Boolean).join(' · ');
+          const cbTarget = (banRes.record.userId || banRes.record.id).slice(0, 44);
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: [
+                `🚫 [BANNED] အကောင့်အား အပြီးပိတ်ပင်ပြီးပါပြီ!`,
+                `━━━━━━━━━━━━━━━━━━━`,
+                `👤 Target: ${label}`,
+                `📝 Reason: ${banRes.record.reason}`,
+                `🔒 လက်ရှိ Login Session များအားလုံးကိုပါ ဖျက်သိမ်းပြီးပါပြီ (ဝင်ရောက်၍ မရတော့ပါ)`
+              ].join('\n'),
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '➖ All Credit နုတ်မည်', callback_data: `deductall_${cbTarget}` },
+                    { text: '✅ Unban', callback_data: `unban_${cbTarget}` }
+                  ],
+                  [{ text: '🚫 Ban List ကြည့်မည်', callback_data: 'cmd_banlist' }]
+                ]
+              }
+            })
+          });
+          return;
+        }
+
+        // Unban Gmail / UID from Telegram Bot (Admin ONLY)
+        if (isAdminSender && cmd === '/unban') {
+          const targetId = text.replace(/^\/unban(?:@[a-zA-Z0-9_]+)?\s*/i, '').trim().split(/\s+/)[0] || '';
+          if (!targetId) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `✅ Unban ပြုလုပ်နည်း:\n/unban <Gmail သို့မဟုတ် UID>\nဥပမာ: /unban user@gmail.com`
+              })
+            });
+            return;
+          }
+
+          const resUnban = unbanUserAccount(targetId);
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: resUnban.ok
+                ? `✅ [UNBANNED] ${resUnban.targetLabel} အား Ban စာရင်းမှ ပြန်လည်ဖွင့်ပေးပြီးပါပြီ။`
+                : `ℹ️ "${targetId}" သည် Ban စာရင်းထဲတွင် မရှိပါ။`
+            })
+          });
+          return;
+        }
+
+        if (isAdminSender && (cmd === '/banlist' || cmd === '/banned')) {
+          await sendTelegramBanListReport(chatId);
+          return;
+        }
+
+        if (isAdminSender && cmd === '/help') {
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -9462,24 +10332,23 @@ Strict Video-Scan & Title Rules:
               text: [
                 `🤖 [TTAK RECAP] Admin Bot Commands:`,
                 `• /admin - Admin Control Panel & Live Summary`,
-                `• /keys - Owner API Keys Usage & 24h Limit စစ်ရန်`,
-                `• /addgemini <keys> - Gemini API Key များ ထည့်ရန်`,
-                `• /addgroq <keys> - Groq API Key များ ထည့်ရန်`,
-                `• /resetkeys - 24h Rest Key အားလုံး ပြန်ဖွင့်ရန်`,
-                `• /resetkey <#> - Key နံပါတ်တစ်ခုချင်း ပြန်ဖွင့်ရန်`,
-                `• /delkey <#> - Key ဖယ်ရှားရန်`,
-                `• /users - Sign Up Users အားလုံးနှင့် Daily Free Usage`,
+                `• /paid - Credit Mode Users နှင့် ဗီဒီယိုထုတ်ပြီးမှု စာရင်း`,
+                `• /deduct <Gmail|UID> <amount|all> [reason] - Credit ပြန်နုတ်ယူရန်`,
+                `• /ban <Gmail|UID> [reason] - Gmail / UID အပြီး Ban ရန်`,
+                `• /unban <Gmail|UID> - Ban ပြန်ဖွင့်ရန်`,
+                `• /banlist - Ban ထားသော အကောင့်စာရင်း ကြည့်ရန်`,
+                `• /users - Sign Up Users အားလုံးနှင့် Credit/Free ဗီဒီယို စာရင်း`,
                 `• /free - ယနေ့ Free Mode သုံးနေသူများ (X/5 ပုဒ်)`,
-                `• /paid - Paid Users စာရင်း`,
-                `• /user <UID သို့မဟုတ် Gmail> - User တစ်ဦးချင်းစီ အသေးစိတ်စစ်ရန်`,
-                `• /approve <Txn ID> - ငွေလွှဲ အတည်ပြုရန်`
+                `• /user <UID|Gmail> - User တစ်ဦးချင်းစီ အသေးစိတ်စစ်ရန်`,
+                `• /approve <Txn ID> - ငွေလွှဲ အတည်ပြုရန်`,
+                `• /keys · /addgemini · /addgroq · /resetkeys · /notify · /clearnotify`
               ].join('\n')
             })
           });
           return;
         }
 
-        if (cmd === '/approve') {
+        if (isAdminSender && cmd === '/approve') {
           const parts = text.split(/\s+/);
           const query = parts[1];
           if (!query) {
@@ -9511,35 +10380,64 @@ Strict Video-Scan & Title Rules:
             return;
           }
 
+          if (target.status === 'approved') {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `ℹ️ Txn ID: ${target.txnId} သည် အတည်ပြုပြီးသား (Already Approved) ဖြစ်နေပါသည်။`
+              })
+            });
+            return;
+          }
+
+          const creditAmount = Math.floor(Number(target.credits) || 0);
+          if (creditAmount <= 0) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `❌ ဤပြေစာ၏ Credit ပမာဏ မမှန်ကန်ပါ`
+              })
+            });
+            return;
+          }
+
           target.status = 'approved';
           target.approvedAt = Date.now();
           savePayments(records);
+          const newBal = grantUserCredits(target.userId, creditAmount, target.planName);
 
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               chat_id: chatId,
-              text: `✅ [အတည်ပြုပြီး] Txn ID: ${target.txnId} (+${target.credits} Credits) အား အောင်မြင်စွာ အတည်ပြုပြီး အကောင့်ထဲသို့ ထည့်သွင်းပေးပြီးပါပြီ!`
+              text: `✅ [အတည်ပြုပြီး] Txn ID: ${target.txnId} (+${creditAmount} Credits) အား User (${target.userId}) ထံသို့ ထည့်သွင်းပေးပြီးပါပြီ!\n💰 လက်ရှိ Balance: ${newBal} Credits`
             })
           });
           return;
         }
 
-        // Default reply with Admin options
+        // Default reply with Admin options (Admin Chat ONLY — non-admins returned above)
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
-            text: `မင်္ဂလာပါ! Admin Panel, Owner API Keys နှင့် User Usage များကို ကြည့်ရှုလိုပါက အောက်ပါ ခလုတ်များကို နှိပ်ပါ:`,
+            text: `မင်္ဂလာပါ! Admin Panel, Credit Mode Videos, Ban/Deduct နှင့် User Usage များကို ကြည့်ရှုလိုပါက အောက်ပါ ခလုတ်များကို နှိပ်ပါ:`,
             reply_markup: {
               inline_keyboard: [
                 [{ text: '👑 Admin Control Panel ဖွင့်မည်', callback_data: 'cmd_admin' }],
-                [{ text: '🔑 Owner API Keys & Limit စစ်မည်', callback_data: 'cmd_keys' }],
                 [
-                  { text: '👥 Users & Daily Free စစ်မည်', callback_data: 'cmd_users' },
-                  { text: '🎬 ယနေ့ Free သုံးနေသူများ', callback_data: 'cmd_free_active' }
+                  { text: '💎 Credit Mode Users & Videos', callback_data: 'cmd_paid_users' },
+                  { text: '🚫 Ban List', callback_data: 'cmd_banlist' }
+                ],
+                [
+                  { text: '👥 Users & Daily Free', callback_data: 'cmd_users' },
+                  { text: '🔑 Owner API Keys', callback_data: 'cmd_keys' }
                 ],
                 [{ text: '🌐 Web Admin Panel သို့ သွားမည်', url: PUBLIC_ADMIN_URL }]
               ]
@@ -9548,12 +10446,17 @@ Strict Video-Scan & Title Rules:
         });
       }
 
-      // 2. If user tapped an Inline Button (callback query)
+      // 2. If user tapped an Inline Button (callback query) — STRICT ADMIN ONLY
       if (update.callback_query) {
         const queryId = update.callback_query.id;
-        const data = update.callback_query.data as string;
-        const chatId = String(update.callback_query.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID);
+        const data = String(update.callback_query.data || '');
+        const chatId = String(update.callback_query.message?.chat?.id || '');
         const messageId = update.callback_query.message?.message_id;
+
+        if (!isTelegramAdminCallback(update.callback_query)) {
+          await answerTelegramCallbackQuery(queryId, '⛔ Admin Only', true);
+          return;
+        }
 
         if (data === 'cmd_admin') {
           await answerTelegramCallbackQuery(queryId, '🔄 Loading Admin Panel...');
@@ -9561,21 +10464,19 @@ Strict Video-Scan & Title Rules:
           return;
         }
 
+        if (data === 'cmd_banlist') {
+          await answerTelegramCallbackQuery(queryId, '🚫 Loading Ban List...');
+          await sendTelegramBanListReport(chatId);
+          return;
+        }
+
         if (data === 'cmd_keys') {
-          if (chatId !== TELEGRAM_ADMIN_CHAT_ID) {
-            await answerTelegramCallbackQuery(queryId, 'Admin Only', true);
-            return;
-          }
           await answerTelegramCallbackQuery(queryId, '🔑 Loading Owner API Keys...');
           await sendTelegramApiKeysReport(chatId);
           return;
         }
 
         if (data === 'cmd_keys_add_gemini' || data === 'cmd_keys_add_groq') {
-          if (chatId !== TELEGRAM_ADMIN_CHAT_ID) {
-            await answerTelegramCallbackQuery(queryId, 'Admin Only', true);
-            return;
-          }
           const isGem = data === 'cmd_keys_add_gemini';
           await answerTelegramCallbackQuery(queryId, isGem ? 'Gemini Key ထည့်နည်း' : 'Groq Key ထည့်နည်း');
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -9592,10 +10493,6 @@ Strict Video-Scan & Title Rules:
         }
 
         if (data === 'cmd_keys_reset_all') {
-          if (chatId !== TELEGRAM_ADMIN_CHAT_ID) {
-            await answerTelegramCallbackQuery(queryId, 'Admin Only', true);
-            return;
-          }
           const state = loadApiKeyPoolState();
           state.keys = state.keys.map((k) => ({
             ...k,
@@ -9630,6 +10527,65 @@ Strict Video-Scan & Title Rules:
         if (data === 'cmd_free_active') {
           await answerTelegramCallbackQuery(queryId, '🎬 Loading Active Free Users...');
           await sendTelegramUserStatsReport(chatId, 'free_active');
+          return;
+        }
+
+        if (data.startsWith('deductall_')) {
+          const targetId = data.slice('deductall_'.length).trim();
+          const result = deductOrZeroUserCredits(targetId, 'all', 'Telegram Quick Revoke All', 'Telegram Admin');
+          await answerTelegramCallbackQuery(
+            queryId,
+            result.ok
+              ? `➖ ${result.targetLabel}: -${result.deducted} Cr (လက်ကျန် 0 Cr)`
+              : `❌ ${result.error || 'Failed'}`,
+            true
+          );
+          if (result.ok) {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `➖ [CREDIT ZEROED] ${result.targetLabel}\n• နုတ်ယူမှု: -${result.deducted} Cr\n• လက်ကျန်: ${result.newCredits} Cr`
+              })
+            });
+          }
+          return;
+        }
+
+        if (data.startsWith('ban_')) {
+          const targetId = data.slice('ban_'.length).trim();
+          const banRes = banUserAccount(targetId, 'Telegram Quick Ban', 'Telegram Admin');
+          await answerTelegramCallbackQuery(
+            queryId,
+            banRes.ok ? `🚫 Banned: ${targetId}` : `❌ ${banRes.error || 'Failed'}`,
+            true
+          );
+          if (banRes.ok && banRes.record) {
+            const label = [banRes.record.email, banRes.record.userId].filter(Boolean).join(' · ');
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: `🚫 [BANNED] ${label}\nအကောင့်အား အပြီးပိတ်ပင်ပြီး Active Session များကို ဖျက်သိမ်းပြီးပါပြီ။`
+              })
+            });
+          }
+          return;
+        }
+
+        if (data.startsWith('unban_')) {
+          const targetId = data.slice('unban_'.length).trim();
+          const unbanRes = unbanUserAccount(targetId);
+          await answerTelegramCallbackQuery(
+            queryId,
+            unbanRes.ok ? `✅ Unbanned: ${unbanRes.targetLabel}` : `ℹ️ Ban စာရင်းထဲတွင် မရှိပါ`,
+            true
+          );
+          if (unbanRes.ok) {
+            await sendTelegramBanListReport(chatId);
+          }
           return;
         }
 
@@ -9673,17 +10629,28 @@ Strict Video-Scan & Title Rules:
             return;
           }
 
+          if (target.status === 'approved') {
+            await answerTelegramCallbackQuery(queryId, 'ℹ️ ဤပြေစာသည် အတည်ပြုပြီးသား ဖြစ်နေပါသည်', true);
+            return;
+          }
+
+          const creditAmount = Math.floor(Number(target.credits) || 0);
+          if (creditAmount <= 0) {
+            await answerTelegramCallbackQuery(queryId, '❌ Invalid Credit Amount', true);
+            return;
+          }
+
           target.status = 'approved';
           target.approvedAt = Date.now();
           savePayments(records);
 
           // Auto-grant credits directly to the user's persistent balance using User ID
           const targetUserId = target.userId || 'UID-UNKNOWN';
-          const newBalance = grantUserCredits(targetUserId, target.credits, target.planName);
+          const newBalance = grantUserCredits(targetUserId, creditAmount, target.planName);
 
           await answerTelegramCallbackQuery(
             queryId,
-            `✅ Auto Approved! User ID: ${targetUserId} ထံသို့ +${target.credits} Credits အား Auto ထည့်သွင်းပေးပြီးပါပြီ။`,
+            `✅ Auto Approved! User ID: ${targetUserId} ထံသို့ +${creditAmount} Credits အား Auto ထည့်သွင်းပေးပြီးပါပြီ။`,
             true
           );
 
@@ -9692,11 +10659,11 @@ Strict Video-Scan & Title Rules:
             `✅ [APPROVED] အောင်မြင်စွာ အတည်ပြုပြီးပါပြီ!`,
             `━━━━━━━━━━━━━━━━━━━`,
             `👤 Website User ID: ${targetUserId}`,
-            `📦 Plan: ${target.planName} (+${target.credits} Credits)`,
+            `📦 Plan: ${target.planName} (+${creditAmount} Credits)`,
             `💰 ပမာဏ: ${target.amountMmk}`,
             `🔢 Txn ID: ${target.txnId}`,
             `📱 လွှဲသူ: ${target.senderPhone}`,
-            `⚡ Bot မှ User ID (${targetUserId}) ထံသို့ +${target.credits} Credits အား Auto ပေါင်းထည့်ပေးပြီးပါပြီ!`,
+            `⚡ Bot မှ User ID (${targetUserId}) ထံသို့ +${creditAmount} Credits အား Auto ပေါင်းထည့်ပေးပြီးပါပြီ!`,
             `📊 User ၏ လက်ရှိ စုစုပေါင်း Credit: ${newBalance} Credits`,
             `⏰ အတည်ပြုချိန်: ${new Date().toLocaleString('my-MM')}`
           ].join('\n');
@@ -9859,41 +10826,71 @@ Strict Video-Scan & Title Rules:
     poll();
   }
 
-  // Start polling immediately
+  // Run one-time security remediation on boot & start Telegram bot polling
+  runOneTimeCrackRemediation();
   startTelegramBotPolling();
 
-  // User balance & Free Mode daily quota query endpoint
+  // User balance & Free Mode daily quota query endpoint (Authenticated & Ban-checked)
   app.get('/api/user/credits', (req, res) => {
     try {
-      const userId = (req.query.userId as string) || '';
-      const balances = loadUserBalances();
-      const rec = balances[userId] || { credits: 0, activePlanId: 'free', lastUpdated: Date.now() };
-      const freeUsage = getUserFreeUsageSnapshot(userId);
+      const authUser = resolveAuthenticatedUser(req);
+      if (!authUser) {
+        return res.status(401).json({ ok: false, error: 'Authentication required' });
+      }
+      const banRec = isUserBanned(authUser.email, authUser.userId);
+      if (banRec) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
+      const requestedUserId = String(req.query.userId || '').trim();
+      const targetUserId =
+        requestedUserId && isAuthorizedAdmin(req) ? requestedUserId : authUser.userId;
+      const targetEmail = targetUserId === authUser.userId ? authUser.email : undefined;
+      const rec = getEffectiveUserBalance(targetUserId, targetEmail);
+      const freeUsage = getUserFreeUsageSnapshot(targetUserId);
+
       res.json({
         ok: true,
-        userId,
+        userId: targetUserId,
         credits: typeof rec.credits === 'number' ? rec.credits : 0,
         activePlanId: rec.activePlanId || 'free',
         freeRemaining: freeUsage.freeRemaining,
         freeUsedToday: freeUsage.freeUsedToday,
-        freeLimit: freeUsage.freeLimit
+        freeLimit: freeUsage.freeLimit,
+        paidVideosToday: freeUsage.paidVideosToday,
+        totalPaidVideos: freeUsage.totalPaidVideos
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e) });
     }
   });
 
-  // Record daily Free Mode video usage & notify Admin on Telegram Bot
+  // Record daily Free Mode video usage & notify Admin on Telegram Bot (Authenticated & Ban-checked)
   app.post('/api/user/free-usage', async (req, res) => {
     try {
-      const { userId = '' } = req.body as { userId?: string };
-      if (!userId) {
-        return res.status(400).json({ ok: false, error: 'userId is required' });
+      const authUser = resolveAuthenticatedUser(req);
+      if (!authUser) {
+        return res.status(401).json({ ok: false, error: 'Authentication required' });
       }
+      const banRec = isUserBanned(authUser.email, authUser.userId);
+      if (banRec) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
+      const userId = authUser.userId;
       const usage = recordUserFreeUsage(userId);
-      const user = loadUsers().find((u) => u.userId === userId);
       const isTestRequest =
-        isSyntheticTestUser(userId, user?.email) ||
+        isSyntheticTestUser(userId, authUser.email) ||
         req.headers['x-test-suppress-telegram'] === '1';
 
       if (!isTestRequest) {
@@ -9902,7 +10899,7 @@ Strict Video-Scan & Title Rules:
           `🎬 [FREE MODE] ယနေ့ ဗီဒီယို အသုံးပြုမှု`,
           `━━━━━━━━━━━━━━━━━━━`,
           `🪪 User ID: ${userId}`,
-          `📧 Gmail / Email: ${user?.email || 'Guest'}`,
+          `📧 Gmail / Email: ${authUser.email || 'Unknown'}`,
           `📊 ယနေ့ Free Mode သုံးပြီးမှု: ${usage.freeUsedToday} / ${usage.freeLimit} ပုဒ် (ကျန် ${usage.freeRemaining} ပုဒ်)`,
           `🏷️ အခြေအနေ: Daily Free Mode အသုံးပြုနေသည်`,
           `👥 Users: ${stats.totalUsers} (Free: ${stats.freeUsersCount} | Paid: ${stats.paidUsersCount})`
@@ -9926,31 +10923,87 @@ Strict Video-Scan & Title Rules:
     }
   });
 
-  // User credit deduction endpoint
+  // User credit deduction endpoint — STRICTLY Authenticated, Positive Integer Only, Ban-checked
   app.post('/api/user/deduct-credits', (req, res) => {
     try {
-      const { userId, amount = 1 } = req.body as { userId: string; amount?: number };
-      const balances = loadUserBalances();
-      const current = balances[userId]?.credits || 0;
-      const nextCredits = Math.max(0, current - Number(amount));
-      balances[userId] = {
-        credits: nextCredits,
-        activePlanId: balances[userId]?.activePlanId || 'free',
-        lastUpdated: Date.now()
-      };
-      saveUserBalances(balances);
-      recordUserPaidUsage(userId);
-      res.json({ ok: true, credits: nextCredits });
+      const authUser = resolveAuthenticatedUser(req);
+      if (!authUser) {
+        return res.status(401).json({ ok: false, error: 'Authentication required' });
+      }
+      const banRec = isUserBanned(authUser.email, authUser.userId);
+      if (banRec) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
+      const rawAmount = Number((req.body as { amount?: number })?.amount);
+      if (!Number.isFinite(rawAmount) || rawAmount < 1 || rawAmount > 10000 || !Number.isInteger(rawAmount)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Invalid credit deduction amount (must be a positive integer)'
+        });
+      }
+
+      const currentBal = getEffectiveUserBalance(authUser.userId, authUser.email);
+      if (currentBal.credits < rawAmount) {
+        return res.status(402).json({
+          ok: false,
+          error: `Credit မလုံလောက်ပါ (လိုအပ်ချက်: ${rawAmount} Cr, လက်ကျန်: ${currentBal.credits} Cr)`,
+          credits: currentBal.credits
+        });
+      }
+
+      const deductionRes = chargeUserCreditsForGeneration(authUser.userId, authUser.email, rawAmount);
+      const usageAfter = recordUserPaidUsage(authUser.userId);
+
+      const isTestRequest =
+        isSyntheticTestUser(authUser.userId, authUser.email) ||
+        req.headers['x-test-suppress-telegram'] === '1';
+      if (!isTestRequest) {
+        notifyCreditModeVideoGenerated({
+          userId: authUser.userId,
+          email: authUser.email,
+          name: authUser.name,
+          creditsDeducted: deductionRes.deducted,
+          remainingCredits: deductionRes.remainingCredits,
+          modeLabel: 'Credit Mode Studio',
+          usage: usageAfter
+        }).catch(() => {});
+      }
+
+      res.json({
+        ok: true,
+        credits: deductionRes.remainingCredits,
+        paidVideosToday: usageAfter.paidVideosToday,
+        totalPaidVideos: usageAfter.totalPaidVideos
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e) });
     }
   });
 
-  // Submit payment slip from Wallet modal
+  // Submit payment slip from Wallet modal (Authenticated & Scoped to Caller UID)
   app.post('/api/payments/submit-slip', async (req, res) => {
     try {
+      const authUser = resolveAuthenticatedUser(req);
+      if (!authUser) {
+        return res.status(401).json({ ok: false, error: 'အကောင့်ဝင်ရောက်ပြီးမှသာ ငွေလွှဲပြေစာ တင်နိုင်ပါသည်' });
+      }
+      const banRec = isUserBanned(authUser.email, authUser.userId);
+      if (banRec) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
       const {
-        userId = 'UID-84920',
         planName = 'Starter Pack (100 Credits)',
         credits = 100,
         amountMmk = '15,000 MMK',
@@ -9969,39 +11022,45 @@ Strict Video-Scan & Title Rules:
         slipBase64?: string | null;
       };
 
+      const safeCredits = Math.floor(Number(credits));
+      if (!Number.isFinite(safeCredits) || safeCredits < 1 || safeCredits > 100000) {
+        return res.status(400).json({ ok: false, error: 'Invalid credit package amount' });
+      }
+
       const isWave = walletType.toLowerCase().includes('wave');
       const walletAccountName = isWave ? 'KAUNG HTET' : 'Ma Pyone Pyone';
       const walletPhone = isWave ? '09772350006' : '09797407339';
       const cleanWalletName = isWave ? 'Wave Pay' : 'KBZ Pay';
 
-      const cleanUserId = userId.trim() || 'UID-UNKNOWN';
+      const cleanUserId = authUser.userId;
 
       const newRecord: PaymentRecord = {
         id: `txn_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         userId: cleanUserId,
-        planName,
-        credits: Number(credits) || 150,
-        amountMmk,
+        planName: String(planName).slice(0, 120),
+        credits: safeCredits,
+        amountMmk: String(amountMmk).slice(0, 60),
         walletType: cleanWalletName,
         walletAccountName,
         walletPhone,
-        senderPhone,
-        txnId,
+        senderPhone: String(senderPhone || '').slice(0, 40),
+        txnId: String(txnId || '').slice(0, 40),
         slipBase64,
         status: 'pending',
         createdAt: Date.now(),
         telegramDelivered: false
       };
 
-      const senderPhoneClean = (senderPhone || '').trim();
+      const senderPhoneClean = (newRecord.senderPhone || '').trim();
 
       const captionLines = [
         `🔔 [TTAK RECAP] ငွေလွှဲအသစ် ရောက်ရှိလာပါသည်!`,
         `━━━━━━━━━━━━━━━━━━━`,
         `👤 Website User ID: ${cleanUserId}`,
-        `📦 Credit Plan: ${planName} (+${credits} Credits)`,
-        `💰 ငွေလွှဲပမာဏ: ${amountMmk}`,
-        `🔢 လုပ်ငန်းစဉ်အမှတ် (Txn ID): ${txnId}`,
+        `📧 Gmail: ${authUser.email}`,
+        `📦 Credit Plan: ${newRecord.planName} (+${newRecord.credits} Credits)`,
+        `💰 ငွေလွှဲပမာဏ: ${newRecord.amountMmk}`,
+        `🔢 လုပ်ငန်းစဉ်အမှတ် (Txn ID): ${newRecord.txnId}`,
         ...(senderPhoneClean ? [`📱 လွှဲသူဖုန်း: ${senderPhoneClean}`] : []),
         `🏦 လက်ခံ Wallet: ${cleanWalletName} (${walletPhone} · ${walletAccountName})`,
         `⏰ အချိန်: ${new Date().toLocaleString('my-MM')}`,
@@ -10047,16 +11106,30 @@ Strict Video-Scan & Title Rules:
     }
   });
 
-  // User Payment History & Live Approval Status (Scoped to Website User ID)
+  // User Payment History & Live Approval Status (Authenticated & Scoped to Caller UID)
   app.get('/api/user/payments', (req, res) => {
     try {
-      const userId = (req.query.userId as string) || '';
-      if (!userId.trim()) {
-        return res.json({ ok: true, payments: [] });
+      const authUser = resolveAuthenticatedUser(req);
+      if (!authUser) {
+        return res.status(401).json({ ok: false, error: 'Authentication required' });
       }
+      const banRec = isUserBanned(authUser.email, authUser.userId);
+      if (banRec) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
       const records = loadPayments();
       const userRecords = records
-        .filter((r) => r.userId === userId.trim())
+        .filter(
+          (r) =>
+            r.userId === authUser.userId ||
+            r.userId.toLowerCase() === authUser.email.toLowerCase()
+        )
         .map((r) => ({
           id: r.id,
           userId: r.userId,
@@ -10078,23 +11151,352 @@ Strict Video-Scan & Title Rules:
     }
   });
 
-  const ADMIN_SECRET_PIN = '198125'; // 6-digit Secret Admin PIN (Derived from Admin Telegram ID 1981253384)
-
-  function isAuthorizedAdmin(req: express.Request): boolean {
-    const key =
-      req.headers['x-admin-key'] ||
-      req.query.adminKey ||
-      (req.body && req.body.adminKey);
-    return key === ADMIN_SECRET_PIN;
+  // ============================================================================
+  // HARDENED DUAL-LAYER ADMIN AUTH (Owner Gmail + Server Passcode/Scrypt + Signed Token)
+  // ============================================================================
+  interface StoredAdminCredential {
+    hashHex: string;
+    saltHex: string;
+    ownerEmail: string;
+    createdAt: number;
   }
 
-  // Admin PIN verification route
+  function loadStoredAdminCredential(): StoredAdminCredential | null {
+    try {
+      if (fs.existsSync(ADMIN_CREDENTIAL_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(ADMIN_CREDENTIAL_FILE, 'utf-8'));
+        if (parsed?.hashHex && parsed?.saltHex) return parsed as StoredAdminCredential;
+      }
+    } catch {}
+    return null;
+  }
+
+  function getConfiguredEnvAdminPasscode(): string {
+    return String(process.env.ADMIN_PASSCODE || '').trim();
+  }
+
+  function verifyAdminPasscodeCandidate(candidate: string): boolean {
+    const clean = String(candidate || '').trim();
+    if (!clean) return false;
+    const envPasscode = getConfiguredEnvAdminPasscode();
+    if (envPasscode) {
+      const a = crypto.createHash('sha256').update(clean).digest();
+      const b = crypto.createHash('sha256').update(envPasscode).digest();
+      return crypto.timingSafeEqual(a, b);
+    }
+    const stored = loadStoredAdminCredential();
+    if (!stored) return false;
+    try {
+      const computed = crypto.scryptSync(clean, stored.saltHex, 64);
+      const expected = Buffer.from(stored.hashHex, 'hex');
+      if (computed.length !== expected.length) return false;
+      return crypto.timingSafeEqual(computed, expected);
+    } catch {
+      return false;
+    }
+  }
+
+  const adminPinAttemptTracker = new Map<string, { fails: number; blockedUntil: number }>();
+
+  function getClientIpKey(req: express.Request): string {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return fwd || req.ip || 'unknown';
+  }
+
+  function signAdminSessionToken(ownerEmail: string): string {
+    const payloadObj = {
+      role: 'admin',
+      email: ownerEmail.toLowerCase(),
+      iat: Date.now(),
+      exp: Date.now() + 12 * 3600 * 1000 // 12-hour signed admin token
+    };
+    const payloadB64 = Buffer.from(JSON.stringify(payloadObj), 'utf-8').toString('base64url');
+    const sigB64 = crypto
+      .createHmac('sha256', ADMIN_SESSION_HMAC_KEY)
+      .update(payloadB64)
+      .digest('base64url');
+    return `ttak_adm1.${payloadB64}.${sigB64}`;
+  }
+
+  function verifyAdminSessionToken(token: string): { email: string; exp: number } | null {
+    try {
+      if (!token || !token.startsWith('ttak_adm1.')) return null;
+      const parts = token.split('.');
+      if (parts.length !== 3) return null;
+      const [, payloadB64, sigB64] = parts;
+      const expectedSig = crypto
+        .createHmac('sha256', ADMIN_SESSION_HMAC_KEY)
+        .update(payloadB64)
+        .digest('base64url');
+      const a = Buffer.from(sigB64);
+      const b = Buffer.from(expectedSig);
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+      const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as any;
+      if (
+        decoded?.role !== 'admin' ||
+        String(decoded?.email || '').toLowerCase() !== OWNER_ADMIN_EMAIL ||
+        Number(decoded?.exp || 0) < Date.now()
+      ) {
+        return null;
+      }
+      return { email: String(decoded.email).toLowerCase(), exp: Number(decoded.exp) };
+    } catch {
+      return null;
+    }
+  }
+
+  function isOwnerUserSession(req: express.Request): StoredUserAccount | null {
+    const user = resolveAuthenticatedUser(req);
+    if (!user) return null;
+    if (user.email.trim().toLowerCase() !== OWNER_ADMIN_EMAIL) return null;
+    return user;
+  }
+
+  function isAuthorizedAdmin(req: express.Request): boolean {
+    const ownerUser = isOwnerUserSession(req);
+    if (!ownerUser) return false;
+    const headerToken = String(req.headers['x-admin-session'] || '').trim();
+    if (!headerToken) return false;
+    return Boolean(verifyAdminSessionToken(headerToken));
+  }
+
+  // Check whether current signed-in user is Owner & whether first-run passcode claim is needed
+  app.get('/api/admin/status', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const authUser = resolveAuthenticatedUser(req);
+    const isOwner = Boolean(authUser && authUser.email.trim().toLowerCase() === OWNER_ADMIN_EMAIL);
+    if (!isOwner) {
+      return res.json({
+        ok: true,
+        isOwner: false,
+        authenticated: Boolean(authUser),
+        signedInEmail: authUser?.email || ''
+      });
+    }
+    const hasEnvPasscode = Boolean(getConfiguredEnvAdminPasscode());
+    const hasStoredCred = Boolean(loadStoredAdminCredential());
+    return res.json({
+      ok: true,
+      isOwner: true,
+      authenticated: true,
+      signedInEmail: authUser?.email || '',
+      passcodeConfigured: hasEnvPasscode || hasStoredCred,
+      needsSetup: !hasEnvPasscode && !hasStoredCred,
+      source: hasEnvPasscode ? 'env' : hasStoredCred ? 'claimed' : 'none'
+    });
+  });
+
+  // One-time inline first-run Admin Password Setup (Owner Gmail ONLY, locks itself once claimed or when ADMIN_PASSCODE env is set)
+  app.post('/api/admin/bootstrap-passcode', (req, res) => {
+    const owner = isOwnerUserSession(req);
+    if (!owner) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Owner Gmail အကောင့်ဖြင့် Sign In ဝင်ထားမှသာ Admin Password သတ်မှတ်နိုင်ပါသည်'
+      });
+    }
+    if (getConfiguredEnvAdminPasscode() || loadStoredAdminCredential()) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Admin Password သတ်မှတ်ပြီးသား ဖြစ်နေပါသည်။ လက်ရှိ Password ဖြင့် Unlock လုပ်ပါ။'
+      });
+    }
+    const passcode = String((req.body as { passcode?: string })?.passcode || '').trim();
+    if (passcode.length < 8 || passcode.length > 64) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Admin Password သည် အနည်းဆုံး ၈ လုံး (8–64 characters) ရှိရပါမည်'
+      });
+    }
+
+    const saltHex = crypto.randomBytes(16).toString('hex');
+    const hashHex = crypto.scryptSync(passcode, saltHex, 64).toString('hex');
+    const cred: StoredAdminCredential = {
+      hashHex,
+      saltHex,
+      ownerEmail: OWNER_ADMIN_EMAIL,
+      createdAt: Date.now()
+    };
+    try {
+      fs.writeFileSync(ADMIN_CREDENTIAL_FILE, JSON.stringify(cred, null, 2), {
+        encoding: 'utf-8',
+        flag: 'wx',
+        mode: 0o600
+      });
+    } catch {
+      return res.status(409).json({
+        ok: false,
+        error: 'Admin Password သတ်မှတ်ပြီးသား ဖြစ်နေပါသည်'
+      });
+    }
+
+    const adminToken = signAdminSessionToken(owner.email);
+    res.json({ ok: true, adminToken });
+  });
+
+  // Admin Passcode verification route (Dual-Layer: Owner Gmail Session + Server Passcode + Rate Limit)
   app.post('/api/admin/verify-pin', (req, res) => {
-    const { pin } = req.body as { pin: string };
-    if (pin === ADMIN_SECRET_PIN) {
-      res.json({ ok: true });
-    } else {
-      res.status(401).json({ ok: false, error: 'Admin PIN မမှန်ကန်ပါ (Invalid Admin PIN)' });
+    const owner = isOwnerUserSession(req);
+    if (!owner) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Owner Gmail အကောင့်ဖြင့် Sign In ဝင်ထားမှသာ Admin Panel ဖွင့်နိုင်ပါသည်'
+      });
+    }
+
+    const ipKey = getClientIpKey(req);
+    const now = Date.now();
+    const tracker = adminPinAttemptTracker.get(ipKey);
+    if (tracker && tracker.blockedUntil > now) {
+      const waitMin = Math.ceil((tracker.blockedUntil - now) / 60000);
+      return res.status(429).json({
+        ok: false,
+        error: `Admin Password အကြိမ်များစွာ မှားယွင်းနေပါသည်။ ${waitMin} မိနစ်ကြာမှ ထပ်မံကြိုးစားပါ။`
+      });
+    }
+
+    const hasEnvPasscode = Boolean(getConfiguredEnvAdminPasscode());
+    const hasStoredCred = Boolean(loadStoredAdminCredential());
+    if (!hasEnvPasscode && !hasStoredCred) {
+      return res.status(400).json({
+        ok: false,
+        needsSetup: true,
+        error: 'Admin Password မသတ်မှတ်ရသေးပါ။ ပထမဆုံး Admin Password သတ်မှတ်ပါ။'
+      });
+    }
+
+    const { pin = '', passcode = '' } = (req.body || {}) as { pin?: string; passcode?: string };
+    const candidate = String(passcode || pin || '').trim();
+    if (verifyAdminPasscodeCandidate(candidate)) {
+      adminPinAttemptTracker.delete(ipKey);
+      const adminToken = signAdminSessionToken(owner.email);
+      return res.json({ ok: true, adminToken });
+    }
+
+    const fails = (tracker?.fails || 0) + 1;
+    adminPinAttemptTracker.set(ipKey, {
+      fails,
+      blockedUntil: fails >= 5 ? now + 15 * 60 * 1000 : 0
+    });
+    return res.status(401).json({
+      ok: false,
+      error: 'Admin Password မမှန်ကန်ပါ (Invalid Admin Password)'
+    });
+  });
+
+  // Get all users, Credit Mode video counts & ban list for Admin Panel
+  app.get('/api/admin/users', (req, res) => {
+    try {
+      if (!isAuthorizedAdmin(req)) {
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
+      }
+      const stats = getWebsiteUserStats();
+      res.json({
+        ok: true,
+        totalUsers: stats.totalUsers,
+        paidUsersCount: stats.paidUsersCount,
+        bannedUsersCount: stats.bannedUsersCount,
+        totalPaidVideosToday: stats.totalPaidVideosToday,
+        totalPaidVideosAllTime: stats.totalPaidVideosAllTime,
+        users: stats.users.map((u) => ({
+          userId: u.userId,
+          name: u.name,
+          email: u.email,
+          credits: u.credits,
+          isPaidUser: u.isPaidUser,
+          isBanned: u.isBanned,
+          banReason: u.banReason,
+          paidVideosToday: u.usage.paidVideosToday,
+          totalPaidVideos: u.usage.totalPaidVideos,
+          freeUsedToday: u.usage.freeUsedToday,
+          totalFreeVideos: u.usage.totalFreeVideos,
+          createdAt: u.createdAt
+        })),
+        bannedUsers: stats.bannedUsers
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error) });
+    }
+  });
+
+  // Deduct / Revoke Credits by Admin
+  app.post('/api/admin/deduct-credit', async (req, res) => {
+    try {
+      if (!isAuthorizedAdmin(req)) {
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
+      }
+      const {
+        targetIdentifier = '',
+        amount = 'all',
+        reason = 'Admin Credit Revocation'
+      } = (req.body || {}) as {
+        targetIdentifier?: string;
+        amount?: number | 'all';
+        reason?: string;
+      };
+
+      const result = deductOrZeroUserCredits(targetIdentifier, amount, reason, 'Web Admin');
+      if (!result.ok) {
+        return res.status(400).json({ ok: false, error: result.error });
+      }
+
+      await notifyTelegramAdmin(
+        `➖ [TTAK RECAP] Admin Credit Deduction!\n` +
+        `• User: ${result.targetLabel}\n` +
+        `• Deducted: -${result.deducted} Credits\n` +
+        `• Remaining: ${result.newCredits} Credits\n` +
+        `• Reason: ${reason}`
+      );
+
+      res.json({ ok: true, result });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error) });
+    }
+  });
+
+  // Ban Gmail / UID by Admin
+  app.post('/api/admin/ban-user', async (req, res) => {
+    try {
+      if (!isAuthorizedAdmin(req)) {
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
+      }
+      const { targetIdentifier = '', reason = 'Admin Permanent Ban' } = (req.body || {}) as {
+        targetIdentifier?: string;
+        reason?: string;
+      };
+      const banRes = banUserAccount(targetIdentifier, reason, 'Web Admin');
+      if (!banRes.ok || !banRes.record) {
+        return res.status(400).json({ ok: false, error: banRes.error || 'Unable to ban user' });
+      }
+
+      const label = [banRes.record.email, banRes.record.userId].filter(Boolean).join(' · ');
+      await notifyTelegramAdmin(
+        `🚫 [TTAK RECAP] User Permanently Banned!\n` +
+        `• Target: ${label}\n` +
+        `• Reason: ${banRes.record.reason}`
+      );
+
+      res.json({ ok: true, record: banRes.record });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error) });
+    }
+  });
+
+  // Unban Gmail / UID by Admin
+  app.post('/api/admin/unban-user', async (req, res) => {
+    try {
+      if (!isAuthorizedAdmin(req)) {
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
+      }
+      const { targetIdentifier = '' } = (req.body || {}) as { targetIdentifier?: string };
+      const unbanRes = unbanUserAccount(targetIdentifier);
+      if (!unbanRes.ok) {
+        return res.status(404).json({ ok: false, error: 'Ban စာရင်းထဲတွင် မတွေ့ရှိပါ' });
+      }
+      await notifyTelegramAdmin(`✅ [TTAK RECAP] User Unbanned: ${unbanRes.targetLabel}`);
+      res.json({ ok: true, targetLabel: unbanRes.targetLabel });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error) });
     }
   });
 
@@ -10102,7 +11504,7 @@ Strict Video-Scan & Title Rules:
   app.get('/api/admin/payments', (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const records = loadPayments();
       res.json({
@@ -10124,13 +11526,20 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/payments/approve', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const { id } = req.body as { id: string };
       const records = loadPayments();
       const target = records.find((r) => r.id === id);
       if (!target) {
         return res.status(404).json({ ok: false, error: 'Payment record not found' });
+      }
+      if (target.status === 'approved') {
+        return res.status(409).json({ ok: false, error: 'Payment record is already approved' });
+      }
+      const creditAmount = Math.floor(Number(target.credits) || 0);
+      if (creditAmount <= 0) {
+        return res.status(400).json({ ok: false, error: 'Invalid payment credit amount' });
       }
 
       target.status = 'approved';
@@ -10139,13 +11548,13 @@ Strict Video-Scan & Title Rules:
 
       // Auto-grant credits directly to the user's persistent balance using User ID
       const targetUserId = target.userId || 'UID-UNKNOWN';
-      const newBalance = grantUserCredits(targetUserId, target.credits, target.planName);
+      const newBalance = grantUserCredits(targetUserId, creditAmount, target.planName);
 
       // Notify Telegram
       await notifyTelegramAdmin(
         `✅ [TTAK RECAP] ငွေလွှဲ အတည်ပြုပြီးပါပြီ!\n` +
         `• Website User ID: ${targetUserId}\n` +
-        `• Plan: ${target.planName} (+${target.credits} Credits)\n` +
+        `• Plan: ${target.planName} (+${creditAmount} Credits)\n` +
         `• ပမာဏ: ${target.amountMmk}\n` +
         `• လွှဲသူ: ${target.senderPhone}\n` +
         `• Txn ID: ${target.txnId}\n` +
@@ -10162,7 +11571,7 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/payments/reject', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const { id, reason = 'အချက်အလက် မကိုက်ညီပါ သို့မဟုတ် ငွေလွှဲပြေစာ မမှန်ကန်ပါ' } = req.body as {
         id: string;
@@ -10196,12 +11605,12 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/telegram-test', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const pingText =
         `🚀 [TTAK RECAP BOT TEST]\n` +
-        `Bot Token: 8931773634:AAH2f3iOB5rDU3CgTH2nQ3guS1HyqJZXYjM\n` +
-        `Admin ID: 1981253384\n` +
+        `Bot: @ttakrecap_bot\n` +
+        `Admin ID: ${TELEGRAM_ADMIN_CHAT_ID}\n` +
         `Status: Active & Connected!\n` +
         `အချိန်: ${new Date().toLocaleString('my-MM')}`;
 
@@ -10221,7 +11630,7 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/manual-credit', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const { targetPhoneOrEmail, credits, reason = 'Admin Manual Bonus' } = req.body as {
         targetPhoneOrEmail: string;
@@ -10229,16 +11638,28 @@ Strict Video-Scan & Title Rules:
         reason?: string;
       };
 
+      const cleanTarget = String(targetPhoneOrEmail || '').trim();
+      const safeCredits = Math.floor(Number(credits));
+      if (!cleanTarget) {
+        return res.status(400).json({ ok: false, error: 'User ID သို့မဟုတ် Gmail ထည့်သွင်းပါ' });
+      }
+      if (!Number.isFinite(safeCredits) || safeCredits < 1 || safeCredits > 100000) {
+        return res.status(400).json({ ok: false, error: 'Credit ပမာဏ ၁ မှ ၁၀၀,၀၀၀ အတွင်း ဖြစ်ရပါမည်' });
+      }
+
+      const resolved = resolveUserAndBalanceKeys(cleanTarget);
+      const canonicalUid = resolved.matchedUser?.userId || resolved.canonicalUserId;
+
       const manualRecord: PaymentRecord = {
         id: `manual_${Date.now()}`,
-        userId: targetPhoneOrEmail,
-        planName: `Manual Grant (+${credits} Cr)`,
-        credits: Number(credits) || 100,
+        userId: canonicalUid,
+        planName: `Manual Grant (+${safeCredits} Cr)`,
+        credits: safeCredits,
         amountMmk: '0 MMK (Admin Grant)',
         walletType: 'Admin Direct',
         walletAccountName: 'System Admin',
         walletPhone: 'DIRECT',
-        senderPhone: targetPhoneOrEmail,
+        senderPhone: resolved.email || cleanTarget,
         txnId: `ADM${Math.floor(100000 + Math.random() * 900000)}`,
         status: 'approved',
         createdAt: Date.now(),
@@ -10246,7 +11667,7 @@ Strict Video-Scan & Title Rules:
         telegramDelivered: false
       };
 
-      grantUserCredits(targetPhoneOrEmail, Number(credits) || 100, reason);
+      const newBalance = grantUserCredits(canonicalUid, safeCredits, reason);
 
       const all = loadPayments();
       all.unshift(manualRecord);
@@ -10254,12 +11675,12 @@ Strict Video-Scan & Title Rules:
 
       await notifyTelegramAdmin(
         `🎁 [TTAK RECAP] Manual Credit Grant!\n` +
-        `• User: ${targetPhoneOrEmail}\n` +
-        `• Added: +${credits} Credits\n` +
+        `• User: ${resolved.email ? `${canonicalUid} (${resolved.email})` : canonicalUid}\n` +
+        `• Added: +${safeCredits} Credits (Balance: ${newBalance} Cr)\n` +
         `• Reason: ${reason}`
       );
 
-      res.json({ ok: true, record: manualRecord });
+      res.json({ ok: true, record: manualRecord, newBalance });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error) });
     }
@@ -10270,7 +11691,7 @@ Strict Video-Scan & Title Rules:
   // ============================================================================
   app.get('/api/admin/r2-config', (req, res) => {
     if (!isAuthorizedAdmin(req)) {
-      return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+      return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
     }
     const cfg = loadR2Config();
     if (!cfg) {
@@ -10299,7 +11720,7 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/r2-config', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const { accountId, accessKeyId, secretAccessKey, bucketName, publicUrl = '' } = (req.body || {}) as {
         accountId?: string;
@@ -10340,7 +11761,7 @@ Strict Video-Scan & Title Rules:
   app.post('/api/admin/r2-test-cors', async (req, res) => {
     try {
       if (!isAuthorizedAdmin(req)) {
-        return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+        return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
       }
       const { accountId, accessKeyId, secretAccessKey, bucketName, publicUrl = '' } = (req.body || {}) as {
         accountId?: string;
@@ -10379,7 +11800,7 @@ Strict Video-Scan & Title Rules:
 
   app.delete('/api/admin/r2-config', (req, res) => {
     if (!isAuthorizedAdmin(req)) {
-      return res.status(403).json({ ok: false, error: 'Access Denied: Admin PIN Required' });
+      return res.status(403).json({ ok: false, error: 'Access Denied: Admin Authorization Required' });
     }
     clearSavedR2Config();
     res.json({ ok: true, configured: false });
@@ -10486,9 +11907,12 @@ Strict Video-Scan & Title Rules:
     return uid;
   }
 
-  const SESSION_HMAC_KEY = crypto
-    .createHash('sha256')
-    .update(process.env.SESSION_SECRET || `ttak-session-hmac-v1:${TELEGRAM_BOT_TOKEN}`)
+  const SESSION_HMAC_KEY = process.env.SESSION_SECRET
+    ? crypto.createHash('sha256').update(process.env.SESSION_SECRET).digest()
+    : crypto.randomBytes(32);
+  const ADMIN_SESSION_HMAC_KEY = crypto
+    .createHmac('sha256', SESSION_HMAC_KEY)
+    .update('ttak-admin-session-v1')
     .digest();
   const REVOKED_TOKENS_FILE = path.join(JOBS_TEMP_DIR, 'revoked_tokens.json');
 
@@ -10564,6 +11988,38 @@ Strict Video-Scan & Title Rules:
     } catch {
       return null;
     }
+  }
+
+  function extractAuthTokenFromReq(req: express.Request): string {
+    const authHeader = req.headers.authorization || '';
+    const cookieToken = readCookieValueFromReq(req, 'ttak_auth_token');
+    return authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : String(req.headers['x-auth-token'] || cookieToken || '').trim();
+  }
+
+  function resolveAuthenticatedUser(req: express.Request): StoredUserAccount | null {
+    const token = extractAuthTokenFromReq(req);
+    if (!token) return null;
+    const h = crypto.createHash('sha256').update(token).digest('hex');
+    if (loadRevokedTokenHashes().includes(h)) return null;
+
+    const signed = verifySignedSessionToken(token);
+    if (signed) {
+      const users = loadUsers();
+      const found =
+        users.find((u) => u.userId === signed.userId) ||
+        users.find((u) => u.email.toLowerCase() === signed.email.toLowerCase());
+      return found || signed;
+    }
+
+    const sessions = loadSessions();
+    const sess = sessions[token];
+    if (sess && sess.expiresAt >= Date.now()) {
+      const users = loadUsers();
+      return users.find((u) => u.userId === sess.userId) || null;
+    }
+    return null;
   }
 
   function createSessionForUser(userOrId: StoredUserAccount | string): string {
@@ -10663,6 +12119,15 @@ Strict Video-Scan & Title Rules:
       }
 
       const cleanEmail = String(fbUser.email).trim().toLowerCase();
+      if (isUserBanned(cleanEmail)) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
       const displayName =
         String(fbUser.displayName || '').trim() || cleanEmail.split('@')[0] || 'Creator';
       const photoUrl = fbUser.photoUrl ? String(fbUser.photoUrl) : undefined;
@@ -10689,6 +12154,14 @@ Strict Video-Scan & Title Rules:
 
         notifyNewUserSignup(user).catch(() => {});
       } else {
+        if (isUserBanned(user.email, user.userId)) {
+          clearAuthSessionCookies(res);
+          return res.status(403).json({
+            ok: false,
+            banned: true,
+            error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          });
+        }
         let updated = false;
         if (user.name !== displayName && displayName) {
           user.name = displayName;
@@ -10736,6 +12209,13 @@ Strict Video-Scan & Title Rules:
 
       if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
         return res.status(400).json({ ok: false, error: 'မှန်ကန်သော Email / Gmail လိပ်စာ ထည့်သွင်းပါ' });
+      }
+      if (isUserBanned(cleanEmail)) {
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤ Email / Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
       }
       if (!password || password.length < 6) {
         return res.status(400).json({ ok: false, error: 'စကားဝှက် (Password) အနည်းဆုံး ၆ လုံး ထည့်သွင်းပါ' });
@@ -10798,6 +12278,14 @@ Strict Video-Scan & Title Rules:
       if (!cleanEmail || !password) {
         return res.status(400).json({ ok: false, error: 'Email နှင့် Password နှစ်ခုလုံး ထည့်သွင်းပါ' });
       }
+      if (isUserBanned(cleanEmail)) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤ Email / Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
 
       const users = loadUsers();
       const user = users.find((u) => u.email === cleanEmail && u.provider === 'email');
@@ -10805,6 +12293,14 @@ Strict Video-Scan & Title Rules:
         return res.status(401).json({
           ok: false,
           error: 'Email သို့မဟုတ် Password မှားယွင်းနေပါသည် (အကောင့်မရှိသေးပါက Sign Up လုပ်ပါ)'
+        });
+      }
+      if (isUserBanned(user.email, user.userId)) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
         });
       }
 
@@ -10890,13 +12386,22 @@ Strict Video-Scan & Title Rules:
       }
       pendingTelegramOtps.delete(cleanChatId);
 
+      const tgEmail = `tg_${cleanChatId}@telegram.ttak`;
+      if (isUserBanned(tgEmail)) {
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
+      }
+
       const users = loadUsers();
       let user = users.find((u) => u.telegramChatId === cleanChatId);
       if (!user) {
         user = {
           userId: generateUniqueUserId(users),
           name: name.trim() || `TG-${cleanChatId.slice(-4)}`,
-          email: `tg_${cleanChatId}@telegram.ttak`,
+          email: tgEmail,
           provider: 'telegram',
           telegramChatId: cleanChatId,
           createdAt: Date.now()
@@ -10911,6 +12416,13 @@ Strict Video-Scan & Title Rules:
         }
 
         notifyNewUserSignup(user).catch(() => {});
+      } else if (isUserBanned(user.email, user.userId)) {
+        clearAuthSessionCookies(res);
+        return res.status(403).json({
+          ok: false,
+          banned: true,
+          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        });
       }
 
       const token = createSessionForUser(user);
@@ -10933,35 +12445,34 @@ Strict Video-Scan & Title Rules:
   app.get('/api/auth/me', (req, res) => {
     try {
       res.setHeader('Cache-Control', 'no-store');
-      const authHeader = req.headers.authorization || '';
-      const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
-      const cookieToken = readCookieValueFromReq(req, 'ttak_auth_token');
-      const token = authHeader.startsWith('Bearer ')
-        ? authHeader.slice(7).trim()
-        : String(req.headers['x-auth-token'] || queryToken || cookieToken || '').trim();
+      const token = extractAuthTokenFromReq(req);
 
-      const rawUserCacheHeader = String(req.headers['x-auth-user-cache'] || '').trim();
-      const cookieUserJson = readCookieValueFromReq(req, 'ttak_auth_user');
-
-      if (!token && !rawUserCacheHeader && !cookieUserJson) {
+      if (!token) {
         return res.status(401).json({ ok: false, error: 'Not authenticated' });
       }
 
-      // Check if token was explicitly revoked via Sign Out
-      if (token) {
-        const h = crypto.createHash('sha256').update(token).digest('hex');
-        if (loadRevokedTokenHashes().includes(h)) {
-          return res.status(401).json({ ok: false, error: 'Session signed out' });
-        }
+      // Check if token was explicitly revoked via Sign Out or Ban
+      const h = crypto.createHash('sha256').update(token).digest('hex');
+      if (loadRevokedTokenHashes().includes(h)) {
+        clearAuthSessionCookies(res);
+        return res.status(401).json({ ok: false, error: 'Session signed out' });
       }
 
-      // 1) Fast path: verify durable HMAC-signed session token (works even after container restarts!)
-      const signedPayload = token ? verifySignedSessionToken(token) : null;
+      // 1) Fast path: verify durable HMAC-signed session token ONLY (no unsigned cache spoofing!)
+      const signedPayload = verifySignedSessionToken(token);
       if (signedPayload) {
+        if (isUserBanned(signedPayload.email, signedPayload.userId)) {
+          clearAuthSessionCookies(res);
+          return res.status(403).json({
+            ok: false,
+            banned: true,
+            error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          });
+        }
         const users = loadUsers();
         let user =
           users.find((u) => u.userId === signedPayload.userId) ||
-          users.find((u) => u.email === signedPayload.email);
+          users.find((u) => u.email.toLowerCase() === signedPayload.email.toLowerCase());
         if (!user) {
           user = {
             userId: signedPayload.userId,
@@ -10994,77 +12505,26 @@ Strict Video-Scan & Title Rules:
         });
       }
 
-      // 2) Legacy random hex session lookup
+      // 2) Active server-side session lookup
       const sessions = loadSessions();
-      const session = token ? sessions[token] : undefined;
+      const session = sessions[token];
       if (session && session.expiresAt >= Date.now()) {
         const users = loadUsers();
         const user = users.find((u) => u.userId === session.userId);
         if (user) {
+          if (isUserBanned(user.email, user.userId)) {
+            clearAuthSessionCookies(res);
+            return res.status(403).json({
+              ok: false,
+              banned: true,
+              error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+            });
+          }
           const upgradedToken = createSessionForUser(user);
           setAuthSessionCookies(res, upgradedToken, user);
           return res.json({
             ok: true,
             token: upgradedToken,
-            user: {
-              userId: user.userId,
-              name: user.name,
-              email: user.email,
-              provider: user.provider,
-              photoUrl: user.photoUrl
-            }
-          });
-        }
-      }
-
-      // 3) Seamless restoration from client's persisted user cache (`x-auth-user-cache` or `ttak_auth_user` cookie)
-      // when a Cloud Run instance cold-started or a legacy hex token was used before `ttak1.` tokens.
-      let cachedProfile: any = null;
-      if (rawUserCacheHeader) {
-        try {
-          cachedProfile = JSON.parse(Buffer.from(rawUserCacheHeader, 'base64').toString('utf-8'));
-        } catch {}
-      }
-      if (!cachedProfile && cookieUserJson) {
-        try {
-          cachedProfile = JSON.parse(cookieUserJson);
-        } catch {}
-      }
-      if (cachedProfile && typeof cachedProfile.userId === 'string' && typeof cachedProfile.email === 'string') {
-        const cleanUserId = cachedProfile.userId.trim();
-        const cleanEmail = cachedProfile.email.trim().toLowerCase();
-        if (cleanUserId && cleanEmail && !isSyntheticTestUser(cleanUserId, cleanEmail)) {
-          const users = loadUsers();
-          let user =
-            users.find((u) => u.userId === cleanUserId) ||
-            users.find((u) => u.email === cleanEmail);
-          if (!user) {
-            user = {
-              userId: cleanUserId,
-              name: String(cachedProfile.name || cleanEmail.split('@')[0] || 'Creator').trim(),
-              email: cleanEmail,
-              provider:
-                cachedProfile.provider === 'google' ||
-                cachedProfile.provider === 'email' ||
-                cachedProfile.provider === 'telegram'
-                  ? cachedProfile.provider
-                  : 'google',
-              photoUrl: typeof cachedProfile.photoUrl === 'string' ? cachedProfile.photoUrl : undefined,
-              createdAt: Date.now()
-            };
-            users.push(user);
-            saveUsers(users);
-            const balances = loadUserBalances();
-            if (!balances[user.userId]) {
-              balances[user.userId] = { credits: 0, activePlanId: 'free', lastUpdated: Date.now() };
-              saveUserBalances(balances);
-            }
-          }
-          const freshToken = createSessionForUser(user);
-          setAuthSessionCookies(res, freshToken, user);
-          return res.json({
-            ok: true,
-            token: freshToken,
             user: {
               userId: user.userId,
               name: user.name,

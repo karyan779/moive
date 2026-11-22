@@ -3,7 +3,7 @@ import {
   INITIAL_HISTORY_JOBS,
   FREE_DAILY_VIDEO_LIMIT,
   parsePersistedAuthUser,
-  encodeAuthUserCacheHeader,
+  getClientAuthHeaders,
   shouldAutoRedirectAuthenticatedRoot,
   type PersistedAuthUser,
   type CreditPlanId,
@@ -104,6 +104,7 @@ export default function App() {
   });
   const [signInModalOpen, setSignInModalOpen] = useState<boolean>(false);
   const [signInModalMode, setSignInModalMode] = useState<'signin' | 'signup'>('signup');
+  const [banNoticeMsg, setBanNoticeMsg] = useState<string>('');
 
   // Default directly to /app/free-recap with ?tab=history or ?tab=settings support
   const [currentRoute, setCurrentRoute] = useState<AppRoute>(() => {
@@ -190,24 +191,39 @@ export default function App() {
       return exchangeFirebaseUserForSession(fbUser);
     };
 
+    const handleBannedKickout = (msg?: string) => {
+      firebaseSignOut().catch(() => {});
+      clearClientAuthSession();
+      if (isMounted) {
+        setAuthUser(null);
+        setProCredits(0);
+        setActivePlanId('free');
+        setBanNoticeMsg(
+          msg || 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+        );
+        setSignInModalMode('signin');
+        setSignInModalOpen(true);
+      }
+    };
+
     const verifySession = async () => {
       const initialPersisted = readInitialPersistedSession();
       try {
         const token = initialPersisted.token;
-        const cachedUser = initialPersisted.user;
 
-        if (token || cachedUser) {
-          const headers: Record<string, string> = {};
-          if (token) {
-            headers.Authorization = `Bearer ${token}`;
-            headers['x-auth-token'] = token;
+        if (token) {
+          const headers: Record<string, string> = {
+            Authorization: `Bearer ${token}`,
+            'x-auth-token': token
+          };
+          const res = await fetch('/api/auth/me', { headers });
+          if (res.status === 403) {
+            const errData = await res.json().catch(() => ({}));
+            if (errData?.banned) {
+              handleBannedKickout(errData.error);
+              return;
+            }
           }
-          const cacheHeader = encodeAuthUserCacheHeader(cachedUser);
-          if (cacheHeader) {
-            headers['x-auth-user-cache'] = cacheHeader;
-          }
-          const query = token ? `?token=${encodeURIComponent(token)}` : '';
-          const res = await fetch(`/api/auth/me${query}`, { headers });
           if (res.ok) {
             const data = await res.json();
             if (isMounted && data.ok && data.user) {
@@ -217,23 +233,13 @@ export default function App() {
               return;
             }
           }
-
-          // If we already have a persisted user profile, keep them logged in across reloads
-          // and attempt a silent Firebase token refresh in the background
-          if (cachedUser) {
-            if (isMounted) {
-              setAuthUser(cachedUser);
-              setSignInModalOpen(false);
-            }
-            trySilentFirebaseRestore().catch(() => {});
-            return;
-          }
         }
 
         // Before asking the user to sign in, check if Firebase Auth already persists Google login
         const restored = await trySilentFirebaseRestore();
         if (restored) return;
 
+        clearClientAuthSession();
         if (isMounted) {
           setAuthUser(null);
           if (window.location.pathname !== '/admin') {
@@ -242,12 +248,7 @@ export default function App() {
           }
         }
       } catch {
-        // Network offline / server starting up: keep persisted user or try silent Firebase restore
-        if (initialPersisted.user && isMounted) {
-          setAuthUser(initialPersisted.user);
-          setSignInModalOpen(false);
-          return;
-        }
+        // Network offline / server starting up: try silent Firebase restore
         const restored = await trySilentFirebaseRestore();
         if (restored) return;
         if (isMounted && window.location.pathname !== '/admin') {
@@ -286,8 +287,25 @@ export default function App() {
     let isMounted = true;
     const syncCredits = async () => {
       try {
-        const res = await fetch(`/api/user/credits?userId=${encodeURIComponent(activeUserId)}`);
+        const res = await fetch(`/api/user/credits?userId=${encodeURIComponent(activeUserId)}`, {
+          headers: getClientAuthHeaders()
+        });
         const data = await res.json();
+        if (res.status === 403 && data?.banned) {
+          firebaseSignOut().catch(() => {});
+          clearClientAuthSession();
+          if (isMounted) {
+            setAuthUser(null);
+            setProCredits(0);
+            setActivePlanId('free');
+            setBanNoticeMsg(
+              data.error || 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+            );
+            setSignInModalMode('signin');
+            setSignInModalOpen(true);
+          }
+          return;
+        }
         if (isMounted && data.ok && typeof data.credits === 'number') {
           setProCredits(data.credits);
           if (typeof data.freeRemaining === 'number') {
@@ -383,14 +401,18 @@ export default function App() {
     }
   };
 
-  const handleSaveJob = (newJob: RecapJobRecord, creditCostUsed = 1) => {
+  const handleSaveJob = (
+    newJob: RecapJobRecord,
+    creditCostUsed = 1,
+    serverDeductedInfo?: { serverDeducted?: boolean; remainingCredits?: number }
+  ) => {
     setHistoryJobs((prev) => [newJob, ...prev]);
     if (currentRoute === '/app/free-recap') {
       setFreeRemaining((prev) => Math.max(0, prev - 1));
       if (activeUserId) {
         fetch('/api/user/free-usage', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
           body: JSON.stringify({ userId: activeUserId })
         })
           .then((r) => r.json())
@@ -402,13 +424,29 @@ export default function App() {
           .catch(() => {});
       }
     } else if (activeUserId) {
+      if (serverDeductedInfo?.serverDeducted) {
+        if (typeof serverDeductedInfo.remainingCredits === 'number') {
+          setProCredits(serverDeductedInfo.remainingCredits);
+        } else {
+          const deduction = Math.max(1, creditCostUsed);
+          setProCredits((prev) => Math.max(0, prev - deduction));
+        }
+        return;
+      }
       const deduction = Math.max(1, creditCostUsed);
       setProCredits((prev) => Math.max(0, prev - deduction));
       fetch('/api/user/deduct-credits', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
         body: JSON.stringify({ userId: activeUserId, amount: deduction })
-      }).catch(() => {});
+      })
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.ok && typeof d.credits === 'number') {
+            setProCredits(d.credits);
+          }
+        })
+        .catch(() => {});
     }
   };
 
@@ -431,6 +469,18 @@ export default function App() {
   if ((!authUser && currentRoute !== '/admin') || currentRoute === '/') {
     return (
       <>
+        {banNoticeMsg && (
+          <div className="fixed top-3 left-1/2 z-[120] -translate-x-1/2 max-w-md w-[92%] rounded-2xl border border-red-500/40 bg-red-950/95 px-4 py-3 text-xs font-bold text-red-100 shadow-2xl flex items-center justify-between gap-3">
+            <span>🚫 {banNoticeMsg}</span>
+            <button
+              type="button"
+              onClick={() => setBanNoticeMsg('')}
+              className="rounded-lg bg-red-500/20 px-2 py-1 text-[10px] hover:bg-red-500/30 cursor-pointer shrink-0"
+            >
+              OK
+            </button>
+          </div>
+        )}
         <SiteNotificationBanner uiLang={uiLang} />
         <LandingView
           onNavigate={(r) => {
@@ -503,12 +553,20 @@ export default function App() {
             uiLang={uiLang}
             proCredits={proCredits}
             activePlanId={activePlanId}
-            onDeductCredits={(amt) => {
+            onDeductCredits={(amt, serverDeductedInfo) => {
+              if (serverDeductedInfo?.serverDeducted) {
+                if (typeof serverDeductedInfo.remainingCredits === 'number') {
+                  setProCredits(serverDeductedInfo.remainingCredits);
+                } else {
+                  setProCredits((c) => Math.max(0, c - amt));
+                }
+                return;
+              }
               setProCredits((c) => Math.max(0, c - amt));
               if (activeUserId) {
                 fetch('/api/user/deduct-credits', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
                   body: JSON.stringify({ userId: activeUserId, amount: amt })
                 }).catch(() => {});
               }
@@ -540,8 +598,9 @@ export default function App() {
         {currentRoute === '/settings' && <SettingsView userEmail={userEmail} />}
         {currentRoute === '/admin' && (
           <AdminPanelView
-            userId={activeUserId || 'UID-ADMIN'}
-            userEmail={userEmail || 'admin@ttakmovierecap.com'}
+            userId={activeUserId}
+            userEmail={userEmail}
+            onOpenSignIn={() => handleOpenAuthModal('signin')}
             onAddUserCredits={(amt) => {
               setProCredits((c) => c + amt);
             }}

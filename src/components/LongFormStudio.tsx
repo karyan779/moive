@@ -16,6 +16,7 @@ import {
   VOICE_OPTIONS,
   calculateCreditCost,
   exportCuesToSrt,
+  getClientAuthHeaders,
   type LongFormStyleId,
   type VoiceGender,
   type SubtitleCue
@@ -168,7 +169,7 @@ export const LongFormStudio: React.FC<{ uiLang: 'my' | 'en' }> = ({ uiLang }) =>
       const selectedMode = OUTPUT_MODES.find((m) => m.id === outputMode) || OUTPUT_MODES[3];
       const res = await fetch('/api/recap/free/generate-assets', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getClientAuthHeaders() },
         body: JSON.stringify({
           durationSec: selectedMode.targetSec,
           mode: 'recap',
