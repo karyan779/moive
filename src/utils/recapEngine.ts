@@ -833,7 +833,7 @@ export function formatTimedSttSegments(
     .join('\n');
 }
 
-export function parseWorkersAiWhisperTimedResult(payload: unknown): string {
+export function parseWorkersAiWhisperTimedResult(payload: unknown, maxSegments = 120): string {
   const plain = parseWorkersAiWhisperResult(payload);
   if (!payload || typeof payload !== 'object') return plain;
   const data = payload as {
@@ -841,7 +841,7 @@ export function parseWorkersAiWhisperTimedResult(payload: unknown): string {
       segments?: Array<{ start?: unknown; end?: unknown; text?: unknown }>;
     };
   };
-  return formatTimedSttSegments(data.result?.segments, plain);
+  return formatTimedSttSegments(data.result?.segments, plain, maxSegments);
 }
 
 export type SttProviderOrder = ('user_groq' | 'workers_ai' | 'groq_pool')[];
@@ -1425,6 +1425,169 @@ export function parseTimedSttTranscriptToCues(
 }
 
 /**
+ * Finds timestamped Whisper STT segments (`[MM:SS - MM:SS] text`) that were missed/skipped
+ * by the LLM translator in Translate Captions-Only mode so a targeted repair pass can fill
+ * every missing line without re-translating already covered dialogue.
+ */
+export function findUncoveredTranscriptSegments(
+  timedTranscript: string | undefined | null,
+  existingCues: SubtitleCue[],
+  totalDurationSec: number
+): SubtitleCue[] {
+  if (!timedTranscript || typeof timedTranscript !== 'string' || !timedTranscript.trim()) {
+    return [];
+  }
+  const sourceCues = parseTimedSttTranscriptToCues(timedTranscript, totalDurationSec);
+  if (sourceCues.length === 0) return [];
+  if (!Array.isArray(existingCues) || existingCues.length === 0) {
+    return sourceCues;
+  }
+
+  const uncovered: SubtitleCue[] = [];
+  for (const seg of sourceCues) {
+    const cleanText = String(seg.text || '').trim();
+    if (!cleanText || /^[\s.,!?…\-~•♪♫]+$/.test(cleanText)) continue;
+
+    const segStart = seg.start_ms;
+    const segEnd = Math.max(segStart + 350, seg.end_ms);
+    const segMid = (segStart + segEnd) / 2;
+
+    const isCovered = existingCues.some((cue) => {
+      const cStart = Number(cue.start_ms) || 0;
+      const cEnd = Math.max(cStart + 250, Number(cue.end_ms) || cStart + 500);
+      // Direct time overlap or segment midpoint within ±650ms tolerance of an existing cue
+      const overlap = Math.min(segEnd, cEnd) - Math.max(segStart, cStart);
+      if (overlap >= 180) return true;
+      if (segMid >= cStart - 650 && segMid <= cEnd + 650) return true;
+      return false;
+    });
+
+    if (!isCovered) {
+      uncovered.push({
+        id: `missing-${uncovered.length + 1}`,
+        start_ms: segStart,
+        end_ms: segEnd,
+        text: cleanText
+      });
+    }
+  }
+  return uncovered;
+}
+
+/**
+ * Chronologically merges repaired/missing subtitle cues into existing Captions-Only cues
+ * with tight 20ms non-overlapping spacing so rapid lines stay locked to original speech.
+ */
+export function mergeMissingDialogueCues(
+  existingCues: SubtitleCue[],
+  repairedCues: SubtitleCue[],
+  totalDurationSec: number
+): SubtitleCue[] {
+  const totalMs = Math.max(4000, Math.round(totalDurationSec * 1000));
+  const combined = [...(existingCues || []), ...(repairedCues || [])]
+    .map((c, idx) => ({
+      ...c,
+      id: c.id || `cue-${idx + 1}`,
+      text: String(c.text || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim(),
+      start_ms: Math.max(0, Math.round(Number(c.start_ms) || 0)),
+      end_ms: Math.max(300, Math.round(Number(c.end_ms) || 0))
+    }))
+    .filter((c) => c.text.length > 0)
+    .sort((a, b) => a.start_ms - b.start_ms);
+
+  if (combined.length === 0) return [];
+
+  const result: SubtitleCue[] = [];
+  let cursorMs = 0;
+  for (let i = 0; i < combined.length; i++) {
+    const c = combined[i];
+    const nextStart = i + 1 < combined.length ? combined[i + 1].start_ms : totalMs;
+    const rawDur = Math.max(380, c.end_ms - c.start_ms);
+    const startMs = Math.max(cursorMs, Math.min(totalMs - 300, c.start_ms));
+    const maxEndBeforeNext = nextStart > startMs + 360 ? nextStart - 20 : totalMs;
+    const desiredEnd = Math.min(totalMs, Math.max(startMs + 320, startMs + rawDur));
+    const endMs = Math.min(desiredEnd, Math.max(startMs + 320, maxEndBeforeNext));
+
+    result.push({
+      ...c,
+      id: `cue-${i + 1}`,
+      start_ms: startMs,
+      end_ms: Math.min(totalMs, endMs)
+    });
+    cursorMs = Math.min(totalMs, endMs + 20);
+  }
+  return result;
+}
+
+const AIYA_SOURCE_REGEX = /(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)/i;
+const AIYA_INLINE_REPLACE_REGEX = /(?:哎呀呀|哎呀|啊呀|\bāiyā\b|\baiyā\b|\baiyah\b|\baiya\b)/gi;
+const AIYA_LEADING_SOURCE_REGEX = /^\s*[「“"'(（\[]*(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)/i;
+const AIYA_STANDALONE_SOURCE_REGEX =
+  /^\s*[「“"'(（\[]*(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)[」”"')）\]!！?？.,，。…~\s]*$/i;
+const GENERIC_LEADING_MY_EXCLAMATION_REGEX =
+  /^(\s*(?:-\s*)?)(?:ဟယ်|အိုး|အမလေး|အလိုလေး|အား|အာ|ဟာ|အို)([!！?？,၊…\s]*)/;
+
+/**
+ * Guarantees that Chinese/spoken "哎呀 (Āiyā / 啊呀)" dialogue interjections always render
+ * naturally as "အိုက်ယား" in Burmese captions/translations without altering unrelated lines.
+ */
+export function applyBurmeseDialogueExclamationRules(
+  cues: SubtitleCue[],
+  sourceTimedTranscript?: string | null,
+  targetLanguage: TargetLanguageCode = 'my'
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0 || targetLanguage !== 'my') {
+    return cues;
+  }
+
+  const aiyaSourceSegs = sourceTimedTranscript
+    ? parseTimedSttTranscriptToCues(sourceTimedTranscript, 10800).filter((seg) =>
+        AIYA_SOURCE_REGEX.test(seg.text)
+      )
+    : [];
+
+  return cues.map((cue) => {
+    let text = String(cue.text || '');
+    if (!text.trim()) return cue;
+
+    // 1) Replace any raw untranslated 哎呀 / Āiyā / Aiyah directly with အိုက်ယား
+    if (AIYA_INLINE_REPLACE_REGEX.test(text)) {
+      text = text.replace(AIYA_INLINE_REPLACE_REGEX, 'အိုက်ယား').replace(/\s+/g, ' ').trim();
+    }
+
+    // 2) Cross-check overlapping Whisper source segments containing 哎呀 (Āiyā)
+    if (aiyaSourceSegs.length > 0 && !text.includes('အိုက်ယား')) {
+      const cStart = Number(cue.start_ms) || 0;
+      const cEnd = Math.max(cStart + 300, Number(cue.end_ms) || cStart + 500);
+      const matchingSeg = aiyaSourceSegs.find((seg) => {
+        const overlap = Math.min(cEnd, seg.end_ms) - Math.max(cStart, seg.start_ms);
+        if (overlap >= 150) return true;
+        const segMid = (seg.start_ms + seg.end_ms) / 2;
+        return segMid >= cStart - 500 && segMid <= cEnd + 500;
+      });
+
+      if (matchingSeg) {
+        if (AIYA_STANDALONE_SOURCE_REGEX.test(matchingSeg.text)) {
+          if (text.length <= 16) {
+            text = 'အိုက်ယား!';
+          } else if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
+            text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
+          }
+        } else if (AIYA_LEADING_SOURCE_REGEX.test(matchingSeg.text)) {
+          if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
+            text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
+          } else {
+            text = `အိုက်ယား၊ ${text.replace(/^\s+/, '')}`;
+          }
+        }
+      }
+    }
+
+    return text === cue.text ? cue : { ...cue, text };
+  });
+}
+
+/**
  * Builds dedicated system instructions for:
  * - Cinematic Movie Dialogue Translation (`dub` & `captions-only`, or STT + AI Translation)
  * - Verbatim Original Speech Transcription (`sttMode === 'transcribe'`)
@@ -1459,17 +1622,20 @@ RULES:
 1. VERBATIM SPOKEN WORDS: Transcribe what the speakers actually say word-for-word cleanly with proper punctuation and exact timing [start_ms, end_ms].
 2. SILENCE & MUSIC GAPS: Only create cues when speech is actually heard; keep silent/music scenes empty.
 ${speakerRule}
-4. SHORT READABLE LINES: Keep each cue concise (1 readable subtitle line, 4 to 12 words).
+4. SHORT READABLE LINES: Keep each cue concise (1 readable subtitle line, 1 to 12 words). Never skip short spoken interjections.
 5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
   }
 
   const isCaptionsOnly = opts.translateAudio === 'captions-only';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- BURMESE EXCLAMATION GLOSSARY (STRICT): Whenever a character says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it naturally as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...") — NEVER skip it and NEVER replace it with formal/stiff words.`
       : '';
   const speakerNote = opts.speakerDiarization
     ? `\n- SPEAKER TURNS: When multiple characters exchange quick lines inside a cue or change speakers, mark speaker turns cleanly (e.g., "- ဘယ်သွားနေတာလဲ").`
+    : '';
+  const zeroSkipRule = isCaptionsOnly
+    ? `\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word exclamation (such as "哎呀", "等等", "什么?", "快走") from 0ms to the final second! NEVER skip, drop, compress, or summarize away ANY line from the audio, timestamped transcript, or burned-in on-screen subtitles.`
     : '';
 
   return `You are TTAK MOVIE RECAP's Senior Cinematic Movie Dialogue Translator (${isCaptionsOnly ? 'Subtitles / Captions-Only Mode' : 'Voice Dubbing Mode'}).
@@ -1477,8 +1643,8 @@ TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into ${langL
 CRITICAL ANTI-RECAP RULES (MUST OBEY):
 1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate what the characters are saying in first/second person as if they are speaking on screen!
 2. STRICTLY FORBIDDEN RECAP PHRASES: NEVER write third-person movie recap narrator commentary such as "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
-3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the timestamped Whisper transcript and audio speech. Keep silent/music gaps uncaptioned instead of inventing filler narration.${myanmarStyleGuide}${speakerNote}
-4. ${isCaptionsOnly ? 'CRISP MOVIE SUBTITLE LINES: Keep each cue concise (1 clean subtitle line, 4–12 words, 22–54 characters) so viewers read effortlessly while listening to original audio.' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
+3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the timestamped Whisper transcript and audio speech. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
+4. ${isCaptionsOnly ? 'CRISP MOVIE SUBTITLE LINES (INCLUDING SHORT LINES): Keep each cue to 1 clean subtitle line (1 to 12 words, up to 54 characters) so viewers read effortlessly while listening to original audio. ALWAYS keep short 1–3 word exclamations and replies as their own timed cues!' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
 5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
 }
 

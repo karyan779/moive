@@ -47,6 +47,9 @@ import {
   extractReadableGeminiErrorDetail,
   normalizeDialogueSubtitleCues,
   parseTimedSttTranscriptToCues,
+  findUncoveredTranscriptSegments,
+  mergeMissingDialogueCues,
+  applyBurmeseDialogueExclamationRules,
   buildCinematicTranslateSystemPrompt,
   extractJobIdFromVideoUrl,
   MAX_SAFE_BLOB_DOWNLOAD_BYTES,
@@ -1519,6 +1522,76 @@ test('Hybrid Dialogue Script Style registers cleanly with Burmese narrator + quo
   const synced = buildSyncedRecapCues(30, 'hybrid', 'my', 'Demo Clip');
   assert.ok(synced.cues.length >= 4);
   assert.ok(synced.cues.some((c) => c.text.includes('"')));
+});
+
+test('Translate Captions-Only helpers catch missed lines, preserve dense STT segments, merge cleanly, and enforce 哎呀 (Āiyā) -> အိုက်ယား', () => {
+  // 1) System prompt enforces Zero-Skip 100% coverage, 1-word short lines, and 哎呀 -> အိုက်ယား
+  const captionsPrompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'captions-only',
+    sttMode: 'translate'
+  });
+  assert.ok(captionsPrompt.includes('ZERO-SKIP 100% DIALOGUE COVERAGE'));
+  assert.ok(captionsPrompt.includes('1 to 12 words'));
+  assert.ok(captionsPrompt.includes('哎呀'));
+  assert.ok(captionsPrompt.includes('အိုက်ယား'));
+
+  // 2) Dense Whisper transcript (>120 segments) preserves every segment when maxSegments = 1000
+  const denseSegments = Array.from({ length: 185 }, (_, i) => ({
+    start: i * 1.5,
+    end: i * 1.5 + 1.2,
+    text: `台词 ${i + 1}`
+  }));
+  const fullTimed = formatTimedSttSegments(denseSegments, '', 1000);
+  assert.equal(fullTimed.split('\n').length, 185);
+
+  // 3) findUncoveredTranscriptSegments detects missed lines (including short 哎呀! exclamation)
+  const sourceTranscript = [
+    '[00:01 - 00:03] 你怎么回来了？',
+    '[00:05 - 00:06] 哎呀！',
+    '[00:10 - 00:13] 快点跟我走吧。',
+    '[00:18 - 00:20] 等等我！'
+  ].join('\n');
+  const partialTranslated = [
+    { id: 'cue-1', start_ms: 1000, end_ms: 3000, text: 'မင်း ဘယ်လိုပြန်ရောက်လာတာလဲ' },
+    { id: 'cue-2', start_ms: 10000, end_ms: 13000, text: 'ငါနဲ့ မြန်မြန်လိုက်ခဲ့ပါ' }
+  ];
+  const missed = findUncoveredTranscriptSegments(sourceTranscript, partialTranslated, 25);
+  assert.equal(missed.length, 2);
+  assert.equal(missed[0].text, '哎呀！');
+  assert.equal(missed[1].text, '等等我！');
+
+  // 4) mergeMissingDialogueCues inserts repaired cues chronologically without overlaps
+  const repaired = [
+    { id: 'rep-1', start_ms: 5000, end_ms: 6000, text: 'အိုက်ယား!' },
+    { id: 'rep-2', start_ms: 18000, end_ms: 20000, text: 'ငါ့ကို ခဏစောင့်ဦး!' }
+  ];
+  const merged = mergeMissingDialogueCues(partialTranslated, repaired, 25);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[1].text, 'အိုက်ယား!');
+  assert.equal(merged[3].text, 'ငါ့ကို ခဏစောင့်ဦး!');
+  for (let i = 1; i < merged.length; i++) {
+    assert.ok(merged[i].start_ms >= merged[i - 1].end_ms, 'Merged cues must not overlap');
+  }
+
+  // 5) applyBurmeseDialogueExclamationRules guarantees 哎呀 / Āiyā -> အိုက်ယား deterministically
+  const rawBurmeseCues = [
+    { id: 'cue-1', start_ms: 1000, end_ms: 3000, text: 'မင်း ဘယ်လိုပြန်ရောက်လာတာလဲ' },
+    { id: 'cue-2', start_ms: 5000, end_ms: 6000, text: 'ဟယ်!' },
+    { id: 'cue-3', start_ms: 7000, end_ms: 9000, text: '哎呀၊ မြန်မြန်လုပ်ပါ' },
+    { id: 'cue-4', start_ms: 11000, end_ms: 13000, text: 'Aiyah! နောက်ကျတော့မယ်' }
+  ];
+  const sourceWithAiya = [
+    '[00:01 - 00:03] 你怎么回来了？',
+    '[00:05 - 00:06] 哎呀！',
+    '[00:07 - 00:09] 哎呀，快点吧',
+    '[00:11 - 00:13] 哎呀，要迟到了'
+  ].join('\n');
+  const normalizedBurmese = applyBurmeseDialogueExclamationRules(rawBurmeseCues, sourceWithAiya, 'my');
+  assert.equal(normalizedBurmese[0].text, 'မင်း ဘယ်လိုပြန်ရောက်လာတာလဲ');
+  assert.equal(normalizedBurmese[1].text, 'အိုက်ယား!');
+  assert.equal(normalizedBurmese[2].text, 'အိုက်ယား၊ မြန်မြန်လုပ်ပါ');
+  assert.equal(normalizedBurmese[3].text, 'အိုက်ယား! နောက်ကျတော့မယ်');
 });
 
 

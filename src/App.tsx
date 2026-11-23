@@ -173,6 +173,22 @@ export default function App() {
           body: JSON.stringify({ idToken })
         });
         const gData = await gRes.json();
+        if (gRes.status === 403 && gData?.banned) {
+          firebaseSignOut().catch(() => {});
+          clearClientAuthSession();
+          if (isMounted) {
+            setAuthUser(null);
+            setProCredits(0);
+            setActivePlanId('free');
+            setBanNoticeMsg(
+              gData.error ||
+                'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
+            );
+            setSignInModalMode('signin');
+            setSignInModalOpen(true);
+          }
+          return false;
+        }
         if (gRes.ok && gData.ok && gData.user && gData.token) {
           persistClientAuthSession(gData.user, gData.token);
           if (isMounted) {
@@ -199,7 +215,8 @@ export default function App() {
         setProCredits(0);
         setActivePlanId('free');
         setBanNoticeMsg(
-          msg || 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          msg ||
+            'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         );
         setSignInModalMode('signin');
         setSignInModalOpen(true);
@@ -299,7 +316,8 @@ export default function App() {
             setProCredits(0);
             setActivePlanId('free');
             setBanNoticeMsg(
-              data.error || 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+              data.error ||
+                'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
             );
             setSignInModalMode('signin');
             setSignInModalOpen(true);

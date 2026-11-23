@@ -63,6 +63,9 @@ import {
   sliceTimedTranscriptForWindow,
   normalizeDialogueSubtitleCues,
   parseTimedSttTranscriptToCues,
+  findUncoveredTranscriptSegments,
+  mergeMissingDialogueCues,
+  applyBurmeseDialogueExclamationRules,
   buildCinematicTranslateSystemPrompt,
   groupCuesIntoTimedBlocks,
   resolveSttStrategyForMode,
@@ -2715,7 +2718,8 @@ async function executeWithGroqKeyPool<T>(
 async function transcribeWithDirectGroqKey(
   audioBuffer: Buffer,
   apiKey: string,
-  sttModel: SttEngineId = 'whisper-large-v3-turbo'
+  sttModel: SttEngineId = 'whisper-large-v3-turbo',
+  opts: { maxSegments?: number } = {}
 ): Promise<string> {
   const form = new FormData();
   const blob = new Blob([new Uint8Array(audioBuffer)], { type: 'audio/mpeg' });
@@ -2742,17 +2746,18 @@ async function transcribeWithDirectGroqKey(
     text?: string;
     segments?: Array<{ start?: number; end?: number; text?: string }>;
   };
-  return formatTimedSttSegments(data?.segments, String(data?.text || '').trim());
+  return formatTimedSttSegments(data?.segments, String(data?.text || '').trim(), opts.maxSegments ?? 120);
 }
 
 async function transcribeAudioWithGroqPool(
   audioBuffer: Buffer,
-  sttModel: SttEngineId = 'whisper-large-v3-turbo'
+  sttModel: SttEngineId = 'whisper-large-v3-turbo',
+  opts: { maxSegments?: number } = {}
 ): Promise<{ text: string; keyLabel: string } | null> {
   if (!audioBuffer || audioBuffer.length < 200) return null;
   try {
     const res = await executeWithGroqKeyPool(async (apiKey, keyRec) => {
-      const text = await transcribeWithDirectGroqKey(audioBuffer, apiKey, sttModel);
+      const text = await transcribeWithDirectGroqKey(audioBuffer, apiKey, sttModel, opts);
       return { text, keyLabel: keyRec.label };
     });
     return res?.result && res.result.text ? res.result : null;
@@ -2770,7 +2775,8 @@ function loadCloudflareWorkersAiConfig(): { accountId: string; apiToken: string 
 
 async function transcribeAudioWithWorkersAi(
   audioBuffer: Buffer,
-  sttModel: SttEngineId = 'whisper-large-v3-turbo'
+  sttModel: SttEngineId = 'whisper-large-v3-turbo',
+  opts: { maxSegments?: number; vadFilter?: boolean } = {}
 ): Promise<string | null> {
   const cfg = loadCloudflareWorkersAiConfig();
   if (!cfg || !audioBuffer || shouldSkipWorkersAiForPayloadSize(audioBuffer.length)) return null;
@@ -2785,7 +2791,7 @@ async function transcribeAudioWithWorkersAi(
       },
       body: JSON.stringify({
         audio: audioBuffer.toString('base64'),
-        vad_filter: true
+        vad_filter: opts.vadFilter ?? true
       }),
       signal: AbortSignal.timeout(22000)
     });
@@ -2795,7 +2801,7 @@ async function transcribeAudioWithWorkersAi(
       return null;
     }
     const json = await resp.json();
-    const parsedText = parseWorkersAiWhisperTimedResult(json);
+    const parsedText = parseWorkersAiWhisperTimedResult(json, opts.maxSegments ?? 120);
     return parsedText || null;
   } catch (err) {
     console.warn('[Workers AI STT] Request failed:', err);
@@ -3981,7 +3987,7 @@ async function startServer() {
           res.status(403).json({
             ok: false,
             banned: true,
-            error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+            error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
           });
           return;
         }
@@ -4822,19 +4828,22 @@ async function startServer() {
         Boolean(freeGroqKey),
         Boolean(loadCloudflareWorkersAiConfig())
       );
+      const sttOpts = isTranslateMode
+        ? { maxSegments: 1000, vadFilter: !isCaptionsOnlyMode }
+        : { maxSegments: 120, vadFilter: true };
       const runSttChain = async () => {
         for (const step of sttOrder) {
           if (groqTranscript) break;
           if (step === 'user_groq' && freeGroqKey) {
             try {
-              const t = await transcribeWithDirectGroqKey(extractedAudioBuffer!, freeGroqKey, sttModel);
+              const t = await transcribeWithDirectGroqKey(extractedAudioBuffer!, freeGroqKey, sttModel, sttOpts);
               if (t) {
                 groqTranscript = t;
                 sttProviderUsed = 'groq';
               }
             } catch {}
           } else if (step === 'workers_ai' && !isFreeMode) {
-            const cfText = await transcribeAudioWithWorkersAi(extractedAudioBuffer!, sttModel);
+            const cfText = await transcribeAudioWithWorkersAi(extractedAudioBuffer!, sttModel, sttOpts);
             if (cfText) {
               groqTranscript = cfText;
               sttProviderUsed = 'cloudflare-workers-ai';
@@ -4843,7 +4852,7 @@ async function startServer() {
             }
           } else if (step === 'groq_pool') {
             onProgress(53, 'Transcribing dialogue...');
-            const sttRes = await transcribeAudioWithGroqPool(extractedAudioBuffer!, sttModel);
+            const sttRes = await transcribeAudioWithGroqPool(extractedAudioBuffer!, sttModel, sttOpts);
             if (sttRes?.text) {
               groqTranscript = sttRes.text;
               sttProviderUsed = 'groq';
@@ -4910,7 +4919,7 @@ async function startServer() {
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
           : '';
-        const timeWindows = computeAudioScriptWindows(safeDuration, 75);
+        const timeWindows = computeAudioScriptWindows(safeDuration, isCaptionsOnlyMode ? 45 : 75);
 
         const extractVisualKeyframesForSegment = async (
           srcVideoPath: string | null,
@@ -4919,8 +4928,14 @@ async function startServer() {
           segTag: string,
           prioritizeEndingTail = true
         ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
-          if (!srcVideoPath || !fs.existsSync(srcVideoPath) || isTranslateMode) return [];
-          const plan = computeVisualKeyframePlan(segDurSec, prioritizeEndingTail ? 22 : 16, prioritizeEndingTail);
+          if (!srcVideoPath || !fs.existsSync(srcVideoPath)) return [];
+          if (isTranslateMode && (!isCaptionsOnlyMode || Boolean(isSttOnly))) return [];
+          const useLightCaptionsFrames = isCaptionsOnlyMode && !isSttOnly;
+          const plan = computeVisualKeyframePlan(
+            segDurSec,
+            useLightCaptionsFrames ? 10 : prioritizeEndingTail ? 22 : 16,
+            useLightCaptionsFrames ? false : prioritizeEndingTail
+          );
 
           const runKeyframePass = async (
             passName: string,
@@ -5102,6 +5117,14 @@ async function startServer() {
             : '';
 
           if (isTranslateMode) {
+            const captionsVisualHint =
+              isCaptionsOnlyMode && hasVisualKeyframes
+                ? `\n- BURNED-IN ON-SCREEN SUBTITLE CROSS-CHECK: Visual scene frames are attached so you can cross-read any burned-in original subtitles on screen alongside the spoken audio and Whisper transcript — if any spoken line was soft or masked by background music, capture and translate it too so ZERO lines are missed!`
+                : '';
+            const myanmarAiyaHint =
+              targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
+                ? `\n- BURMESE EXCLAMATION RULE: Whenever a character says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it naturally as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...").`
+                : '';
             return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
 Task: ${
@@ -5114,10 +5137,14 @@ Video Title / Filename: ${title || 'Movie Clip'}.
 ${winContext ? `Timestamped Source Speech Transcript for this segment (0ms to ${Math.round(winDurSec * 1000)}ms):\n${winContext}` : 'Listen carefully to the attached audio segment and transcribe/translate every spoken dialogue line at its exact timestamp.'}
 
 CRITICAL DIALOGUE & TIMING RULES:
-- ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).
-- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms). Leave non-dialogue/music pauses silent.
+- ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).${
+              isCaptionsOnlyMode
+                ? `\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE timestamped line in the transcript AND every spoken sentence/exclamation heard in the audio (including short 1–3 word reactions like "哎呀", "等等", "什么?", "好"). NEVER drop, skip, or omit ANY spoken line!`
+                : ''
+            }${captionsVisualHint}${myanmarAiyaHint}
+- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms). Leave truly silent/music-only pauses uncaptioned.
 - All timestamps (start_ms, end_ms) MUST be in MILLISECONDS and strictly increasing.
-- ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 4 to 12 words, 20 to 54 characters).' : phraseLengthRule}`;
+- ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 1 to 12 words, up to 54 characters). ALWAYS include short 1–3 word spoken lines!' : phraseLengthRule}`;
           }
 
           const isHybridDialogueStyle = scriptStyle === 'hybrid';
@@ -5423,8 +5450,9 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                 rawStart = Math.max(0, rawStart - winOffsetMs);
                 rawEnd = Math.max(rawStart + 800, rawEnd - winOffsetMs);
               }
-              const startMs = Math.max(0, Math.min(winDurMs - 400, rawStart || idx * 2500));
-              const endMs = Math.max(startMs + 800, Math.min(winDurMs, rawEnd || startMs + 2400));
+              const minCueDurMs = isCaptionsOnlyMode ? 400 : 800;
+              const startMs = Math.max(0, Math.min(winDurMs - 300, rawStart || idx * 2500));
+              const endMs = Math.max(startMs + minCueDurMs, Math.min(winDurMs, rawEnd || startMs + 2400));
               return {
                 id: `cue-w-${idx + 1}`,
                 start_ms: startMs,
@@ -5503,10 +5531,11 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
               );
               if (!winTranscript && winAudioBuffer) {
                 try {
+                  const winSttOpts = isTranslateMode ? { maxSegments: 1000 } : {};
                   if (freeGroqKey) {
-                    winTranscript = await transcribeWithDirectGroqKey(winAudioBuffer, freeGroqKey, sttModel);
+                    winTranscript = await transcribeWithDirectGroqKey(winAudioBuffer, freeGroqKey, sttModel, winSttOpts);
                   } else if (!isFreeMode) {
-                    const poolStt = await transcribeAudioWithGroqPool(winAudioBuffer, sttModel);
+                    const poolStt = await transcribeAudioWithGroqPool(winAudioBuffer, sttModel, winSttOpts);
                     if (poolStt?.text) winTranscript = poolStt.text;
                   }
                 } catch {}
@@ -5593,11 +5622,14 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             }
 
             if (stitchedCues.length > 0) {
-              let seamCursorMs = 60;
+              const seamGapMs = isCaptionsOnlyMode ? 20 : 90;
+              const minStitchedDurMs = isCaptionsOnlyMode ? 350 : 450;
+              const maxTotalMs = Math.round(safeDuration * 1000);
+              let seamCursorMs = isCaptionsOnlyMode ? 0 : 60;
               finalCues = stitchedCues.map((c, idx) => {
-                const s = Math.max(seamCursorMs, c.start_ms);
-                const e = Math.max(s + 450, c.end_ms);
-                seamCursorMs = e + 90;
+                const s = Math.max(seamCursorMs, Math.min(maxTotalMs - 300, c.start_ms));
+                const e = Math.min(maxTotalMs, Math.max(s + minStitchedDurMs, c.end_ms));
+                seamCursorMs = Math.min(maxTotalMs, e + seamGapMs);
                 return {
                   ...c,
                   id: `cue-${idx + 1}`,
@@ -5681,6 +5713,63 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             geminiFailureReason = 'No Gemini API Key configured';
           } else {
             geminiFailureReason = 'Gemini returned empty script or all keys exhausted quota';
+          }
+        }
+
+        // 2c. Captions-Only Missing-Line Coverage Audit & Targeted 1-to-1 Repair Pass
+        // If Whisper heard timestamped spoken segments that Gemini accidentally skipped, translate ONLY those missed lines and merge them cleanly!
+        if (
+          isCaptionsOnlyMode &&
+          !(isSttOnly && sttMode === 'transcribe') &&
+          usedLiveGemini &&
+          effectiveContext
+        ) {
+          try {
+            const uncoveredSegs = findUncoveredTranscriptSegments(
+              effectiveContext,
+              finalCues,
+              safeDuration
+            ).slice(0, 40);
+            if (uncoveredSegs.length > 0) {
+              onProgress(70, 'Filling missed subtitle lines...');
+              const repairLinesText = uncoveredSegs
+                .map((seg, idx) => `${idx + 1}. [${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.text}`)
+                .join('\n');
+              const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below into ${langLabel} (1-to-1, do NOT skip ANY line!).
+${targetLanguage === 'my' ? 'STRICT RULE: Whenever a line says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...").\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
+${repairLinesText}
+
+Return JSON { title: "${String(finalTitle || 'Captions').replace(/"/g, '')}", scriptText: "...", cues: [{ start_ms, end_ms, text }] } containing ALL ${uncoveredSegs.length} translated cues in the exact same order.`;
+              const repairResp = await invokeGeminiWithParts([{ text: repairPrompt }]);
+              if (repairResp?.text) {
+                const repairParsed = JSON.parse(repairResp.text);
+                if (Array.isArray(repairParsed?.cues) && repairParsed.cues.length > 0) {
+                  const repairedCues: SubtitleCue[] = repairParsed.cues
+                    .map((c: { start_ms?: number; end_ms?: number; text?: string }, idx: number) => {
+                      const fallbackSeg = uncoveredSegs[idx];
+                      const s = Number.isFinite(Number(c.start_ms))
+                        ? Math.max(0, Math.round(Number(c.start_ms)))
+                        : fallbackSeg?.start_ms ?? 0;
+                      const e = Number.isFinite(Number(c.end_ms))
+                        ? Math.max(s + 350, Math.round(Number(c.end_ms)))
+                        : fallbackSeg?.end_ms ?? s + 1200;
+                      return {
+                        id: `repaired-${idx + 1}`,
+                        start_ms: s,
+                        end_ms: e,
+                        text: String(c.text || '').trim()
+                      };
+                    })
+                    .filter((c: SubtitleCue) => c.text.length > 0);
+                  if (repairedCues.length > 0) {
+                    finalCues = mergeMissingDialogueCues(finalCues, repairedCues, safeDuration);
+                    finalScriptText = finalCues.map((c) => c.text).join(' ');
+                  }
+                }
+              }
+            }
+          } catch (repairErr) {
+            console.warn('[Captions-Only Repair] Skipped missing-line repair pass:', repairErr);
           }
         }
       } catch (err: any) {
@@ -5835,6 +5924,16 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
       }
     }
 
+    // Deterministic Burmese exclamation pass (哎呀 / Āiyā / 啊呀 -> အိုက်ယား) for Translate mode
+    if (isTranslateMode && targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')) {
+      finalCues = applyBurmeseDialogueExclamationRules(
+        finalCues,
+        effectiveTranscriptText || groqTranscript,
+        targetLanguage
+      );
+      finalScriptText = finalCues.map((c) => c.text).join(' ');
+    }
+
     // For Verbatim Original Speech STT mode, timed Whisper segments can satisfy cues directly if Gemini failed
     if (isSttOnly && sttMode === 'transcribe' && !usedLiveGemini && groqTranscript) {
       const parsedWhisperCues = parseTimedSttTranscriptToCues(groqTranscript, safeDuration);
@@ -5979,6 +6078,13 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
     finalCues = isTranslateMode
       ? normalizeDialogueSubtitleCues(splitCuesIntoShortPhrases(finalCues, 54), safeDuration)
       : splitCuesIntoShortPhrases(finalCues, 74);
+    if (isTranslateMode && targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')) {
+      finalCues = applyBurmeseDialogueExclamationRules(
+        finalCues,
+        effectiveTranscriptText || groqTranscript,
+        targetLanguage
+      );
+    }
     finalCues = finalCues.map((c) => ({ ...c, burmeseText: c.burmeseText || c.text }));
     finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
 
@@ -6186,7 +6292,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
       res.status(403).json({
         ok: false,
         banned: true,
-        error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။',
+        error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎',
         error_en: 'Your account has been permanently banned by the administrator.'
       });
       return;
@@ -10843,7 +10949,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -10883,7 +10989,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -10936,7 +11042,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -10999,7 +11105,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -11119,7 +11225,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12124,7 +12230,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12159,7 +12265,7 @@ Strict Video-Scan & Title Rules:
           return res.status(403).json({
             ok: false,
             banned: true,
-            error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+            error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
           });
         }
         let updated = false;
@@ -12214,7 +12320,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤ Email / Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
       if (!password || password.length < 6) {
@@ -12283,7 +12389,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤ Email / Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12300,7 +12406,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12391,7 +12497,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12421,7 +12527,7 @@ Strict Video-Scan & Title Rules:
         return res.status(403).json({
           ok: false,
           banned: true,
-          error: 'ဤအကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+          error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
         });
       }
 
@@ -12466,7 +12572,7 @@ Strict Video-Scan & Title Rules:
           return res.status(403).json({
             ok: false,
             banned: true,
-            error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+            error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
           });
         }
         const users = loadUsers();
@@ -12517,7 +12623,7 @@ Strict Video-Scan & Title Rules:
             return res.status(403).json({
               ok: false,
               banned: true,
-              error: 'သင့်အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။'
+              error: 'ဤ Gmail အကောင့်ကို Admin မှ အပြီးပိတ်ပင်ထားပါသည် (Account Permanently Banned)။ Creditများ Crack ထားလို့ အကောက်ကိုအပြီးပိုင်ပိတ်လိုက်ပါပြီး 😎😎😎'
             });
           }
           const upgradedToken = createSessionForUser(user);
