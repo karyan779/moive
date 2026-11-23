@@ -1574,24 +1574,37 @@ test('Translate Captions-Only helpers catch missed lines, preserve dense STT seg
     assert.ok(merged[i].start_ms >= merged[i - 1].end_ms, 'Merged cues must not overlap');
   }
 
-  // 5) applyBurmeseDialogueExclamationRules guarantees 哎呀 / Āiyā -> အိုက်ယား deterministically
+  // 5) applyBurmeseDialogueExclamationRules: ONLY literal 哎呀 (Āiyā) -> အိုက်ယား; never leaks onto split/neighbor/other lines
   const rawBurmeseCues = [
     { id: 'cue-1', start_ms: 1000, end_ms: 3000, text: 'မင်း ဘယ်လိုပြန်ရောက်လာတာလဲ' },
     { id: 'cue-2', start_ms: 5000, end_ms: 6000, text: 'ဟယ်!' },
-    { id: 'cue-3', start_ms: 7000, end_ms: 9000, text: '哎呀၊ မြန်မြန်လုပ်ပါ' },
-    { id: 'cue-4', start_ms: 11000, end_ms: 13000, text: 'Aiyah! နောက်ကျတော့မယ်' }
+    { id: 'cue-3', start_ms: 7000, end_ms: 8500, text: '哎呀၊ မြန်မြန်လုပ်ပါ' },
+    // Second split chunk of the [00:07 - 00:10] segment — must NOT get duplicated အိုက်ယား!
+    { id: 'cue-4', start_ms: 8520, end_ms: 10000, text: 'ငါတို့ နောက်ကျတော့မယ်' },
+    { id: 'cue-5', start_ms: 11000, end_ms: 13000, text: 'Āiyā! ဘယ်လိုဖြစ်တာလဲ' },
+    // Non-哎呀 exclamations (天啊 / 啊呀 / 哇) — must NEVER become အိုက်ယား!
+    { id: 'cue-6', start_ms: 14000, end_ms: 16000, text: 'အိုက်ယား၊ မြန်မြန်ပြေးတော့!' },
+    { id: 'cue-7', start_ms: 17000, end_ms: 18500, text: 'ဟယ်၊ နာလိုက်တာ' },
+    { id: 'cue-8', start_ms: 19000, end_ms: 20500, text: 'အိုက်ယား!' }
   ];
   const sourceWithAiya = [
     '[00:01 - 00:03] 你怎么回来了？',
     '[00:05 - 00:06] 哎呀！',
-    '[00:07 - 00:09] 哎呀，快点吧',
-    '[00:11 - 00:13] 哎呀，要迟到了'
+    '[00:07 - 00:10] 哎呀，快点吧，我们要迟到了',
+    '[00:11 - 00:13] 哎呀，怎么回事',
+    '[00:14 - 00:16] 天啊，快跑吧！',
+    '[00:17 - 00:18] 啊呀，真疼！',
+    '[00:19 - 00:20] 哇！'
   ].join('\n');
   const normalizedBurmese = applyBurmeseDialogueExclamationRules(rawBurmeseCues, sourceWithAiya, 'my');
   assert.equal(normalizedBurmese[0].text, 'မင်း ဘယ်လိုပြန်ရောက်လာတာလဲ');
   assert.equal(normalizedBurmese[1].text, 'အိုက်ယား!');
   assert.equal(normalizedBurmese[2].text, 'အိုက်ယား၊ မြန်မြန်လုပ်ပါ');
-  assert.equal(normalizedBurmese[3].text, 'အိုက်ယား! နောက်ကျတော့မယ်');
+  assert.equal(normalizedBurmese[3].text, 'ငါတို့ နောက်ကျတော့မယ်');
+  assert.equal(normalizedBurmese[4].text, 'အိုက်ယား! ဘယ်လိုဖြစ်တာလဲ');
+  assert.equal(normalizedBurmese[5].text, 'မြန်မြန်ပြေးတော့!');
+  assert.equal(normalizedBurmese[6].text, 'ဟယ်၊ နာလိုက်တာ');
+  assert.equal(normalizedBurmese[7].text, 'ဝိုး!');
 });
 
 

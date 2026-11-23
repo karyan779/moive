@@ -5123,7 +5123,7 @@ async function startServer() {
                 : '';
             const myanmarAiyaHint =
               targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
-                ? `\n- BURMESE EXCLAMATION RULE: Whenever a character says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it naturally as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...").`
+                ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
                 : '';
             return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
@@ -5139,7 +5139,7 @@ ${winContext ? `Timestamped Source Speech Transcript for this segment (0ms to ${
 CRITICAL DIALOGUE & TIMING RULES:
 - ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).${
               isCaptionsOnlyMode
-                ? `\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE timestamped line in the transcript AND every spoken sentence/exclamation heard in the audio (including short 1–3 word reactions like "哎呀", "等等", "什么?", "好"). NEVER drop, skip, or omit ANY spoken line!`
+                ? `\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE timestamped line in the transcript AND every spoken sentence/reaction heard in the audio (including short 1–3 word reactions like "等等", "什么?", "好", "快走"). NEVER drop, skip, or omit ANY spoken line!`
                 : ''
             }${captionsVisualHint}${myanmarAiyaHint}
 - Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms). Leave truly silent/music-only pauses uncaptioned.
@@ -5736,7 +5736,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                 .map((seg, idx) => `${idx + 1}. [${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.text}`)
                 .join('\n');
               const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below into ${langLabel} (1-to-1, do NOT skip ANY line!).
-${targetLanguage === 'my' ? 'STRICT RULE: Whenever a line says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...").\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
+${targetLanguage === 'my' ? 'STRICT RULE: ONLY when a line literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation or line.\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
 ${repairLinesText}
 
 Return JSON { title: "${String(finalTitle || 'Captions').replace(/"/g, '')}", scriptText: "...", cues: [{ start_ms, end_ms, text }] } containing ALL ${uncoveredSegs.length} translated cues in the exact same order.`;

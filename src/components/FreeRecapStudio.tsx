@@ -414,6 +414,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   // Settings Inspector State
   const [mode, setMode] = useState<RecapMode>('recap');
   const [translateAudio, setTranslateAudio] = useState<TranslateAudioMode>('dub');
+  const [translationEngine, setTranslationEngine] = useState<'gemini' | 'whisper'>('gemini');
   const [voiceGender, setVoiceGender] = useState<VoiceGender>('male');
   const [scriptStyle, setScriptStyle] = useState<ScriptStyleId>('narrator');
   const [aspectRatio, setAspectRatio] = useState<AspectRatioMode>('original');
@@ -873,6 +874,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setVideoDuration(job.durationSec);
     setMode(job.mode);
     setTranslateAudio(job.translateAudio || 'dub');
+    setTranslationEngine(job.isSttOnly ? 'whisper' : 'gemini');
     setScriptStyle(job.scriptStyle);
     setTargetLanguage(job.targetLanguage);
     setVoiceGender(
@@ -1010,6 +1012,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         durationSec: safeDur,
         mode,
         translateAudio,
+        isSttOnly: mode === 'translate' && translationEngine === 'whisper',
+        sttMode: translationEngine === 'whisper' ? 'transcribe' : 'translate',
         scriptStyle,
         targetLanguage,
         voiceGender,
@@ -1219,6 +1223,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         resolution: effects.outputHD ? '1080p' : '720p',
         mode,
         translateAudio: mode === 'translate' ? translateAudio : undefined,
+        isSttOnly: mode === 'translate' && translationEngine === 'whisper',
+        sttMode: translationEngine === 'whisper' ? 'transcribe' : 'translate',
         scriptStyle,
         targetLanguage,
         voiceGender,
@@ -2111,28 +2117,49 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     />
                   </div>
 
-                  {/* Audio (when Translate is selected) */}
+                  {/* Audio & Translation Engine (when Translate is selected) */}
                   {mode === 'translate' && (
-                    <div className="flex flex-col gap-1.5 border-t border-stone-200/70 pt-3 dark:border-slate-800">
-                      <DottedTooltipLabel
-                        label="Audio mode"
-                        tooltip="Dub translates voices into your language. Captions only keeps original audio and adds subtitles."
-                      />
-                      <SlidingPillToggle
-                        options={[
-                          { value: 'dub', label: 'Dub' },
-                          { value: 'captions-only', label: 'Captions only' }
-                        ]}
-                        value={translateAudio}
-                        onChange={(val) => {
-                          playUiSound('select');
-                          setTranslateAudio(val);
-                          if (val === 'captions-only') {
-                            setSubtitleConfig({ ...subtitleConfig, enabled: true });
-                          }
-                        }}
-                      />
-                    </div>
+                    <>
+                      <div className="flex flex-col gap-1.5 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                        <DottedTooltipLabel
+                          label="Audio mode"
+                          tooltip="Dub translates voices into your language. Captions only keeps original audio and adds subtitles."
+                        />
+                        <SlidingPillToggle
+                          options={[
+                            { value: 'dub', label: 'Dub' },
+                            { value: 'captions-only', label: 'Captions only' }
+                          ]}
+                          value={translateAudio}
+                          onChange={(val) => {
+                            playUiSound('select');
+                            setTranslateAudio(val);
+                            if (val === 'captions-only') {
+                              setSubtitleConfig({ ...subtitleConfig, enabled: true });
+                            }
+                          }}
+                        />
+                      </div>
+                      {translateAudio === 'captions-only' && (
+                        <div className="flex flex-col gap-1.5 border-t border-stone-200/70 pt-3 dark:border-slate-800">
+                          <DottedTooltipLabel
+                            label="Captions Engine (Whisper / Gemini)"
+                            tooltip="Choose Whisper for direct speech-to-text transcription or Gemini AI for cinematic translation."
+                          />
+                          <SlidingPillToggle
+                            options={[
+                              { value: 'gemini', label: 'Gemini AI Translation' },
+                              { value: 'whisper', label: 'Whisper STT Only' }
+                            ]}
+                            value={translationEngine}
+                            onChange={(val) => {
+                              playUiSound('select');
+                              setTranslationEngine(val);
+                            }}
+                          />
+                        </div>
+                      )}
+                    </>
                   )}
 
                   {/* Voice Selector (Free Mode = Thiha & Nilar; Credit Mode = All 10 Voices) */}

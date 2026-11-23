@@ -201,6 +201,8 @@ export interface RecapJobRecord {
   effects: AntiCopyrightEffects;
   editConfig?: DeepRecapEditConfig;
   autoFlowLogs: AutoFlowLogStep[];
+  isSttOnly?: boolean;
+  sttMode?: 'transcribe' | 'translate';
 }
 
 export interface ScriptStylePromptDefinition {
@@ -1519,17 +1521,26 @@ export function mergeMissingDialogueCues(
   return result;
 }
 
-const AIYA_SOURCE_REGEX = /(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)/i;
-const AIYA_INLINE_REPLACE_REGEX = /(?:哎呀呀|哎呀|啊呀|\bāiyā\b|\baiyā\b|\baiyah\b|\baiya\b)/gi;
-const AIYA_LEADING_SOURCE_REGEX = /^\s*[「“"'(（\[]*(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)/i;
+const AIYA_SOURCE_REGEX =
+  /(?:哎呀|(?<![A-Za-z\u00C0-\u024F])(?:āiyā|aiyā|aiya)(?![A-Za-z\u00C0-\u024F]))/i;
+const AIYA_INLINE_REPLACE_REGEX =
+  /(?:哎呀|(?<![A-Za-z\u00C0-\u024F])(?:āiyā|aiyā|aiya)(?![A-Za-z\u00C0-\u024F]))/gi;
+const AIYA_LEADING_SOURCE_REGEX =
+  /^\s*[「“"'(（\[]*(?:哎呀|(?:āiyā|aiyā|aiya)(?![A-Za-z\u00C0-\u024F]))/i;
 const AIYA_STANDALONE_SOURCE_REGEX =
-  /^\s*[「“"'(（\[]*(?:哎呀呀|哎呀|啊呀|āiyā|aiyā|aiyah|aiya)[」”"')）\]!！?？.,，。…~\s]*$/i;
+  /^\s*[「“"'(（\[]*(?:哎呀|āiyā|aiyā|aiya)[」”"')）\]!！?？.,，。…~\s]*$/i;
+const AIYA_SOUND_GUARD_REGEX = /(?:哎|呀|āiyā|aiyā|aiya)/i;
 const GENERIC_LEADING_MY_EXCLAMATION_REGEX =
   /^(\s*(?:-\s*)?)(?:ဟယ်|အိုး|အမလေး|အလိုလေး|အား|အာ|ဟာ|အို)([!！?？,၊…\s]*)/;
+const GENERIC_STANDALONE_MY_EXCLAMATION_REGEX =
+  /^\s*(?:-\s*)?(?:ဟယ်|အိုး|အမလေး|အလိုလေး|အား|အာ|ဟာ|အို)[!！?？,၊…~\s]*$/;
+const LEADING_AIYA_MY_WITH_BODY_REGEX = /^(\s*(?:-\s*)?)အိုက်ယား[!！?？,၊…\s]+(.+)$/;
+const STANDALONE_AIYA_MY_REGEX = /^\s*(?:-\s*)?အိုက်ယား[!！?？,၊…~\s]*$/;
 
 /**
- * Guarantees that Chinese/spoken "哎呀 (Āiyā / 啊呀)" dialogue interjections always render
- * naturally as "အိုက်ယား" in Burmese captions/translations without altering unrelated lines.
+ * Guarantees that ONLY literal "哎呀 (Āiyā)" dialogue interjections render as "အိုက်ယား"
+ * in Burmese captions/translations — prevents leaking onto split/adjacent cues and strips
+ * falsely hallucinated "အိုက်ယား" on non-"哎呀" lines.
  */
 export function applyBurmeseDialogueExclamationRules(
   cues: SubtitleCue[],
@@ -1540,44 +1551,46 @@ export function applyBurmeseDialogueExclamationRules(
     return cues;
   }
 
-  const aiyaSourceSegs = sourceTimedTranscript
-    ? parseTimedSttTranscriptToCues(sourceTimedTranscript, 10800).filter((seg) =>
-        AIYA_SOURCE_REGEX.test(seg.text)
-      )
+  const sourceSegments = sourceTimedTranscript
+    ? parseTimedSttTranscriptToCues(sourceTimedTranscript, 10800)
     : [];
 
-  return cues.map((cue) => {
+  // Step 1: Replace raw untranslated "哎呀" / "Āiyā" directly with "အိုက်ယား",
+  // and strip hallucinated "အိုက်ယား" when overlapping Whisper speech clearly has NO 哎呀.
+  const working: SubtitleCue[] = cues.map((cue) => {
     let text = String(cue.text || '');
     if (!text.trim()) return cue;
 
-    // 1) Replace any raw untranslated 哎呀 / Āiyā / Aiyah directly with အိုက်ယား
     if (AIYA_INLINE_REPLACE_REGEX.test(text)) {
       text = text.replace(AIYA_INLINE_REPLACE_REGEX, 'အိုက်ယား').replace(/\s+/g, ' ').trim();
     }
 
-    // 2) Cross-check overlapping Whisper source segments containing 哎呀 (Āiyā)
-    if (aiyaSourceSegs.length > 0 && !text.includes('အိုက်ယား')) {
+    if (sourceSegments.length > 0 && text.includes('အိုက်ယား')) {
       const cStart = Number(cue.start_ms) || 0;
       const cEnd = Math.max(cStart + 300, Number(cue.end_ms) || cStart + 500);
-      const matchingSeg = aiyaSourceSegs.find((seg) => {
-        const overlap = Math.min(cEnd, seg.end_ms) - Math.max(cStart, seg.start_ms);
-        if (overlap >= 150) return true;
-        const segMid = (seg.start_ms + seg.end_ms) / 2;
-        return segMid >= cStart - 500 && segMid <= cEnd + 500;
+      const nearbySegs = sourceSegments.filter((seg) => {
+        const overlap = Math.min(cEnd + 500, seg.end_ms) - Math.max(cStart - 500, seg.start_ms);
+        return overlap > 0;
       });
-
-      if (matchingSeg) {
-        if (AIYA_STANDALONE_SOURCE_REGEX.test(matchingSeg.text)) {
-          if (text.length <= 16) {
-            text = 'အိုက်ယား!';
-          } else if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
-            text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
-          }
-        } else if (AIYA_LEADING_SOURCE_REGEX.test(matchingSeg.text)) {
-          if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
-            text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
+      if (nearbySegs.length > 0 && !nearbySegs.some((seg) => AIYA_SOUND_GUARD_REGEX.test(seg.text))) {
+        const combinedSrc = nearbySegs.map((s) => s.text).join(' ');
+        if (LEADING_AIYA_MY_WITH_BODY_REGEX.test(text)) {
+          text = text.replace(LEADING_AIYA_MY_WITH_BODY_REGEX, '$1$2').trim();
+        } else if (STANDALONE_AIYA_MY_REGEX.test(text)) {
+          if (/(?:天啊|天哪|我的天)/i.test(combinedSrc)) {
+            text = 'ဘုရားရေ!';
+          } else if (/(?:糟糕|完了)/i.test(combinedSrc)) {
+            text = 'ဒုက္ခပဲ!';
+          } else if (/哇/i.test(combinedSrc)) {
+            text = 'ဝိုး!';
+          } else if (/(?:喂|嘿)/i.test(combinedSrc)) {
+            text = 'ဟေ့!';
+          } else if (/哦/i.test(combinedSrc)) {
+            text = 'အိုး!';
+          } else if (/啊/i.test(combinedSrc)) {
+            text = 'အာ!';
           } else {
-            text = `အိုက်ယား၊ ${text.replace(/^\s+/, '')}`;
+            text = 'ဟာ!';
           }
         }
       }
@@ -1585,6 +1598,80 @@ export function applyBurmeseDialogueExclamationRules(
 
     return text === cue.text ? cue : { ...cue, text };
   });
+
+  // Step 2: 1-to-1 exact match ONLY for literal "哎呀" (Āiyā) source segments.
+  // Each source segment can update AT MOST ONE cue (the cue whose start_ms aligns with the start
+  // of the segment), and is skipped if any overlapping cue already has "အိုက်ယား".
+  const aiyaSourceSegs = sourceSegments.filter((seg) => AIYA_SOURCE_REGEX.test(seg.text));
+  if (aiyaSourceSegs.length === 0) {
+    return working;
+  }
+
+  for (const seg of aiyaSourceSegs) {
+    const overlappingIndices: number[] = [];
+    for (let i = 0; i < working.length; i++) {
+      const c = working[i];
+      const cStart = Number(c.start_ms) || 0;
+      const cEnd = Math.max(cStart + 300, Number(c.end_ms) || cStart + 500);
+      const overlap = Math.min(cEnd, seg.end_ms) - Math.max(cStart, seg.start_ms);
+      if (overlap >= 150) {
+        overlappingIndices.push(i);
+      }
+    }
+
+    if (overlappingIndices.length === 0) {
+      for (let i = 0; i < working.length; i++) {
+        const c = working[i];
+        const cStart = Number(c.start_ms) || 0;
+        const cEnd = Math.max(cStart + 300, Number(c.end_ms) || cStart + 500);
+        const segMid = (seg.start_ms + seg.end_ms) / 2;
+        if (segMid >= cStart - 300 && segMid <= cEnd + 300) {
+          overlappingIndices.push(i);
+        }
+      }
+    }
+
+    if (overlappingIndices.length === 0) continue;
+    // Already rendered as အိုက်ယား in one of the cues covering this segment — never duplicate onto split chunks!
+    if (overlappingIndices.some((idx) => String(working[idx].text || '').includes('အိုက်ယား'))) {
+      continue;
+    }
+
+    // Pick ONLY the single cue whose start_ms aligns closest to the start of the 哎呀 segment
+    let bestIdx = -1;
+    let bestStartDiff = Infinity;
+    for (const idx of overlappingIndices) {
+      const cStart = Number(working[idx].start_ms) || 0;
+      const diff = Math.abs(cStart - seg.start_ms);
+      if (diff < bestStartDiff) {
+        bestStartDiff = diff;
+        bestIdx = idx;
+      }
+    }
+    if (bestIdx < 0 || bestStartDiff > 900) continue;
+
+    const targetCue = working[bestIdx];
+    let text = String(targetCue.text || '');
+    if (AIYA_STANDALONE_SOURCE_REGEX.test(seg.text)) {
+      if (GENERIC_STANDALONE_MY_EXCLAMATION_REGEX.test(text)) {
+        text = 'အိုက်ယား!';
+      } else if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
+        text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
+      }
+    } else if (AIYA_LEADING_SOURCE_REGEX.test(seg.text)) {
+      if (GENERIC_LEADING_MY_EXCLAMATION_REGEX.test(text)) {
+        text = text.replace(GENERIC_LEADING_MY_EXCLAMATION_REGEX, '$1အိုက်ယား$2');
+      } else {
+        text = `အိုက်ယား၊ ${text.replace(/^\s+/, '')}`;
+      }
+    }
+
+    if (text !== targetCue.text) {
+      working[bestIdx] = { ...targetCue, text };
+    }
+  }
+
+  return working;
 }
 
 /**
@@ -1629,13 +1716,13 @@ ${speakerRule}
   const isCaptionsOnly = opts.translateAudio === 'captions-only';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- BURMESE EXCLAMATION GLOSSARY (STRICT): Whenever a character says "哎呀" (Āiyā / Aiyah / 哎呀呀 / 啊呀), ALWAYS translate it naturally as "အိုက်ယား" (e.g., "အိုက်ယား!" or "အိုက်ယား၊ ...") — NEVER skip it and NEVER replace it with formal/stiff words.`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!`
       : '';
   const speakerNote = opts.speakerDiarization
     ? `\n- SPEAKER TURNS: When multiple characters exchange quick lines inside a cue or change speakers, mark speaker turns cleanly (e.g., "- ဘယ်သွားနေတာလဲ").`
     : '';
   const zeroSkipRule = isCaptionsOnly
-    ? `\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word exclamation (such as "哎呀", "等等", "什么?", "快走") from 0ms to the final second! NEVER skip, drop, compress, or summarize away ANY line from the audio, timestamped transcript, or burned-in on-screen subtitles.`
+    ? `\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word reaction (such as "等等", "什么?", "快走", "好") from 0ms to the final second! NEVER skip, drop, compress, or summarize away ANY line from the audio, timestamped transcript, or burned-in on-screen subtitles.`
     : '';
 
   return `You are TTAK MOVIE RECAP's Senior Cinematic Movie Dialogue Translator (${isCaptionsOnly ? 'Subtitles / Captions-Only Mode' : 'Voice Dubbing Mode'}).
