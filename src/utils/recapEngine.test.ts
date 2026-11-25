@@ -72,7 +72,22 @@ import {
   selectWatermarkFreeTikTokStreams,
   extractDouyinAwemeId,
   normalizeDouyinPlayUrlToNoWatermark,
-  extractDouyinVideoInfoFromHtml
+  extractDouyinVideoInfoFromHtml,
+  clampTimedOverlayRange,
+  isTimedOverlayActiveAtTime,
+  parseTimecodeToSeconds,
+  formatTimedOverlaySec,
+  createDefaultTimedBlur,
+  createDefaultTimedText,
+  buildTimedBlurEnableExpr,
+  sanitizeTimedTextForAss,
+  COLOR_SHIFT_PRESETS,
+  resolveAllowedColorShiftPresetId,
+  resolveColorShiftPreset,
+  isTimedOverlayFeatureAllowed,
+  isCompleteTimecodeInput,
+  formatBurmeseCaptionsOnlyPunctuation,
+  applyBurmeseCaptionsOnlyPunctuation
 } from './recapEngine.ts';
 
 test('formatDuration formats seconds into M:SS and H:MM:SS', () => {
@@ -1843,9 +1858,116 @@ test('TikTok & Douyin resolvers strictly exclude watermarked streams and rewrite
   );
 });
 
+test('Copyright Settings Timed Blur & Timed Text helpers enforce exact time windows on a 4:00 video and sanitize FFmpeg/ASS outputs', () => {
+  // 4:00 (240s) video with first 10 seconds timed blur
+  const introBlur = createDefaultTimedBlur(240, 0, 0);
+  assert.equal(introBlur.startSec, 0);
+  assert.equal(introBlur.endSec, 10);
+  assert.equal(isTimedOverlayActiveAtTime(introBlur, 0), true);
+  assert.equal(isTimedOverlayActiveAtTime(introBlur, 5.2), true);
+  assert.equal(isTimedOverlayActiveAtTime(introBlur, 10), true);
+  assert.equal(isTimedOverlayActiveAtTime(introBlur, 10.5), false);
+  assert.equal(isTimedOverlayActiveAtTime(introBlur, 235), false);
 
+  // Short 6s video clamps default 10s span down to 6s
+  const shortText = createDefaultTimedText(6, 0, 0);
+  assert.equal(shortText.startSec, 0);
+  assert.equal(shortText.endSec, 6);
 
+  // Range clamping handles reversed/overflowing inputs cleanly
+  assert.deepEqual(clampTimedOverlayRange(-5, 999, 240), { startSec: 0, endSec: 240 });
+  assert.deepEqual(clampTimedOverlayRange(30, 20, 240), { startSec: 30, endSec: 30.5 });
 
+  // Timecode parser & formatter
+  assert.equal(parseTimecodeToSeconds('0:10', 240), 10);
+  assert.equal(parseTimecodeToSeconds('1:30', 240), 90);
+  assert.equal(parseTimecodeToSeconds('4:00', 240), 240);
+  assert.equal(parseTimecodeToSeconds('12.5', 240), 12.5);
+  assert.equal(parseTimecodeToSeconds('bad', 240), null);
+  assert.equal(formatTimedOverlaySec(0), '0:00');
+  assert.equal(formatTimedOverlaySec(10), '0:10');
+  assert.equal(formatTimedOverlaySec(240), '4:00');
 
+  // FFmpeg enable expression & ASS Burmese text sanitization
+  assert.equal(buildTimedBlurEnableExpr(0, 10), 'between(t,0.00,10.00)');
+  assert.equal(buildTimedBlurEnableExpr(15.5, 42.25), 'between(t,15.50,42.25)');
+  assert.equal(
+    sanitizeTimedTextForAss('{\\pos(0,0)}အပိုင်း (၁)\nမြန်မာစာတန်းထိုး'),
+    '\\pos(0,0)အပိုင်း (၁)\\Nမြန်မာစာတန်းထိုး'
+  );
+});
 
+test('10 Color Shift presets enforce 1 Free preset (vivid) and 9 Credit-Only presets, plus Credit-Only Timed Overlays & direct 0:11 entry', () => {
+  // Exactly 10 unique presets
+  assert.equal(COLOR_SHIFT_PRESETS.length, 10);
+  const uniqueIds = new Set(COLOR_SHIFT_PRESETS.map((p) => p.id));
+  assert.equal(uniqueIds.size, 10);
+
+  // Strictly 1 preset allowed in Free Mode (vivid), 9 Credit Mode Only
+  const freePresets = COLOR_SHIFT_PRESETS.filter((p) => p.freeAllowed);
+  const creditOnlyPresets = COLOR_SHIFT_PRESETS.filter((p) => !p.freeAllowed);
+  assert.equal(freePresets.length, 1);
+  assert.equal(freePresets[0].id, 'vivid');
+  assert.equal(creditOnlyPresets.length, 9);
+
+  // Every preset has non-empty CSS filter, safe FFmpeg filter, and swatch gradient
+  for (const preset of COLOR_SHIFT_PRESETS) {
+    assert.ok(preset.cssFilter.length > 5, `Preset ${preset.id} missing cssFilter`);
+    assert.ok(preset.ffmpegFilter.length > 5, `Preset ${preset.id} missing ffmpegFilter`);
+    assert.ok(preset.swatchGradient.includes('gradient'), `Preset ${preset.id} missing swatchGradient`);
+    // Free Mode always forces 'vivid'
+    assert.equal(resolveAllowedColorShiftPresetId(preset.id, true), 'vivid');
+    // Credit Mode unlocks every preset
+    assert.equal(resolveAllowedColorShiftPresetId(preset.id, false), preset.id);
+  }
+
+  // Unknown or untrusted filter string falls back safely to vivid allowlist entry
+  assert.equal(resolveAllowedColorShiftPresetId('invalid;rm -rf /', false), 'vivid');
+  assert.equal(resolveColorShiftPreset('bw_classic', false).ffmpegFilter, 'hue=s=0,eq=contrast=1.18:brightness=0.01');
+  assert.equal(resolveColorShiftPreset('bw_classic', true).id, 'vivid');
+
+  // Timed Blur & Timed Add Text are strictly Credit Mode Only
+  assert.equal(isTimedOverlayFeatureAllowed(true), false);
+  assert.equal(isTimedOverlayFeatureAllowed(false), true);
+
+  // Direct MM:SS typing helper commits complete 0:11 immediately without prematurely snapping on 0:1
+  assert.equal(isCompleteTimecodeInput('0:11'), true);
+  assert.equal(isCompleteTimecodeInput('1:05'), true);
+  assert.equal(isCompleteTimecodeInput('0:1'), false);
+  assert.equal(isCompleteTimecodeInput('0:'), false);
+  assert.equal(isCompleteTimecodeInput('0:65'), false);
+  assert.equal(parseTimecodeToSeconds('0:11', 240), 11);
+});
+
+test('Translate Captions-Only Burmese punctuation converts ၊ and Myanmar-adjacent commas to ... while preserving numbers', () => {
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('မင်း၊ဘာဖြစ်တယ်'), 'မင်း...ဘာဖြစ်တယ်');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('ငါ၊က'), 'ငါ...က');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('၊ဒါ'), '...ဒါ');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('ဟုတ်တယ်၊ ငါသွားမယ်'), 'ဟုတ်တယ်...ငါသွားမယ်');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('မင်း, ဘာဖြစ်တယ်'), 'မင်း...ဘာဖြစ်တယ်');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('ငါ，မသိဘူး'), 'ငါ...မသိဘူး');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('ကျပ် 1,000 ပေးမယ်'), 'ကျပ် 1,000 ပေးမယ်');
+  assert.equal(formatBurmeseCaptionsOnlyPunctuation('မင်း....ဘာလဲ'), 'မင်း...ဘာလဲ');
+
+  const cues = [
+    { id: 'c1', start_ms: 0, end_ms: 1500, text: 'မင်း၊ဘာဖြစ်တယ်', burmeseText: 'မင်း၊ဘာဖြစ်တယ်' },
+    { id: 'c2', start_ms: 1600, end_ms: 3000, text: 'ငါ၊က 1,000 ပေးခဲ့တယ်' }
+  ];
+  const formatted = applyBurmeseCaptionsOnlyPunctuation(cues, 'my');
+  assert.equal(formatted[0].text, 'မင်း...ဘာဖြစ်တယ်');
+  assert.equal(formatted[0].burmeseText, 'မင်း...ဘာဖြစ်တယ်');
+  assert.equal(formatted[1].text, 'ငါ...က 1,000 ပေးခဲ့တယ်');
+
+  // Non-Burmese captions remain untouched
+  const enCues = [{ id: 'e1', start_ms: 0, end_ms: 1500, text: 'Wait, what happened?' }];
+  assert.equal(applyBurmeseCaptionsOnlyPunctuation(enCues, 'en')[0].text, 'Wait, what happened?');
+
+  // Captions-Only Burmese system prompt explicitly instructs using "..." instead of "၊"
+  const capPrompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'captions-only'
+  });
+  assert.ok(capPrompt.includes('...'));
+  assert.ok(capPrompt.includes('၊'));
+});
 

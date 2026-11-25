@@ -67,6 +67,7 @@ import {
   findUncoveredTranscriptSegments,
   mergeMissingDialogueCues,
   applyBurmeseDialogueExclamationRules,
+  applyBurmeseCaptionsOnlyPunctuation,
   splitMultiSpeakerDialogueCues,
   buildCinematicTranslateSystemPrompt,
   groupCuesIntoTimedBlocks,
@@ -98,6 +99,10 @@ import {
   extractDouyinAwemeId,
   normalizeDouyinPlayUrlToNoWatermark,
   extractDouyinVideoInfoFromHtml,
+  buildTimedBlurEnableExpr,
+  sanitizeTimedTextForAss,
+  resolveAllowedColorShiftPresetId,
+  resolveColorShiftPreset,
   isGeminiApiKeyExplicitlyInvalid,
   classifyGeminiTestConnectionResult,
   type AdminApiKeyRecord,
@@ -1515,7 +1520,16 @@ function writeAssSubtitleFile(
   const hasCues = Boolean(cues && cues.length > 0 && subtitleConfig?.enabled !== false);
   const wmText = activeEdit.watermarkText?.enabled ? (activeEdit.watermarkText.text || '').trim() : '';
   const hasWatermark = wmText.length > 0;
-  if (!hasCues && !hasWatermark) return false;
+  const validTimedTexts = Array.isArray(activeEdit.timedTexts)
+    ? activeEdit.timedTexts
+        .map((tt) => ({
+          ...tt,
+          safeText: sanitizeTimedTextForAss(tt?.text)
+        }))
+        .filter((tt) => tt.safeText.length > 0 && Number(tt.endSec) > Number(tt.startSec))
+    : [];
+  const hasTimedTexts = validTimedTexts.length > 0;
+  if (!hasCues && !hasWatermark && !hasTimedTexts) return false;
 
   const cfg: SubtitleOverlayConfig = subtitleConfig || {
     enabled: true,
@@ -1569,6 +1583,13 @@ function writeAssSubtitleFile(
   const wmOutline = `&H${wmAlphaHex}000000`;
   const wmSizePx = Math.max(16, Math.round((activeEdit.watermarkText?.sizePx || 18) * scaleFactor * 1.15));
 
+  const timedTextSample = validTimedTexts.map((t) => t.safeText).join(' ');
+  const timedTextFontMeta = resolveSubtitleFontMeta(
+    cfg.fontStyle,
+    cfg.subtitleLanguage,
+    timedTextSample || cueSampleText
+  );
+
   const lines: string[] = [
     '[Script Info]',
     'ScriptType: v4.00+',
@@ -1582,6 +1603,7 @@ function writeAssSubtitleFile(
     `Style: BoxBg,Arial,20,&H24000000,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1`,
     `Style: Default,${fontMeta.assFontName},${fontSizePx},${primaryColor},&H000000FF,${outlineColor},${backColor},${fontMeta.assBold},0,0,0,100,100,0,0,${borderStyle},${outlineWidth},${shadowDepth},5,${marginSide},${marginSide},12,1`,
     `Style: Watermark,DejaVu Sans,${wmSizePx},${wmPrimary},&H000000FF,${wmOutline},&H64000000,-1,0,0,0,100,100,0,0,1,2,1,5,12,12,12,1`,
+    `Style: TimedText,${timedTextFontMeta.assFontName},36,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,2.5,1,5,${marginSide},${marginSide},12,1`,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text'
@@ -1667,6 +1689,51 @@ function writeAssSubtitleFile(
       );
       lines.push(
         `Dialogue: 1,0:00:00.00,${msToAssTime(maxDurMs)},Watermark,,0,0,0,,{\\an${assAlign}\\pos(${x},${y})}${safeWmText}`
+      );
+    }
+  }
+
+  if (hasTimedTexts) {
+    const maxDurMs = Math.max(2000, Math.round(totalDurationSec * 1000) + 500);
+    const maxBoxW = Math.max(120, Math.round(vidW * 0.88));
+    for (const tt of validTimedTexts) {
+      const startMs = Math.max(0, Math.min(maxDurMs - 200, Math.round(Number(tt.startSec) * 1000)));
+      const endMs = Math.max(
+        startMs + 200,
+        Math.min(maxDurMs, Math.round(Number(tt.endSec) * 1000))
+      );
+      const startStr = msToAssTime(startMs);
+      const endStr = msToAssTime(endMs);
+      const tx = Math.max(20, Math.min(vidW - 20, Math.round(((tt.x ?? 50) / 100) * vidW)));
+      const ty = Math.max(20, Math.min(vidH - 20, Math.round(((tt.y ?? 24) / 100) * vidH)));
+      const tFontPx = Math.max(16, Math.min(96, Math.round((tt.fontSize || 30) * scaleFactor * 1.05)));
+      const tColorBgr = hexToAssBgr(tt.color, '') || '&HFFFFFF';
+
+      if (tt.bgColor && tt.bgColor.trim().length > 0) {
+        const bgBgr = hexToAssBgr(tt.bgColor, '') || '&H000000';
+        const pangoScale = timedTextFontMeta.pangoAssScale || 0.70;
+        const pangoPx = Math.max(12, Math.round(tFontPx * pangoScale));
+        const measured = measureCueBoxesWithPango(
+          [tt.safeText.replace(/\\N/g, '\n')],
+          pangoPx,
+          maxBoxW,
+          timedTextFontMeta.pangoFontDesc
+        )[0];
+        if (measured) {
+          const padX = Math.max(16, Math.round(tFontPx * 0.45));
+          const padY = Math.max(8, Math.round(tFontPx * 0.22));
+          const boxW = Math.min(Math.round(vidW * 0.94), measured.w + padX * 2);
+          const boxH = Math.max(Math.round(tFontPx * 1.15), measured.h + padY * 2);
+          const radius = Math.min(Math.floor(boxH / 2), Math.max(8, Math.round(tFontPx * 0.25)));
+          const pillPath = buildAssRoundedBoxPath(boxW, boxH, radius);
+          lines.push(
+            `Dialogue: 2,${startStr},${endStr},BoxBg,,0,0,0,,{\\an5\\pos(${tx},${ty})\\1c${bgBgr}&\\1a&H33&\\p1}${pillPath}{\\p0}`
+          );
+        }
+      }
+
+      lines.push(
+        `Dialogue: 3,${startStr},${endStr},TimedText,,0,0,0,,{\\an5\\pos(${tx},${ty})\\fs${tFontPx}\\1c${tColorBgr}&\\q0}${tt.safeText}`
       );
     }
   }
@@ -1760,7 +1827,7 @@ function buildVideoBurnFilterGraph(
   if (effects?.colorShift || effects?.grain) {
     const fxParts: string[] = [];
     if (effects?.colorShift) {
-      fxParts.push('hue=h=18:s=1.25,eq=contrast=1.06:brightness=0.015');
+      fxParts.push(resolveColorShiftPreset(effects?.colorShiftPreset).ffmpegFilter);
     }
     if (effects?.grain) {
       fxParts.push('noise=alls=5:allf=t');
@@ -1835,6 +1902,46 @@ function buildVideoBurnFilterGraph(
       `${cropInLbl}crop=${bw}:${bh}:${bx}:${by},boxblur=${lumaRadius}:2:${chromaRadius}:1${blurredLbl}`
     );
     filterSteps.push(`${baseLbl}${blurredLbl}overlay=${bx}:${by}:shortest=1${outLbl}`);
+    currentLabel = outLbl;
+  }
+
+  // Timed Blur Overlays (only active during startSec..endSec via FFmpeg enable='between(t,start,end)')
+  const validTimedBlurs = Array.isArray(editConfig?.timedBlurs)
+    ? editConfig!.timedBlurs!.filter(
+        (tb) => tb && tb.width > 1 && tb.height > 1 && Number(tb.endSec) > Number(tb.startSec)
+      )
+    : [];
+
+  for (let i = 0; i < validTimedBlurs.length; i++) {
+    const tb = validTimedBlurs[i];
+    let bx = Math.max(0, Math.min(vidW - 16, Math.round(((tb.x || 0) / 100) * vidW)));
+    let by = Math.max(0, Math.min(vidH - 16, Math.round(((tb.y || 0) / 100) * vidH)));
+    let bw = Math.max(16, Math.min(vidW - bx, Math.round(((tb.width || 20) / 100) * vidW)));
+    let bh = Math.max(16, Math.min(vidH - by, Math.round(((tb.height || 10) / 100) * vidH)));
+    bx = bx - (bx % 2);
+    by = by - (by % 2);
+    bw = Math.max(16, bw - (bw % 2));
+    bh = Math.max(16, bh - (bh % 2));
+    if (bx + bw > vidW) bw = Math.max(16, vidW - bx - ((vidW - bx) % 2));
+    if (by + bh > vidH) bh = Math.max(16, vidH - by - ((vidH - by) % 2));
+
+    const maxRadius = Math.max(2, Math.min(22, Math.floor(Math.min(bw, bh) / 4) - 1));
+    const lumaRadius = Math.max(2, Math.min(maxRadius, Math.round((tb.blurStrength ?? 24) / 1.5)));
+    const chromaRadius = Math.max(1, Math.min(Math.floor(maxRadius / 2), lumaRadius));
+    const enableExpr = buildTimedBlurEnableExpr(tb.startSec, tb.endSec);
+
+    const baseLbl = `[vtbase_${i}]`;
+    const cropInLbl = `[vtcropin_${i}]`;
+    const blurredLbl = `[vtblurred_${i}]`;
+    const outLbl = `[vtovr_${i}]`;
+
+    filterSteps.push(`${currentLabel}split=2${baseLbl}${cropInLbl}`);
+    filterSteps.push(
+      `${cropInLbl}crop=${bw}:${bh}:${bx}:${by},boxblur=${lumaRadius}:2:${chromaRadius}:1${blurredLbl}`
+    );
+    filterSteps.push(
+      `${baseLbl}${blurredLbl}overlay=${bx}:${by}:shortest=1:enable='${enableExpr}'${outLbl}`
+    );
     currentLabel = outLbl;
   }
 
@@ -1939,6 +2046,18 @@ async function muxVideoWithMixedAudio(
     const wantsBlurs = Boolean(
       blurEnabled && Array.isArray(blurRegions) && blurRegions.some((r) => r && r.width > 1 && r.height > 1)
     );
+    const wantsTimedBlurs = Boolean(
+      Array.isArray(editConfig?.timedBlurs) &&
+        editConfig!.timedBlurs!.some(
+          (tb) => tb && tb.width > 1 && tb.height > 1 && Number(tb.endSec) > Number(tb.startSec)
+        )
+    );
+    const wantsTimedTexts = Boolean(
+      Array.isArray(editConfig?.timedTexts) &&
+        editConfig!.timedTexts!.some(
+          (tt) => tt && String(tt.text || '').trim().length > 0 && Number(tt.endSec) > Number(tt.startSec)
+        )
+    );
     const wantsEffectFilters = Boolean(
       effects?.colorShift || effects?.crop || effects?.zoom || effects?.grain
     );
@@ -1949,6 +2068,8 @@ async function muxVideoWithMixedAudio(
       wantsCoverBand ||
       wantsBrandLogo ||
       wantsBlurs ||
+      wantsTimedBlurs ||
+      wantsTimedTexts ||
       wantsAspectTransform ||
       wantsEffectFilters;
 
@@ -1968,7 +2089,7 @@ async function muxVideoWithMixedAudio(
     vidH = Math.max(64, vidH - (vidH % 2));
 
     const hasAss =
-      wantsSubtitles || wantsWatermarkText
+      wantsSubtitles || wantsWatermarkText || wantsTimedTexts
         ? writeAssSubtitleFile(assPath, cues || [], subtitleConfig, vidW, vidH, editConfig, safeDur)
         : false;
 
@@ -2217,9 +2338,15 @@ async function generateStandaloneRecapMp4(
       editConfig?.watermarkText?.enabled && editConfig.watermarkText.text.trim().length > 0
     );
     const wantsBrandLogo = Boolean(logoPath && editConfig?.brandLogo?.enabled);
+    const wantsTimedTexts = Boolean(
+      Array.isArray(editConfig?.timedTexts) &&
+        editConfig!.timedTexts!.some(
+          (tt) => tt && String(tt.text || '').trim().length > 0 && Number(tt.endSec) > Number(tt.startSec)
+        )
+    );
 
     const hasAss =
-      wantsSubtitles || wantsWatermarkText
+      wantsSubtitles || wantsWatermarkText || wantsTimedTexts
         ? writeAssSubtitleFile(assPath, cues || [], subtitleConfig, vidW, vidH, editConfig, safeDur)
         : false;
 
@@ -3549,6 +3676,7 @@ async function startServer() {
             hd: Boolean(payload.effects?.outputHD),
             zm: Boolean(payload.effects?.zoom),
             cs: Boolean(payload.effects?.colorShift),
+            csp: payload.effects?.colorShiftPreset || 'vivid',
             cr: Boolean(payload.effects?.crop),
             gr: Boolean(payload.effects?.grain)
           },
@@ -4075,13 +4203,18 @@ async function startServer() {
           );
         } catch {}
       }
+      if (isCaptionsOnly && (subtitleConfig?.subtitleLanguage || 'my') === 'my' && exportCues.length > 0) {
+        exportCues = applyBurmeseCaptionsOnlyPunctuation(exportCues, 'my');
+      }
 
       const effectiveExportEditConfig: DeepRecapEditConfig | undefined =
         isFreeMode && editConfig
           ? {
               ...editConfig,
               watermarkText: { ...editConfig.watermarkText, enabled: false },
-              brandLogo: { ...editConfig.brandLogo, enabled: false }
+              brandLogo: { ...editConfig.brandLogo, enabled: false },
+              timedBlurs: [],
+              timedTexts: []
             }
           : editConfig;
 
@@ -4090,6 +4223,7 @@ async function startServer() {
         zoom: isFreeMode ? false : Boolean(effects?.zoom),
         mirror: Boolean(effects?.mirror ?? mirrorFlip),
         colorShift: Boolean(effects?.colorShift),
+        colorShiftPreset: resolveAllowedColorShiftPresetId(effects?.colorShiftPreset, isFreeMode),
         crop: Boolean(effects?.crop),
         grain: Boolean(effects?.grain),
         pitchShift: Boolean(effects?.pitchShift)
@@ -4657,6 +4791,7 @@ async function startServer() {
       zoom: isFreeMode ? false : Boolean(effects?.zoom),
       mirror: Boolean(effects?.mirror ?? mirrorFlip),
       colorShift: Boolean(effects?.colorShift),
+      colorShiftPreset: resolveAllowedColorShiftPresetId(effects?.colorShiftPreset, isFreeMode),
       crop: Boolean(effects?.crop),
       grain: Boolean(effects?.grain),
       pitchShift: Boolean(effects?.pitchShift ?? pitchShift)
@@ -4682,7 +4817,9 @@ async function startServer() {
         ? {
             ...editConfig,
             watermarkText: { ...editConfig.watermarkText, enabled: false },
-            brandLogo: { ...editConfig.brandLogo, enabled: false }
+            brandLogo: { ...editConfig.brandLogo, enabled: false },
+            timedBlurs: [],
+            timedTexts: []
           }
         : editConfig;
 
@@ -6091,6 +6228,9 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         effectiveTranscriptText || groqTranscript,
         targetLanguage
       );
+      if (isCaptionsOnlyMode) {
+        finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, targetLanguage);
+      }
       finalScriptText = finalCues.map((c) => c.text).join(' ');
     }
 
@@ -6250,6 +6390,9 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         effectiveTranscriptText || groqTranscript,
         targetLanguage
       );
+      if (isCaptionsOnlyMode) {
+        finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, targetLanguage);
+      }
     }
     finalCues = finalCues.map((c) => ({ ...c, burmeseText: c.burmeseText || c.text }));
     finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
@@ -6266,6 +6409,9 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         userGroqApiKey: freeGroqKey,
         sourceLanguage: targetLanguage
       });
+      if (isCaptionsOnlyMode && subtitleConfig.subtitleLanguage === 'my') {
+        finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, 'my');
+      }
     }
 
     let voiceoverWavPath: string | null = null;

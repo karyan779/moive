@@ -9,6 +9,7 @@ import {
   RotateCw,
   X,
   Plus,
+  Minus,
   Check,
   Pencil
 } from 'lucide-react';
@@ -20,9 +21,12 @@ import {
   computeAspectCanvasLayout,
   resolveBurmeseFontMeta,
   resolveSubtitleFontMeta,
+  resolveColorShiftPreset,
   shouldSyncCompanionAudioTime,
   DEFAULT_DEEPRECAP_EDIT_CONFIG,
   TARGET_LANGUAGES,
+  isTimedOverlayActiveAtTime,
+  formatTimedOverlaySec,
   type AspectRatioMode,
   type BlurRegion,
   type BlurStyleMode,
@@ -52,6 +56,9 @@ interface CanvasVideoEditorProps {
   onChangeSubtitleConfig: (cfg: SubtitleOverlayConfig) => void;
   effects: AntiCopyrightEffects;
   editConfig?: DeepRecapEditConfig;
+  onChangeEditConfig?: React.Dispatch<React.SetStateAction<DeepRecapEditConfig>>;
+  externalSeekRequest?: { sec: number; seq: number } | null;
+  onCurrentTimeChange?: (sec: number) => void;
   cues: SubtitleCue[];
   targetLanguage: TargetLanguageCode;
   audioBase64?: string;
@@ -245,6 +252,9 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   onChangeSubtitleConfig,
   effects,
   editConfig,
+  onChangeEditConfig,
+  externalSeekRequest = null,
+  onCurrentTimeChange,
   cues,
   targetLanguage,
   audioBase64,
@@ -276,6 +286,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   const [selectedBlurIdx, setSelectedBlurIdx] = useState<number | null>(
     blurRegions.length > 0 ? 0 : null
   );
+  const [selectedTimedTextId, setSelectedTimedTextId] = useState<string | null>(null);
   const [videoDimensions, setVideoDimensions] = useState<{ width: number; height: number } | null>(
     null
   );
@@ -407,6 +418,33 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     origY: number;
   } | null>(null);
   const subScaleRef = useRef<{ startClientX: number; startSize: number } | null>(null);
+  const timedBlurMoveRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+  } | null>(null);
+  const timedBlurResizeRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    origWidth: number;
+    origHeight: number;
+  } | null>(null);
+  const timedTextMoveRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+  } | null>(null);
+  const timedTextScaleRef = useRef<{
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    startSize: number;
+  } | null>(null);
   const timelineScrubRef = useRef<boolean>(false);
 
   const blurRegionsRef = useRef(blurRegions);
@@ -417,6 +455,41 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   onChangeBlurRegionsRef.current = onChangeBlurRegions;
   const onChangeSubtitleConfigRef = useRef(onChangeSubtitleConfig);
   onChangeSubtitleConfigRef.current = onChangeSubtitleConfig;
+  const onChangeEditConfigRef = useRef(onChangeEditConfig);
+  onChangeEditConfigRef.current = onChangeEditConfig;
+  const activeEditRef = useRef(activeEdit);
+  activeEditRef.current = activeEdit;
+  const lastReportedTimeRef = useRef<number>(-1);
+
+  useEffect(() => {
+    if (!onCurrentTimeChange) return;
+    if (Math.abs(currentTime - lastReportedTimeRef.current) >= 0.25) {
+      lastReportedTimeRef.current = currentTime;
+      onCurrentTimeChange(currentTime);
+    }
+  }, [currentTime, onCurrentTimeChange]);
+
+  useEffect(() => {
+    if (!externalSeekRequest) return;
+    const safeSec = Math.max(0, Math.min(Math.max(1, videoDuration || 60), externalSeekRequest.sec));
+    lastUserSeekAtRef.current = Date.now();
+    setCurrentTime(safeSec);
+    if (videoRef.current) {
+      try {
+        videoRef.current.currentTime = safeSec;
+      } catch {}
+    }
+    if (bgVideoRef.current) {
+      try {
+        bgVideoRef.current.currentTime = safeSec;
+      } catch {}
+    }
+    if (audioRef.current && !hasMuxedAudio) {
+      try {
+        audioRef.current.currentTime = safeSec;
+      } catch {}
+    }
+  }, [externalSeekRequest, videoDuration, hasMuxedAudio]);
 
   const isProceduralDemo = Boolean(videoFileUrl && videoFileUrl.startsWith('/api/demo-video'));
 
@@ -494,6 +567,67 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
           ...subtitleConfigRef.current,
           fontSize: nextFontSize
         });
+      } else if (timedBlurMoveRef.current && onChangeEditConfigRef.current) {
+        const { id, startX, startY, origX, origY } = timedBlurMoveRef.current;
+        const { x, y } = getStagePercentCoords(clientX, clientY);
+        const dx = x - startX;
+        const dy = y - startY;
+        onChangeEditConfigRef.current((prev) => ({
+          ...prev,
+          timedBlurs: (prev.timedBlurs || []).map((tb) => {
+            if (tb.id !== id) return tb;
+            const nextX = Math.max(0, Math.min(100 - tb.width, origX + dx));
+            const nextY = Math.max(0, Math.min(100 - tb.height, origY + dy));
+            return {
+              ...tb,
+              x: Math.round(10 * nextX) / 10,
+              y: Math.round(10 * nextY) / 10
+            };
+          })
+        }));
+      } else if (timedBlurResizeRef.current && onChangeEditConfigRef.current) {
+        const { id, startX, startY, origWidth, origHeight } = timedBlurResizeRef.current;
+        const { x, y } = getStagePercentCoords(clientX, clientY);
+        const dx = x - startX;
+        const dy = y - startY;
+        onChangeEditConfigRef.current((prev) => ({
+          ...prev,
+          timedBlurs: (prev.timedBlurs || []).map((tb) => {
+            if (tb.id !== id) return tb;
+            const nextW = Math.max(8, Math.min(100 - tb.x, origWidth + dx));
+            const nextH = Math.max(4, Math.min(100 - tb.y, origHeight + dy));
+            return {
+              ...tb,
+              width: Math.round(10 * nextW) / 10,
+              height: Math.round(10 * nextH) / 10
+            };
+          })
+        }));
+      } else if (timedTextMoveRef.current && onChangeEditConfigRef.current) {
+        const { id, startX, startY, origX, origY } = timedTextMoveRef.current;
+        const { x, y } = getStagePercentCoords(clientX, clientY);
+        const dx = x - startX;
+        const dy = y - startY;
+        const nextX = Math.round(Math.min(95, Math.max(5, origX + dx)) * 10) / 10;
+        const nextY = Math.round(Math.min(95, Math.max(5, origY + dy)) * 10) / 10;
+        onChangeEditConfigRef.current((prev) => ({
+          ...prev,
+          timedTexts: (prev.timedTexts || []).map((tt) =>
+            tt.id === id ? { ...tt, x: nextX, y: nextY } : tt
+          )
+        }));
+      } else if (timedTextScaleRef.current && onChangeEditConfigRef.current) {
+        const { id, startClientX, startClientY, startSize } = timedTextScaleRef.current;
+        const dx = clientX - startClientX;
+        const dy = clientY - startClientY;
+        const diagDelta = (dx + dy) * 0.55;
+        const nextFontSize = Math.max(14, Math.min(64, Math.round(startSize + 0.35 * diagDelta)));
+        onChangeEditConfigRef.current((prev) => ({
+          ...prev,
+          timedTexts: (prev.timedTexts || []).map((tt) =>
+            tt.id === id ? { ...tt, fontSize: nextFontSize } : tt
+          )
+        }));
       }
     },
     [getStagePercentCoords]
@@ -505,7 +639,11 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         blurMoveRef.current ||
         blurResizeRef.current ||
         subMoveRef.current ||
-        subScaleRef.current
+        subScaleRef.current ||
+        timedBlurMoveRef.current ||
+        timedBlurResizeRef.current ||
+        timedTextMoveRef.current ||
+        timedTextScaleRef.current
       ) {
         handleGlobalDragMove(e.clientX, e.clientY);
       }
@@ -515,7 +653,11 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         (blurMoveRef.current ||
           blurResizeRef.current ||
           subMoveRef.current ||
-          subScaleRef.current) &&
+          subScaleRef.current ||
+          timedBlurMoveRef.current ||
+          timedBlurResizeRef.current ||
+          timedTextMoveRef.current ||
+          timedTextScaleRef.current) &&
         e.touches.length > 0
       ) {
         e.preventDefault();
@@ -527,6 +669,10 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
       blurResizeRef.current = null;
       subMoveRef.current = null;
       subScaleRef.current = null;
+      timedBlurMoveRef.current = null;
+      timedBlurResizeRef.current = null;
+      timedTextMoveRef.current = null;
+      timedTextScaleRef.current = null;
       timelineScrubRef.current = false;
     };
 
@@ -875,9 +1021,8 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     ? Number((1 + 0.075 * (0.5 + 0.5 * Math.sin((currentTime * Math.PI) / 2.2))).toFixed(4))
     : 1;
   const totalVideoScale = Number((frameZoomScale * slightCropScale * dynamicZoomScale).toFixed(4));
-  const colorShiftFilter = effects.colorShift
-    ? 'hue-rotate(18deg) saturate(1.25) contrast(1.06) brightness(1.02)'
-    : undefined;
+  const activeColorShiftPreset = resolveColorShiftPreset(effects.colorShiftPreset);
+  const colorShiftFilter = effects.colorShift ? activeColorShiftPreset.cssFilter : undefined;
 
   const cropObjectPosition =
     activeEdit.focus === 'top'
@@ -998,7 +1143,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                     autoPlay
                     style={
                       effects.colorShift
-                        ? { filter: 'blur(24px) brightness(0.68) saturate(1.25) hue-rotate(18deg)' }
+                        ? { filter: `blur(24px) brightness(0.68) ${activeColorShiftPreset.cssFilter}` }
                         : undefined
                     }
                     className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-cover blur-2xl brightness-[0.68] saturate-110"
@@ -1495,6 +1640,362 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
                 )}
               </div>
             ))}
+
+          {/* Interactive Draggable & Resizable Timed Blur Overlays (visible only during startSec..endSec) */}
+          {(activeEdit.timedBlurs || [])
+            .filter((tb) => isTimedOverlayActiveAtTime(tb, currentTime))
+            .map((tb, idx) => (
+              <div
+                key={tb.id}
+                data-testid={`stage-timed-blur-${idx}`}
+                style={{
+                  position: 'absolute',
+                  left: `${tb.x}%`,
+                  top: `${tb.y}%`,
+                  width: `${tb.width}%`,
+                  height: `${tb.height}%`,
+                  zIndex: 21,
+                  touchAction: 'none',
+                  willChange: 'left, top, width, height'
+                }}
+                className={`rounded-md select-none cursor-grab active:cursor-grabbing ${
+                  isOverlayEditMode
+                    ? 'border-2 border-amber-400/90 shadow-[0_8px_28px_rgba(0,0,0,0.45)]'
+                    : 'hover:border hover:border-amber-400/60'
+                }`}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  if (!isOverlayEditMode) {
+                    onToggleOverlayEditMode(true);
+                  }
+                  const { x, y } = getStagePercentCoords(e.clientX, e.clientY);
+                  timedBlurMoveRef.current = {
+                    id: tb.id,
+                    startX: x,
+                    startY: y,
+                    origX: tb.x,
+                    origY: tb.y
+                  };
+                  try {
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                  } catch {}
+                }}
+                onTouchStart={(e) => {
+                  if (e.touches.length === 0) return;
+                  e.stopPropagation();
+                  if (!isOverlayEditMode) {
+                    onToggleOverlayEditMode(true);
+                  }
+                  const { x, y } = getStagePercentCoords(e.touches[0].clientX, e.touches[0].clientY);
+                  timedBlurMoveRef.current = {
+                    id: tb.id,
+                    startX: x,
+                    startY: y,
+                    origX: tb.x,
+                    origY: tb.y
+                  };
+                }}
+                onPointerMove={(e) => {
+                  if (!timedBlurMoveRef.current || timedBlurMoveRef.current.id !== tb.id) return;
+                  handleGlobalDragMove(e.clientX, e.clientY);
+                }}
+                onPointerUp={(e) => {
+                  timedBlurMoveRef.current = null;
+                  try {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  } catch {}
+                }}
+              >
+                <div
+                  className="pointer-events-none absolute inset-0 rounded-md"
+                  style={{
+                    backdropFilter: `blur(${Math.max(10, Math.min(36, (tb.blurStrength ?? 24) / 1.1))}px)`,
+                    WebkitBackdropFilter: `blur(${Math.max(10, Math.min(36, (tb.blurStrength ?? 24) / 1.1))}px)`,
+                    backgroundColor: 'rgba(15, 23, 42, 0.22)'
+                  }}
+                />
+                {isOverlayEditMode && (
+                  <>
+                    <span className="pointer-events-none absolute -top-6 left-0 z-30 rounded-md bg-amber-500 px-1.5 py-0.5 font-mono text-[9.5px] font-bold whitespace-nowrap text-slate-950 shadow">
+                      {formatTimedOverlaySec(tb.startSec)}–{formatTimedOverlaySec(tb.endSec)}
+                    </span>
+                    {onChangeEditConfig && (
+                      <button
+                        type="button"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onTouchStart={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onChangeEditConfig((prev) => ({
+                            ...prev,
+                            timedBlurs: (prev.timedBlurs || []).filter((item) => item.id !== tb.id)
+                          }));
+                        }}
+                        title="Delete timed blur"
+                        className="absolute -top-3 -right-3 z-30 flex size-6 cursor-pointer items-center justify-center rounded-full border border-amber-300/60 bg-[#18181B]/90 text-white shadow hover:bg-red-600"
+                      >
+                        <X className="size-3 stroke-[2.5]" />
+                      </button>
+                    )}
+                    <div
+                      data-testid={`timed-blur-resize-handle-${idx}`}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        const { x, y } = getStagePercentCoords(e.clientX, e.clientY);
+                        timedBlurResizeRef.current = {
+                          id: tb.id,
+                          startX: x,
+                          startY: y,
+                          origWidth: tb.width,
+                          origHeight: tb.height
+                        };
+                        try {
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                        } catch {}
+                      }}
+                      onTouchStart={(e) => {
+                        if (e.touches.length === 0) return;
+                        e.stopPropagation();
+                        const { x, y } = getStagePercentCoords(e.touches[0].clientX, e.touches[0].clientY);
+                        timedBlurResizeRef.current = {
+                          id: tb.id,
+                          startX: x,
+                          startY: y,
+                          origWidth: tb.width,
+                          origHeight: tb.height
+                        };
+                      }}
+                      onPointerMove={(e) => {
+                        if (!timedBlurResizeRef.current || timedBlurResizeRef.current.id !== tb.id) return;
+                        handleGlobalDragMove(e.clientX, e.clientY);
+                      }}
+                      onPointerUp={(e) => {
+                        timedBlurResizeRef.current = null;
+                        try {
+                          e.currentTarget.releasePointerCapture(e.pointerId);
+                        } catch {}
+                      }}
+                      className="absolute -right-2 -bottom-2 z-30 size-4.5 cursor-se-resize touch-none rounded-full bg-amber-400 shadow ring-2 ring-black/40"
+                    />
+                  </>
+                )}
+              </div>
+            ))}
+
+          {/* Interactive Draggable & Resizable Timed Text Overlays (visible only during startSec..endSec) */}
+          {(activeEdit.timedTexts || [])
+            .filter((tt) => tt.text.trim().length > 0 && isTimedOverlayActiveAtTime(tt, currentTime))
+            .map((tt, idx) => {
+              const isSelectedText = isOverlayEditMode || selectedTimedTextId === tt.id;
+              return (
+                <div
+                  key={tt.id}
+                  data-testid={`stage-timed-text-${idx}`}
+                  style={{
+                    position: 'absolute',
+                    left: `${tt.x}%`,
+                    top: `${tt.y}%`,
+                    transform: 'translate(-50%, -50%)',
+                    maxWidth: '88%',
+                    zIndex: 26,
+                    touchAction: 'none',
+                    willChange: 'left, top'
+                  }}
+                  className={`cursor-grab active:cursor-grabbing select-none ${
+                    isSelectedText ? 'rounded-lg ring-2 ring-teal-400/90' : ''
+                  }`}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    setSelectedTimedTextId(tt.id);
+                    if (!isOverlayEditMode) {
+                      onToggleOverlayEditMode(true);
+                    }
+                    const { x, y } = getStagePercentCoords(e.clientX, e.clientY);
+                    timedTextMoveRef.current = {
+                      id: tt.id,
+                      startX: x,
+                      startY: y,
+                      origX: tt.x,
+                      origY: tt.y
+                    };
+                    try {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                    } catch {}
+                  }}
+                  onTouchStart={(e) => {
+                    if (e.touches.length === 0) return;
+                    e.stopPropagation();
+                    setSelectedTimedTextId(tt.id);
+                    if (!isOverlayEditMode) {
+                      onToggleOverlayEditMode(true);
+                    }
+                    const { x, y } = getStagePercentCoords(
+                      e.touches[0].clientX,
+                      e.touches[0].clientY
+                    );
+                    timedTextMoveRef.current = {
+                      id: tt.id,
+                      startX: x,
+                      startY: y,
+                      origX: tt.x,
+                      origY: tt.y
+                    };
+                  }}
+                  onPointerMove={(e) => {
+                    if (!timedTextMoveRef.current || timedTextMoveRef.current.id !== tt.id) return;
+                    handleGlobalDragMove(e.clientX, e.clientY);
+                  }}
+                  onPointerUp={(e) => {
+                    timedTextMoveRef.current = null;
+                    try {
+                      e.currentTarget.releasePointerCapture(e.pointerId);
+                    } catch {}
+                  }}
+                >
+                  {isSelectedText && (
+                    <>
+                      {/* Floating Size & Delete Pill Above Selected Timed Text */}
+                      <div
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onTouchStart={(e) => e.stopPropagation()}
+                        className="absolute -top-8 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-full border border-teal-300/60 bg-[#0D1117]/95 px-1.5 py-0.5 whitespace-nowrap text-white shadow-lg"
+                      >
+                        <span className="font-mono text-[9px] font-bold text-teal-300">
+                          {formatTimedOverlaySec(tt.startSec)}–{formatTimedOverlaySec(tt.endSec)}
+                        </span>
+                        {onChangeEditConfig && (
+                          <>
+                            <button
+                              type="button"
+                              aria-label={`Decrease timed text ${idx + 1} size`}
+                              data-testid={`timed-text-dec-size-${idx}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                playUiSound('tap');
+                                onChangeEditConfig((prev) => ({
+                                  ...prev,
+                                  timedTexts: (prev.timedTexts || []).map((item) =>
+                                    item.id === tt.id
+                                      ? { ...item, fontSize: Math.max(14, (item.fontSize || 30) - 2) }
+                                      : item
+                                  )
+                                }));
+                              }}
+                              className="flex size-5 cursor-pointer items-center justify-center rounded-full bg-slate-800 text-white hover:bg-teal-600 active:scale-95"
+                            >
+                              <Minus className="size-2.5 stroke-[2.5]" />
+                            </button>
+                            <span
+                              data-testid={`timed-text-size-badge-${idx}`}
+                              className="min-w-[26px] text-center font-mono text-[9.5px] font-bold text-white"
+                            >
+                              {tt.fontSize || 30}
+                            </span>
+                            <button
+                              type="button"
+                              aria-label={`Increase timed text ${idx + 1} size`}
+                              data-testid={`timed-text-inc-size-${idx}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                playUiSound('tap');
+                                onChangeEditConfig((prev) => ({
+                                  ...prev,
+                                  timedTexts: (prev.timedTexts || []).map((item) =>
+                                    item.id === tt.id
+                                      ? { ...item, fontSize: Math.min(64, (item.fontSize || 30) + 2) }
+                                      : item
+                                  )
+                                }));
+                              }}
+                              className="flex size-5 cursor-pointer items-center justify-center rounded-full bg-slate-800 text-white hover:bg-teal-600 active:scale-95"
+                            >
+                              <Plus className="size-2.5 stroke-[2.5]" />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Delete timed text ${idx + 1} on stage`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                playUiSound('tap');
+                                onChangeEditConfig((prev) => ({
+                                  ...prev,
+                                  timedTexts: (prev.timedTexts || []).filter(
+                                    (item) => item.id !== tt.id
+                                  )
+                                }));
+                              }}
+                              className="flex size-5 cursor-pointer items-center justify-center rounded-full bg-red-500/80 text-white hover:bg-red-500 active:scale-95"
+                            >
+                              <X className="size-2.5 stroke-[2.5]" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+
+                      {/* Bottom-Right Touch/Drag Corner Scale Handle (just like Blur boxes!) */}
+                      {onChangeEditConfig && (
+                        <div
+                          data-testid={`timed-text-resize-handle-${idx}`}
+                          title="Drag to resize text"
+                          onPointerDown={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            timedTextScaleRef.current = {
+                              id: tt.id,
+                              startClientX: e.clientX,
+                              startClientY: e.clientY,
+                              startSize: tt.fontSize || 30
+                            };
+                            try {
+                              e.currentTarget.setPointerCapture(e.pointerId);
+                            } catch {}
+                          }}
+                          onTouchStart={(e) => {
+                            if (e.touches.length === 0) return;
+                            e.stopPropagation();
+                            timedTextScaleRef.current = {
+                              id: tt.id,
+                              startClientX: e.touches[0].clientX,
+                              startClientY: e.touches[0].clientY,
+                              startSize: tt.fontSize || 30
+                            };
+                          }}
+                          onPointerMove={(e) => {
+                            if (!timedTextScaleRef.current || timedTextScaleRef.current.id !== tt.id)
+                              return;
+                            handleGlobalDragMove(e.clientX, e.clientY);
+                          }}
+                          onPointerUp={(e) => {
+                            timedTextScaleRef.current = null;
+                            try {
+                              e.currentTarget.releasePointerCapture(e.pointerId);
+                            } catch {}
+                          }}
+                          className="absolute -right-2.5 -bottom-2.5 z-30 size-5 cursor-se-resize touch-none rounded-full bg-teal-400 shadow-[0_2px_10px_rgba(0,0,0,0.6)] ring-2 ring-white transition-transform active:scale-125"
+                        />
+                      )}
+                    </>
+                  )}
+                  <div
+                    style={{
+                      color: tt.color || '#FFFFFF',
+                      backgroundColor: tt.bgColor ? `${tt.bgColor}CC` : 'transparent',
+                      fontSize: `${Math.max(11, Math.min(38, Math.round((tt.fontSize || 30) * 0.56)))}px`,
+                      fontFamily: '"Pyidaungsu", "Padauk", "Noto Sans Myanmar", sans-serif',
+                      textShadow: tt.bgColor
+                        ? '0 1px 3px rgba(0,0,0,0.65)'
+                        : '0 2px 6px rgba(0,0,0,0.92), 0 0 2px rgba(0,0,0,0.95)'
+                    }}
+                    className="rounded-lg px-2.5 py-1 text-center font-bold leading-snug whitespace-pre-wrap break-words"
+                  >
+                    {tt.text}
+                  </div>
+                </div>
+              );
+            })}
 
           {/* Interactive Draggable & Resizable Subtitle Box */}
           {subtitleConfig.enabled && (isOverlayEditMode || displayedSubtitleText.trim().length > 0) && (

@@ -50,6 +50,8 @@ import {
   exportCuesToSrt,
   resolveStudioWorkflowStep,
   getDefaultAntiCopyrightEffects,
+  COLOR_SHIFT_PRESETS,
+  resolveAllowedColorShiftPresetId,
   buildPaymentNoticeKey,
   shouldShowPaymentNotificationBanner,
   isTransientPollHttpStatus,
@@ -86,6 +88,7 @@ import {
   type DemoScenePreset
 } from './CanvasVideoEditor';
 import { ThumbnailStudioModal } from './ThumbnailStudioModal';
+import { CopyrightTimedOverlaysPanel } from './CopyrightTimedOverlaysPanel';
 
 export type RightInspectorTab = 'settings' | 'history';
 
@@ -417,6 +420,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [translationEngine, setTranslationEngine] = useState<'gemini' | 'whisper'>('gemini');
   const [voiceGender, setVoiceGender] = useState<VoiceGender>('male');
   const [scriptStyle, setScriptStyle] = useState<ScriptStyleId>('narrator');
+  const [isScriptStyleMenuOpen, setIsScriptStyleMenuOpen] = useState<boolean>(false);
   const [aspectRatio, setAspectRatio] = useState<AspectRatioMode>('original');
   const [targetLanguage, setTargetLanguage] = useState<TargetLanguageCode>('my');
 
@@ -517,32 +521,51 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [isBrandCardOpen, setIsBrandCardOpen] = useState<boolean>(false);
   const logoFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Strip Watermark Text & Circular Brand Logo completely when in Free Mode (Credit Mode Only feature)
+  // Strip Credit-Mode-Only overlays (Watermark Text, Brand Logo, Timed Blur, Timed Add Text) when in Free Mode
   const effectiveEditConfig: DeepRecapEditConfig = isFreeTier
     ? {
         ...editConfig,
         watermarkText: { ...editConfig.watermarkText, enabled: false },
-        brandLogo: { ...editConfig.brandLogo, enabled: false }
+        brandLogo: { ...editConfig.brandLogo, enabled: false },
+        timedBlurs: [],
+        timedTexts: []
       }
     : editConfig;
+
+  const effectiveEffects: AntiCopyrightEffects = isFreeTier
+    ? {
+        ...effects,
+        outputHD: false,
+        zoom: false,
+        colorShiftPreset: 'vivid'
+      }
+    : {
+        ...effects,
+        colorShiftPreset: resolveAllowedColorShiftPresetId(effects.colorShiftPreset, false)
+      };
+
+  const [colorShiftLockNotice, setColorShiftLockNotice] = useState<string | null>(null);
 
   // Sync Free Tier vs Pro Credit Tier effect defaults & Voice restriction when switching routes
   useEffect(() => {
     const modeChanged = prevFreeTierRef.current !== isFreeTier;
     prevFreeTierRef.current = isFreeTier;
     if (isFreeTier) {
-      setEffects((prev) => ({ ...prev, outputHD: false, zoom: false }));
+      setEffects((prev) => ({ ...prev, outputHD: false, zoom: false, colorShiftPreset: 'vivid' }));
       if (!isVoiceAllowedInMode(voiceGender, true)) {
         setVoiceGender('male');
       }
     } else if (modeChanged) {
       // Entering Credit Mode: ONLY FHD 1080p is auto-enabled; all optional edit toggles stay OFF
       setEffects(getDefaultAntiCopyrightEffects(false));
+      setColorShiftLockNotice(null);
     }
   }, [isFreeTier, voiceGender]);
 
   // Interactive Canvas Edit Mode (`e$` in submit_form_only.js)
   const [isOverlayEditMode, setIsOverlayEditMode] = useState<boolean>(false);
+  const [previewCurrentTimeSec, setPreviewCurrentTimeSec] = useState<number>(0);
+  const [externalSeekRequest, setExternalSeekRequest] = useState<{ sec: number; seq: number } | null>(null);
 
   // Uploaded File ref for server-side audio extraction & ffmpeg muxing
   const uploadedFileRef = useRef<File | null>(null);
@@ -1028,9 +1051,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         title: videoTitle || originalFilename,
         r2ObjectKey: r2ObjectKeyPayload,
         localUploadId: localUploadIdPayload,
-        pitchShift: effects.pitchShift,
-        mirrorFlip: effects.mirror,
-        effects,
+        pitchShift: effectiveEffects.pitchShift,
+        mirrorFlip: effectiveEffects.mirror,
+        effects: effectiveEffects,
         scriptModel: savedEngineCfg.scriptModel,
         ttsEngine: savedEngineCfg.ttsEngine,
         sttModel: savedEngineCfg.sttModel,
@@ -1248,7 +1271,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         blurRegions,
         blurStyle,
         subtitleConfig,
-        effects,
+        effects: effectiveEffects,
         editConfig: effectiveEditConfig,
         autoFlowLogs: logs
       };
@@ -1316,8 +1339,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             subtitleConfig,
             blurEnabled,
             blurRegions,
-            mirrorFlip: effects.mirror,
-            effects,
+            mirrorFlip: effectiveEffects.mirror,
+            effects: effectiveEffects,
             aspectRatio,
             editConfig: effectiveEditConfig,
             isFreeMode: isFreeTier,
@@ -2274,22 +2297,164 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           label="Script style"
                           tooltip="Choose the tone and pacing for your narration."
                         />
-                        <select
-                          value={scriptStyle}
-                          onChange={(e) => {
-                            playUiSound('select');
-                            setScriptStyle(e.target.value as ScriptStyleId);
-                          }}
-                          className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-medium text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
-                        >
-                          <option value="narrator">Fast Recap (အမြန်ဆွဲဆောင် ပြောဟန်)</option>
-                          <option value="natural">Natural Flow (သဘာဝ အပြောဟန်)</option>
-                          <option value="hybrid">Hybrid Dialogue (ဇာတ်ကြောင်းပြော + ဇာတ်ကောင်စကားပြော)</option>
-                          <option value="drama">Storytelling (ရုပ်ရှင်ဇာတ်လမ်း ပြောဟန်)</option>
-                          <option value="casual">Gen Z (လူငယ်ဆန်ဆန် သွက်လက်ပြောဟန်)</option>
-                          <option value="news">News (သတင်းကြေညာ တင်ဆက်ဟန်)</option>
-                          <option value="none">Documentary (မှတ်တမ်းရုပ်ရှင် လေးနက်ပြောဟန်)</option>
-                        </select>
+                        {(() => {
+                          const scriptStyleOptions: ReadonlyArray<{
+                            id: ScriptStyleId;
+                            title: string;
+                            subtitleMy: string;
+                            tag?: string;
+                          }> = [
+                            {
+                              id: 'narrator',
+                              title: 'Fast Recap',
+                              subtitleMy: 'အမြန်ဆွဲဆောင် ပြောဟန်',
+                              tag: 'Popular'
+                            },
+                            {
+                              id: 'natural',
+                              title: 'Natural Flow',
+                              subtitleMy: 'သဘာဝ အပြောဟန်'
+                            },
+                            {
+                              id: 'hybrid',
+                              title: 'Hybrid Dialogue',
+                              subtitleMy: 'ဇာတ်ကြောင်းပြော + ဇာတ်ကောင်စကားပြော'
+                            },
+                            {
+                              id: 'drama',
+                              title: 'Storytelling',
+                              subtitleMy: 'ရုပ်ရှင်ဇာတ်လမ်း ပြောဟန်'
+                            },
+                            {
+                              id: 'casual',
+                              title: 'Gen Z',
+                              subtitleMy: 'လူငယ်ဆန်ဆန် သွက်လက်ပြောဟန်'
+                            },
+                            {
+                              id: 'news',
+                              title: 'News',
+                              subtitleMy: 'သတင်းကြေညာ တင်ဆက်ဟန်'
+                            },
+                            {
+                              id: 'none',
+                              title: 'Documentary',
+                              subtitleMy: 'မှတ်တမ်းရုပ်ရှင် လေးနက်ပြောဟန်'
+                            }
+                          ];
+                          const activeOpt =
+                            scriptStyleOptions.find((o) => o.id === scriptStyle) ||
+                            scriptStyleOptions[0];
+                          return (
+                            <div
+                              className="relative flex flex-col gap-1.5"
+                              onKeyDown={(e) => {
+                                if (e.key === 'Escape' && isScriptStyleMenuOpen) {
+                                  setIsScriptStyleMenuOpen(false);
+                                }
+                              }}
+                            >
+                              <button
+                                type="button"
+                                data-testid="script-style-trigger"
+                                aria-haspopup="listbox"
+                                aria-expanded={isScriptStyleMenuOpen}
+                                onClick={() => {
+                                  playUiSound('tap');
+                                  setIsScriptStyleMenuOpen((open) => !open);
+                                }}
+                                className={`flex min-h-[44px] w-full cursor-pointer items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left shadow-2xs transition-all outline-none ${
+                                  isScriptStyleMenuOpen
+                                    ? 'border-amber-500 bg-amber-500/[0.06] ring-1 ring-amber-500/30 dark:border-amber-400 dark:bg-[#17202E]'
+                                    : 'border-stone-200/90 bg-white hover:border-amber-400/70 dark:border-slate-700/80 dark:bg-[#151C26] dark:hover:border-amber-400/50'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-xs font-bold text-stone-900 dark:text-white">
+                                      {activeOpt.title}
+                                    </span>
+                                    {activeOpt.tag && (
+                                      <span className="rounded bg-amber-500/15 px-1.5 py-0.2 text-[9px] font-bold text-amber-700 dark:text-amber-300">
+                                        {activeOpt.tag}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="truncate text-[11px] font-medium text-stone-500 dark:text-slate-400">
+                                    {activeOpt.subtitleMy}
+                                  </p>
+                                </div>
+                                <ChevronDown
+                                  className={`size-4 shrink-0 text-stone-400 transition-transform duration-200 dark:text-slate-400 ${
+                                    isScriptStyleMenuOpen ? 'rotate-180 text-amber-500 dark:text-amber-400' : ''
+                                  }`}
+                                />
+                              </button>
+
+                              {isScriptStyleMenuOpen && (
+                                <div
+                                  role="listbox"
+                                  aria-label="Script style options"
+                                  data-testid="script-style-listbox"
+                                  className="flex flex-col gap-1 rounded-xl border border-stone-200/90 bg-[#FAF9F5] p-1.5 shadow-xl dark:border-slate-700/80 dark:bg-[#0D131D]"
+                                >
+                                  {scriptStyleOptions.map((opt) => {
+                                    const selected = scriptStyle === opt.id;
+                                    return (
+                                      <button
+                                        key={opt.id}
+                                        type="button"
+                                        role="option"
+                                        aria-selected={selected}
+                                        data-testid={`script-style-option-${opt.id}`}
+                                        onClick={() => {
+                                          playUiSound('select');
+                                          setScriptStyle(opt.id);
+                                          setIsScriptStyleMenuOpen(false);
+                                        }}
+                                        className={`flex min-h-[44px] w-full cursor-pointer items-center justify-between gap-2.5 rounded-lg border px-2.5 py-2 text-left transition-all ${
+                                          selected
+                                            ? 'border-amber-500/80 bg-amber-500/12 shadow-2xs dark:border-amber-400/70 dark:bg-amber-500/15'
+                                            : 'border-transparent bg-white/75 hover:border-stone-200 hover:bg-white dark:bg-[#141C27] dark:hover:border-slate-700 dark:hover:bg-[#192332]'
+                                        }`}
+                                      >
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-1.5">
+                                            <span
+                                              className={`text-xs font-bold ${
+                                                selected
+                                                  ? 'text-amber-800 dark:text-amber-300'
+                                                  : 'text-stone-900 dark:text-slate-100'
+                                              }`}
+                                            >
+                                              {opt.title}
+                                            </span>
+                                            {opt.tag && (
+                                              <span className="rounded bg-amber-500/15 px-1.5 py-0.2 text-[9px] font-bold text-amber-700 dark:text-amber-300">
+                                                {opt.tag}
+                                              </span>
+                                            )}
+                                          </div>
+                                          <p className="mt-0.5 text-[11px] leading-snug text-stone-500 dark:text-slate-400">
+                                            {opt.subtitleMy}
+                                          </p>
+                                        </div>
+                                        <span
+                                          className={`flex size-5 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                                            selected
+                                              ? 'border-amber-500 bg-amber-500 text-slate-950 dark:border-amber-400 dark:bg-amber-400'
+                                              : 'border-stone-300 bg-transparent dark:border-slate-600'
+                                          }`}
+                                        >
+                                          {selected && <Check className="size-3 stroke-[3]" />}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                         {SCRIPT_STYLE_PROMPTS[scriptStyle]?.descriptionMy && (
                           <p className="text-[11px] leading-relaxed text-stone-500 dark:text-slate-400">
                             {SCRIPT_STYLE_PROMPTS[scriptStyle].descriptionMy}
@@ -3135,15 +3300,133 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       />
                     </div>
 
-                    <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
-                      <DottedTooltipLabel
-                        label="Color shift"
-                        tooltip="Subtly shifts tones for a fresh visual look."
-                      />
-                      <StreamWaveSwitch
-                        checked={effects.colorShift}
-                        onCheckedChange={(v) => setEffects({ ...effects, colorShift: v })}
-                      />
+                    <div className="flex flex-col border-b border-stone-100 py-2 dark:border-slate-800/70">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-1.5">
+                          <DottedTooltipLabel
+                            label="Color shift"
+                            tooltip="Pick from 10 cinematic color grading effects. Vivid Warm is free; 9 extra effects are Credit Mode only."
+                          />
+                          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold text-amber-700 dark:text-amber-300">
+                            {isFreeTier ? '1 Free · 9 Credit' : '10 FX'}
+                          </span>
+                        </div>
+                        <StreamWaveSwitch
+                          checked={effectiveEffects.colorShift}
+                          onCheckedChange={(v) => {
+                            setColorShiftLockNotice(null);
+                            setEffects((prev) => ({
+                              ...prev,
+                              colorShift: v,
+                              colorShiftPreset: resolveAllowedColorShiftPresetId(
+                                prev.colorShiftPreset,
+                                isFreeTier
+                              )
+                            }));
+                          }}
+                        />
+                      </div>
+
+                      {/* Swipeable / Tap-to-Select 10 Color Shift Effect Presets Strip */}
+                      <div className="mt-2 flex flex-col gap-1">
+                        <div className="flex items-center justify-between text-[9.5px] text-stone-400 dark:text-slate-500">
+                          <span>
+                            {uiLang === 'my'
+                              ? 'လက်ဖြင့် ဘေးဆွဲ၍ Effect ၁၀ မျိုး ရွေးနိုင်သည်'
+                              : 'Swipe & tap to pick a color effect'}
+                          </span>
+                          {effectiveEffects.colorShift && (
+                            <span className="font-semibold text-amber-600 dark:text-amber-300">
+                              {(() => {
+                                const cur = COLOR_SHIFT_PRESETS.find(
+                                  (p) => p.id === (effectiveEffects.colorShiftPreset || 'vivid')
+                                );
+                                return cur ? (uiLang === 'my' ? cur.labelMy : cur.labelEn) : '';
+                              })()}
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          data-testid="color-shift-preset-strip"
+                          className="flex touch-pan-x snap-x gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                        >
+                          {COLOR_SHIFT_PRESETS.map((preset, idx) => {
+                            const isLocked = isFreeTier && !preset.freeAllowed;
+                            const isSelected =
+                              effectiveEffects.colorShift &&
+                              (effectiveEffects.colorShiftPreset || 'vivid') === preset.id;
+                            return (
+                              <button
+                                key={preset.id}
+                                type="button"
+                                data-testid={`color-shift-preset-${preset.id}`}
+                                onClick={() => {
+                                  playUiSound('tap');
+                                  if (isLocked) {
+                                    setColorShiftLockNotice(
+                                      uiLang === 'my'
+                                        ? `"${preset.labelMy}" Effect ကို Credit Mode တွင်သာ အသုံးပြုနိုင်ပါသည် (Free Mode တွင် #1 စိုပြေ ၁ မျိုးသာ ရပါသည်)`
+                                        : `"${preset.labelEn}" is Credit Mode only (Free Mode includes Vivid Warm only).`
+                                    );
+                                    return;
+                                  }
+                                  setColorShiftLockNotice(null);
+                                  setEffects((prev) => ({
+                                    ...prev,
+                                    colorShift: true,
+                                    colorShiftPreset: preset.id
+                                  }));
+                                }}
+                                className={`group relative flex w-[74px] shrink-0 snap-start flex-col items-center gap-1 rounded-xl border p-1.5 text-center transition-all ${
+                                  isSelected
+                                    ? 'border-amber-500 bg-amber-500/15 ring-1 ring-amber-500/50 dark:border-amber-400'
+                                    : isLocked
+                                      ? 'cursor-not-allowed border-stone-200/70 bg-stone-100/70 opacity-75 dark:border-slate-800 dark:bg-[#0D1117]/80'
+                                      : 'cursor-pointer border-stone-200/90 bg-white hover:border-amber-400 dark:border-slate-700/80 dark:bg-[#111720] dark:hover:border-amber-400/60'
+                                }`}
+                              >
+                                <div
+                                  className="relative flex h-7 w-full items-center justify-center overflow-hidden rounded-lg shadow-inner"
+                                  style={{ background: preset.swatchGradient }}
+                                >
+                                  <span className="absolute top-0.5 left-1 font-mono text-[8px] font-bold text-white/90 drop-shadow">
+                                    {idx + 1}
+                                  </span>
+                                  {isLocked ? (
+                                    <span className="flex items-center gap-0.5 rounded-full bg-black/65 px-1.5 py-0.5 text-[8px] font-bold text-amber-300">
+                                      <Lock className="size-2.5" />
+                                      <span>Pro</span>
+                                    </span>
+                                  ) : preset.freeAllowed && isFreeTier ? (
+                                    <span className="rounded-full bg-black/55 px-1.5 py-0.5 text-[8px] font-bold text-emerald-300">
+                                      Free
+                                    </span>
+                                  ) : isSelected ? (
+                                    <Check className="size-3.5 stroke-[3] text-white drop-shadow" />
+                                  ) : null}
+                                </div>
+                                <span
+                                  className={`line-clamp-1 w-full text-[9.5px] font-bold ${
+                                    isSelected
+                                      ? 'text-amber-700 dark:text-amber-300'
+                                      : 'text-stone-700 dark:text-slate-300'
+                                  }`}
+                                >
+                                  {uiLang === 'my' ? preset.labelMy : preset.labelEn}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {colorShiftLockNotice && (
+                          <p
+                            data-testid="color-shift-lock-notice"
+                            className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-800 dark:text-amber-200"
+                          >
+                            {colorShiftLockNotice}
+                          </p>
+                        )}
+                      </div>
                     </div>
 
                     <div className="flex items-center justify-between border-b border-stone-100 py-2 dark:border-slate-800/70">
@@ -3178,6 +3461,20 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                         onCheckedChange={(v) => setEffects({ ...effects, pitchShift: v })}
                       />
                     </div>
+
+                    {/* Timed Blur & Timed Add Text Overlays inside Copyright Settings (Credit Mode Only) */}
+                    <CopyrightTimedOverlaysPanel
+                      uiLang={uiLang}
+                      isFreeTier={isFreeTier}
+                      videoDuration={videoDuration}
+                      currentTimeSec={previewCurrentTimeSec}
+                      editConfig={effectiveEditConfig}
+                      onChangeEditConfig={setEditConfig}
+                      onSeekPreview={(sec) =>
+                        setExternalSeekRequest((prev) => ({ sec, seq: (prev?.seq || 0) + 1 }))
+                      }
+                      onEnterEditMode={() => setIsOverlayEditMode(true)}
+                    />
                   </div>
                 </div>
               )}
@@ -3483,8 +3780,11 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               }}
               subtitleConfig={subtitleConfig}
               onChangeSubtitleConfig={setSubtitleConfig}
-              effects={effects}
+              effects={effectiveEffects}
               editConfig={effectiveEditConfig}
+              onChangeEditConfig={setEditConfig}
+              externalSeekRequest={externalSeekRequest}
+              onCurrentTimeChange={setPreviewCurrentTimeSec}
               cues={cues}
               targetLanguage={targetLanguage}
               audioBase64={

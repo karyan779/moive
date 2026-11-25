@@ -57,11 +57,34 @@ export interface SubtitleOverlayConfig {
   samplePreviewLight: boolean;
 }
 
+export type ColorShiftPresetId =
+  | 'vivid'
+  | 'cinema_teal'
+  | 'golden_hour'
+  | 'cyber_neon'
+  | 'cool_noir'
+  | 'vintage_film'
+  | 'dramatic_dark'
+  | 'rose_bloom'
+  | 'emerald_matrix'
+  | 'bw_classic';
+
+export interface ColorShiftPresetDefinition {
+  id: ColorShiftPresetId;
+  labelEn: string;
+  labelMy: string;
+  freeAllowed: boolean;
+  cssFilter: string;
+  ffmpegFilter: string;
+  swatchGradient: string;
+}
+
 export interface AntiCopyrightEffects {
   outputHD: boolean; // FHD 1080p vs 720p
   zoom: boolean; // Dynamic zoom 1.15x sine wave 4s cycle
   mirror: boolean; // Horizontal flip
-  colorShift: boolean; // hue-rotate(10deg) saturate(1.1)
+  colorShift: boolean; // Color shift filter enabled
+  colorShiftPreset?: ColorShiftPresetId; // Active Color Shift preset (vivid = Free, 9 others = Credit Mode Only)
   crop: boolean; // Slight crop 4% edge trim
   grain: boolean; // Film grain procedural overlay
   pitchShift: boolean; // Audio pitch +5%
@@ -91,6 +114,29 @@ export interface BrandLogoConfig {
   pos: BrandGridPos;
 }
 
+export interface TimedBlurOverlay {
+  id: string;
+  x: number; // 0..95 (% from left)
+  y: number; // 0..95 (% from top)
+  width: number; // 8..100 (% width)
+  height: number; // 4..100 (% height)
+  blurStrength: number; // 10..60
+  startSec: number; // >= 0
+  endSec: number; // > startSec
+}
+
+export interface TimedTextOverlay {
+  id: string;
+  text: string;
+  x: number; // 5..95 (% center X)
+  y: number; // 5..95 (% center Y)
+  fontSize: number; // 14..64
+  color: string; // hex color e.g. #FFFFFF
+  bgColor: string; // '' (none) or hex e.g. #000000
+  startSec: number; // >= 0
+  endSec: number; // > startSec
+}
+
 export interface DeepRecapEditConfig {
   fitMode: FramingFitMode;
   focus: FocusAnchor;
@@ -103,6 +149,8 @@ export interface DeepRecapEditConfig {
   brandLogo: BrandLogoConfig;
   captionTextColor: string; // empty string = default theme color (#FFFFFF / #FDE047)
   captionOutlineWidth: number; // 0..8
+  timedBlurs?: TimedBlurOverlay[];
+  timedTexts?: TimedTextOverlay[];
 }
 
 export const DEFAULT_DEEPRECAP_EDIT_CONFIG: DeepRecapEditConfig = {
@@ -134,7 +182,9 @@ export const DEFAULT_DEEPRECAP_EDIT_CONFIG: DeepRecapEditConfig = {
     pos: 'tl'
   },
   captionTextColor: '',
-  captionOutlineWidth: 3
+  captionOutlineWidth: 3,
+  timedBlurs: [],
+  timedTexts: []
 };
 
 export const CAPTION_COLOR_PRESETS: { id: string; label: string; hex: string }[] = [
@@ -1904,9 +1954,13 @@ ${speakerRule}
   }
 
   const isCaptionsOnly = opts.translateAudio === 'captions-only';
+  const myanmarCaptionsEllipsisRule =
+    isCaptionsOnly && opts.targetLanguage === 'my'
+      ? `\n- BURMESE CAPTIONS-ONLY PAUSE STYLE: NEVER use the Burmese little section mark "၊" or commas between Burmese words/clauses; whenever there is a spoken pause, hesitation, or mid-line break, write three dots "..." instead (e.g. "မင်း...ဘာဖြစ်တယ်", "ငါ...မသိဘူး", "...ဒါပေမဲ့").`
+      : '';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
       : '';
   const speakerNote = isCaptionsOnly
     ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE TWO SPEAKERS!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
@@ -6098,5 +6152,366 @@ export function shouldShowSiteNotification(
   return !dismissedIds.includes(id);
 }
 
+export const TIMED_TEXT_COLOR_PRESETS: { id: string; label: string; hex: string }[] = [
+  { id: 'white', label: 'White', hex: '#FFFFFF' },
+  { id: 'yellow', label: 'Yellow', hex: '#FFE600' },
+  { id: 'cyan', label: 'Cyan', hex: '#7DE3FF' },
+  { id: 'pink', label: 'Pink', hex: '#FF8FB1' },
+  { id: 'green', label: 'Green', hex: '#8CF0A0' },
+  { id: 'orange', label: 'Orange', hex: '#FF9F43' }
+];
 
+export const TIMED_TEXT_BG_PRESETS: { id: string; label: string; hex: string }[] = [
+  { id: 'none', label: 'None', hex: '' },
+  { id: 'dark', label: 'Dark', hex: '#000000' },
+  { id: 'crimson', label: 'Red', hex: '#B91C1C' },
+  { id: 'amber', label: 'Gold', hex: '#D97706' }
+];
+
+/**
+ * Clamps a timed overlay [startSec, endSec] range strictly within [0, maxDurationSec],
+ * guaranteeing endSec >= startSec + 0.5 (or maxDurationSec when the clip is shorter than 0.5s).
+ */
+export function clampTimedOverlayRange(
+  startSec: number,
+  endSec: number,
+  maxDurationSec: number
+): { startSec: number; endSec: number } {
+  const safeMax = Math.max(0.5, Number.isFinite(maxDurationSec) && maxDurationSec > 0 ? maxDurationSec : 15);
+  const minSpan = Math.min(0.5, safeMax);
+  const rawStart = Number.isFinite(startSec) ? startSec : 0;
+  const rawEnd = Number.isFinite(endSec) ? endSec : Math.min(10, safeMax);
+
+  let s = Math.max(0, Math.min(safeMax - minSpan, rawStart));
+  let e = Math.max(s + minSpan, Math.min(safeMax, rawEnd));
+
+  s = Math.round(s * 10) / 10;
+  e = Math.round(e * 10) / 10;
+  if (e <= s) {
+    e = Math.min(safeMax, Math.round((s + minSpan) * 10) / 10);
+  }
+  return { startSec: s, endSec: e };
+}
+
+/**
+ * Checks whether a timed blur or timed text overlay should be displayed at `currentTimeSec`.
+ */
+export function isTimedOverlayActiveAtTime(
+  overlay: { startSec: number; endSec: number } | undefined | null,
+  currentTimeSec: number
+): boolean {
+  if (!overlay) return false;
+  const t = Number.isFinite(currentTimeSec) ? currentTimeSec : 0;
+  const s = Number.isFinite(overlay.startSec) ? overlay.startSec : 0;
+  const e = Number.isFinite(overlay.endSec) ? overlay.endSec : 0;
+  if (e <= s) return false;
+  return t >= s - 0.05 && t <= e + 0.05;
+}
+
+/**
+ * Parses a user-typed timecode like "0:10", "1:30", "4:00", or plain seconds like "12.5" into seconds.
+ * Returns null if the string cannot be parsed.
+ */
+export function parseTimecodeToSeconds(
+  raw: string | number | undefined | null,
+  maxDurationSec = 10800
+): number | null {
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0) return null;
+    return Math.min(Math.max(0, raw), Math.max(0.5, maxDurationSec));
+  }
+  const str = String(raw || '').trim();
+  if (!str) return null;
+
+  let seconds: number | null = null;
+  if (str.includes(':')) {
+    const parts = str.split(':').map((p) => Number(p.trim()));
+    if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+    if (parts.length === 2) {
+      seconds = parts[0] * 60 + parts[1];
+    } else if (parts.length === 3) {
+      seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+  } else {
+    const num = Number(str);
+    if (Number.isFinite(num) && num >= 0) {
+      seconds = num;
+    }
+  }
+  if (seconds === null || !Number.isFinite(seconds)) return null;
+  return Math.round(Math.min(Math.max(0, seconds), Math.max(0.5, maxDurationSec)) * 10) / 10;
+}
+
+/**
+ * Formats seconds into compact MM:SS (or H:MM:SS) for timed overlay sliders & badges.
+ */
+export function formatTimedOverlaySec(sec: number): string {
+  const safe = Math.max(0, Number.isFinite(sec) ? sec : 0);
+  const whole = Math.floor(safe);
+  const hrs = Math.floor(whole / 3600);
+  const mins = Math.floor((whole % 3600) / 60);
+  const secs = whole % 60;
+  if (hrs > 0) {
+    return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
+/**
+ * Creates a default Timed Blur overlay (default 0:00 -> 0:10 or clip duration) placed cleanly on stage.
+ */
+export function createDefaultTimedBlur(
+  videoDurationSec: number,
+  existingCount = 0,
+  startAtSec = 0
+): TimedBlurOverlay {
+  const safeDur = Math.max(1, Number.isFinite(videoDurationSec) && videoDurationSec > 0 ? videoDurationSec : 60);
+  const range = clampTimedOverlayRange(startAtSec, Math.min(safeDur, startAtSec + 10), safeDur);
+  const offsetY = 14 + ((existingCount * 14) % 52);
+  return {
+    id: `tblur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    x: 10,
+    y: offsetY,
+    width: 80,
+    height: 12,
+    blurStrength: 24,
+    startSec: range.startSec,
+    endSec: range.endSec
+  };
+}
+
+/**
+ * Creates a default Timed Text overlay (default 0:00 -> 0:10 or clip duration) centered on stage.
+ */
+export function createDefaultTimedText(
+  videoDurationSec: number,
+  existingCount = 0,
+  startAtSec = 0
+): TimedTextOverlay {
+  const safeDur = Math.max(1, Number.isFinite(videoDurationSec) && videoDurationSec > 0 ? videoDurationSec : 60);
+  const range = clampTimedOverlayRange(startAtSec, Math.min(safeDur, startAtSec + 10), safeDur);
+  const offsetY = 20 + ((existingCount * 12) % 48);
+  return {
+    id: `ttxt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    text: 'စာသားအသစ်',
+    x: 50,
+    y: offsetY,
+    fontSize: 30,
+    color: '#FFE600',
+    bgColor: '#000000',
+    startSec: range.startSec,
+    endSec: range.endSec
+  };
+}
+
+/**
+ * Produces a strictly sanitized FFmpeg overlay `enable` expression for a Timed Blur window.
+ */
+export function buildTimedBlurEnableExpr(startSec: number, endSec: number): string {
+  const safeStart = Math.max(0, Math.min(86400, Number.isFinite(startSec) ? startSec : 0));
+  const safeEnd = Math.max(safeStart + 0.1, Math.min(86400, Number.isFinite(endSec) ? endSec : safeStart + 1));
+  return `between(t,${safeStart.toFixed(2)},${safeEnd.toFixed(2)})`;
+}
+
+/**
+ * Sanitizes custom user text for safe ASS Dialogue insertion (preserving Burmese Unicode & line breaks,
+ * stripping ASS override braces `{}` and control chars).
+ */
+export function sanitizeTimedTextForAss(rawText: string | undefined | null): string {
+  return String(rawText || '')
+    .replace(/[{}]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join('\\N')
+    .slice(0, 240);
+}
+
+/**
+ * 10 curated Color Shift presets.
+ * ONLY preset #1 (`vivid`) is allowed in Free Mode; the other 9 presets are Credit Mode Only.
+ * Every `ffmpegFilter` string is strictly hardcoded here (allowlist) — never built from user input.
+ */
+export const COLOR_SHIFT_PRESETS: readonly ColorShiftPresetDefinition[] = [
+  {
+    id: 'vivid',
+    labelEn: 'Vivid Warm',
+    labelMy: 'စိုပြေ',
+    freeAllowed: true,
+    cssFilter: 'hue-rotate(18deg) saturate(1.25) contrast(1.06) brightness(1.02)',
+    ffmpegFilter: 'hue=h=18:s=1.25,eq=contrast=1.06:brightness=0.015',
+    swatchGradient: 'linear-gradient(135deg, #f59e0b 0%, #ef4444 100%)'
+  },
+  {
+    id: 'cinema_teal',
+    labelEn: 'Teal Cinema',
+    labelMy: 'ရုပ်ရှင်စတိုင်',
+    freeAllowed: false,
+    cssFilter: 'contrast(1.14) saturate(1.18) hue-rotate(-14deg) brightness(0.98)',
+    ffmpegFilter:
+      'colorbalance=rs=-0.06:gs=0.03:bs=0.10:rh=0.10:gh=0.03:bh=-0.06,eq=contrast=1.12:saturation=1.16',
+    swatchGradient: 'linear-gradient(135deg, #0d9488 0%, #f97316 100%)'
+  },
+  {
+    id: 'golden_hour',
+    labelEn: 'Golden Glow',
+    labelMy: 'ရွှေရောင်',
+    freeAllowed: false,
+    cssFilter: 'sepia(0.26) saturate(1.38) contrast(1.06) brightness(1.05)',
+    ffmpegFilter:
+      'colorbalance=rm=0.12:gm=0.05:bm=-0.10:rh=0.10:bh=-0.08,eq=saturation=1.28:brightness=0.03:contrast=1.05',
+    swatchGradient: 'linear-gradient(135deg, #fbbf24 0%, #ea580c 100%)'
+  },
+  {
+    id: 'cyber_neon',
+    labelEn: 'Cyber Neon',
+    labelMy: 'နီယွန်',
+    freeAllowed: false,
+    cssFilter: 'hue-rotate(-34deg) saturate(1.58) contrast(1.16) brightness(1.02)',
+    ffmpegFilter: 'hue=h=-34:s=1.55,eq=contrast=1.14:brightness=0.015',
+    swatchGradient: 'linear-gradient(135deg, #06b6d4 0%, #d946ef 100%)'
+  },
+  {
+    id: 'cool_noir',
+    labelEn: 'Cool Blue',
+    labelMy: 'အေးမြပြာ',
+    freeAllowed: false,
+    cssFilter: 'saturate(0.92) contrast(1.1) brightness(0.98) hue-rotate(-22deg)',
+    ffmpegFilter:
+      'colorbalance=rs=-0.08:gs=0.01:bs=0.14:rm=-0.05:bm=0.10,eq=contrast=1.10:saturation=0.92',
+    swatchGradient: 'linear-gradient(135deg, #2563eb 0%, #0ea5e9 100%)'
+  },
+  {
+    id: 'vintage_film',
+    labelEn: 'Vintage 90s',
+    labelMy: 'ဖလင်ဟောင်း',
+    freeAllowed: false,
+    cssFilter: 'sepia(0.38) contrast(0.96) saturate(0.88) brightness(1.04)',
+    ffmpegFilter:
+      'colorbalance=rs=0.06:gs=0.03:bs=-0.05:rm=0.05:bm=-0.07,eq=contrast=0.96:saturation=0.82:brightness=0.025',
+    swatchGradient: 'linear-gradient(135deg, #a16207 0%, #d6d3d1 100%)'
+  },
+  {
+    id: 'dramatic_dark',
+    labelEn: 'Dark Moody',
+    labelMy: 'သည်းထိတ်ရင်ဖို',
+    freeAllowed: false,
+    cssFilter: 'contrast(1.28) brightness(0.86) saturate(0.82)',
+    ffmpegFilter: 'eq=contrast=1.26:brightness=-0.08:saturation=0.80:gamma=0.92',
+    swatchGradient: 'linear-gradient(135deg, #1e293b 0%, #475569 100%)'
+  },
+  {
+    id: 'rose_bloom',
+    labelEn: 'Rose Bloom',
+    labelMy: 'ပန်းနုရောင်',
+    freeAllowed: false,
+    cssFilter: 'hue-rotate(-18deg) saturate(1.26) brightness(1.06) contrast(1.02)',
+    ffmpegFilter:
+      'colorbalance=rm=0.11:gm=-0.03:bm=0.06:rh=0.08:bh=0.05,eq=saturation=1.22:brightness=0.03',
+    swatchGradient: 'linear-gradient(135deg, #f43f5e 0%, #ec4899 100%)'
+  },
+  {
+    id: 'emerald_matrix',
+    labelEn: 'Emerald',
+    labelMy: 'မြစိမ်း',
+    freeAllowed: false,
+    cssFilter: 'hue-rotate(58deg) saturate(1.18) contrast(1.1) brightness(0.96)',
+    ffmpegFilter:
+      'colorbalance=rs=-0.06:gs=0.12:bs=-0.04:gm=0.09,eq=contrast=1.10:saturation=1.12',
+    swatchGradient: 'linear-gradient(135deg, #10b981 0%, #047857 100%)'
+  },
+  {
+    id: 'bw_classic',
+    labelEn: 'Classic B&W',
+    labelMy: 'အဖြူအမည်း',
+    freeAllowed: false,
+    cssFilter: 'grayscale(1) contrast(1.18) brightness(1.02)',
+    ffmpegFilter: 'hue=s=0,eq=contrast=1.18:brightness=0.01',
+    swatchGradient: 'linear-gradient(135deg, #f8fafc 0%, #0f172a 100%)'
+  }
+];
+
+/**
+ * Strictly validates & enforces Free Mode vs Credit Mode access for Color Shift presets.
+ * Free Mode is always restricted to `'vivid'`; Credit Mode unlocks all 10 presets.
+ */
+export function resolveAllowedColorShiftPresetId(
+  presetId: string | undefined | null,
+  isFreeTier: boolean
+): ColorShiftPresetId {
+  if (isFreeTier) return 'vivid';
+  const found = COLOR_SHIFT_PRESETS.find((p) => p.id === presetId);
+  return found ? found.id : 'vivid';
+}
+
+export function resolveColorShiftPreset(
+  presetId: string | undefined | null,
+  isFreeTier = false
+): ColorShiftPresetDefinition {
+  const safeId = resolveAllowedColorShiftPresetId(presetId, isFreeTier);
+  return COLOR_SHIFT_PRESETS.find((p) => p.id === safeId) || COLOR_SHIFT_PRESETS[0];
+}
+
+/**
+ * Timed Blur and Timed Add Text overlays are Credit Mode Only.
+ */
+export function isTimedOverlayFeatureAllowed(isFreeTier: boolean): boolean {
+  return !isFreeTier;
+}
+
+/**
+ * Returns true when a user's direct timecode entry is a complete M:SS / MM:SS / H:MM:SS string
+ * (e.g. `0:11`, `1:05`, `02:30`) so the UI can apply it immediately on typing without pressing Enter.
+ */
+export function isCompleteTimecodeInput(raw: string): boolean {
+  return /^\s*\d{1,2}:[0-5]\d(?::[0-5]\d)?\s*$/.test(String(raw || ''));
+}
+
+/**
+ * Replaces Burmese pause/comma marks (`၊`, and `,` / `，` / `、` adjacent to Myanmar text)
+ * with cinematic three-dot ellipses (`...`) for Translate Captions-Only Burmese subtitles
+ * (e.g. `မင်း၊ဘာဖြစ်တယ်` -> `မင်း...ဘာဖြစ်တယ်`, `ငါ၊က` -> `ငါ...က`, `၊ဒါ` -> `...ဒါ`)
+ * while preserving numeric commas like `1,000` and `50,000`.
+ */
+export function formatBurmeseCaptionsOnlyPunctuation(rawText: string): string {
+  const input = String(rawText || '');
+  if (!input.trim()) return input;
+  return input
+    // Replace Burmese little section mark `၊` (U+104A) and surrounding optional spaces with `...`
+    .replace(/[ \t]*\u104A+[ \t]*/g, '...')
+    // Replace commas adjacent to Myanmar Unicode characters (never touching numeric 1,000)
+    .replace(/([\u1000-\u109F])[ \t]*[,，、]+[ \t]*/g, '$1...')
+    .replace(/[ \t]*[,，、]+[ \t]*([\u1000-\u109F])/g, '...$1')
+    // Normalize Unicode ellipsis / 4+ dots cleanly to `...`
+    .replace(/\.{4,}|…\.+|\.+…/g, '...')
+    .trim();
+}
+
+/**
+ * Applies `formatBurmeseCaptionsOnlyPunctuation` across a Captions-Only Burmese subtitle cue array.
+ */
+export function applyBurmeseCaptionsOnlyPunctuation(
+  cues: SubtitleCue[],
+  targetLanguage: TargetLanguageCode = 'my'
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0 || targetLanguage !== 'my') {
+    return cues;
+  }
+  return cues.map((cue) => {
+    const nextText = formatBurmeseCaptionsOnlyPunctuation(cue.text);
+    const nextBurmese =
+      typeof cue.burmeseText === 'string'
+        ? formatBurmeseCaptionsOnlyPunctuation(cue.burmeseText)
+        : cue.burmeseText;
+    if (nextText === cue.text && nextBurmese === cue.burmeseText) {
+      return cue;
+    }
+    return {
+      ...cue,
+      text: nextText,
+      ...(typeof nextBurmese === 'string' ? { burmeseText: nextBurmese } : {})
+    };
+  });
+}
 
