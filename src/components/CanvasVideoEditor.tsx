@@ -469,10 +469,13 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
     }
   }, [currentTime, onCurrentTimeChange]);
 
+  const lastHandledSeekSeqRef = useRef<number>(0);
+
   useEffect(() => {
-    if (!externalSeekRequest) return;
+    if (!externalSeekRequest || externalSeekRequest.seq === lastHandledSeekSeqRef.current) return;
+    lastHandledSeekSeqRef.current = externalSeekRequest.seq;
     const safeSec = Math.max(0, Math.min(Math.max(1, videoDuration || 60), externalSeekRequest.sec));
-    lastUserSeekAtRef.current = Date.now();
+    lastUserSeekAtRef.current = performance.now();
     setCurrentTime(safeSec);
     if (videoRef.current) {
       try {
