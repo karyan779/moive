@@ -1753,6 +1753,117 @@ export function applyBurmeseDialogueExclamationRules(
   return working;
 }
 
+const SHORT_LEADING_SAME_SPEAKER_EXCLAMATION_REGEX =
+  /^(?:အိုက်ယား|ဟယ်|ဟာ|အိုး|အို|အာ|အား|ဝိုး|အမလေး|အလိုလေး|ဘုရားရေ|ဒုက္ခပဲ|ဟေ့|ဟေး|အင်း|အဲ|အေး|ဟုတ်|ဟုတ်ကဲ့|မဟုတ်ဘူး|ခဏ|Oh|Ah|Hey|Wait|Whoa|Wow|No|Yes)[!！.။…]*$/i;
+
+/**
+ * Splits accidentally merged multi-speaker / back-and-forth dialogue cues into separate
+ * individual speaker cues (1 speaker turn = 1 subtitle cue) while preserving exact total
+ * timing bounds [start_ms, end_ms] without drifting subsequent cues.
+ */
+export function splitMultiSpeakerDialogueCues(cues: SubtitleCue[]): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const result: SubtitleCue[] = [];
+  let seq = 1;
+
+  for (const cue of cues) {
+    const raw = String(cue.text || '').trim();
+    if (!raw) continue;
+
+    // 1) Split on explicit newlines or multi-speaker dash turns (e.g. "- Line A - Line B" or "Line A? - Line B")
+    let rawTurns: string[] = [];
+    const lines = raw
+      .split(/\r?\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      // Split inline speaker turn markers: space + dash/em-dash + space (e.g. "ဘာလဲ? - ဘာမှမဟုတ်ဘူး" or "- ဟုတ်လား - အင်း")
+      const dashParts = line
+        .replace(/^\s*[-–—•]\s+/, '')
+        .split(/\s+[-–—]\s+/)
+        .map((p) => p.replace(/^\s*[-–—•]\s*/, '').trim())
+        .filter(Boolean);
+      rawTurns.push(...dashParts);
+    }
+
+    // 2) Further split merged sentences/Q&A turns on sentence boundaries (?, ？, !, ！, ။, ។)
+    //    while keeping short same-speaker leading exclamations (e.g. "အိုက်ယား! ဘယ်လိုဖြစ်တာလဲ") attached!
+    const finalTurns: string[] = [];
+    for (const turn of rawTurns) {
+      const sentenceParts = turn
+        .split(/(?<=[?？!！။។])\s+|(?<=[?？!！။។])(?=[^\s?？!！။។.,'"”’)\]])/)
+        .map((p) => p.replace(/[။។]+$/g, '').trim())
+        .filter(Boolean);
+
+      if (sentenceParts.length <= 1) {
+        const cleanedSingle = turn.replace(/[။។]+$/g, '').trim();
+        if (cleanedSingle) finalTurns.push(cleanedSingle);
+        continue;
+      }
+
+      const mergedForSameSpeaker: string[] = [];
+      for (const part of sentenceParts) {
+        if (
+          mergedForSameSpeaker.length > 0 &&
+          SHORT_LEADING_SAME_SPEAKER_EXCLAMATION_REGEX.test(
+            mergedForSameSpeaker[mergedForSameSpeaker.length - 1]
+          )
+        ) {
+          mergedForSameSpeaker[mergedForSameSpeaker.length - 1] =
+            `${mergedForSameSpeaker[mergedForSameSpeaker.length - 1]} ${part}`.trim();
+        } else {
+          mergedForSameSpeaker.push(part);
+        }
+      }
+      finalTurns.push(...mergedForSameSpeaker);
+    }
+
+    if (finalTurns.length <= 1) {
+      const singleText = (finalTurns[0] || raw).replace(/^\s*[-–—]\s+/, '').trim();
+      result.push({
+        ...cue,
+        id: `cue-${seq++}`,
+        text: singleText
+      });
+      continue;
+    }
+
+    const startMs = Math.max(0, Math.round(Number(cue.start_ms) || 0));
+    const endMs = Math.max(startMs + finalTurns.length * 300, Math.round(Number(cue.end_ms) || startMs + 1500));
+    const totalDur = endMs - startMs;
+    const totalChars = Math.max(
+      1,
+      finalTurns.reduce((sum, t) => sum + Math.max(3, t.length), 0)
+    );
+    const gapMs = 20;
+    const usableDur = Math.max(finalTurns.length * 260, totalDur - gapMs * (finalTurns.length - 1));
+
+    let cursor = startMs;
+    for (let i = 0; i < finalTurns.length; i++) {
+      const text = finalTurns[i];
+      const isLast = i === finalTurns.length - 1;
+      const weight = Math.max(3, text.length) / totalChars;
+      const share = Math.max(260, Math.round(usableDur * weight));
+      const remainingMin = (finalTurns.length - 1 - i) * (260 + gapMs);
+      const partEnd = isLast
+        ? endMs
+        : Math.min(endMs - remainingMin, cursor + share);
+      result.push({
+        ...cue,
+        id: `cue-${seq++}`,
+        start_ms: cursor,
+        end_ms: Math.max(cursor + 240, partEnd),
+        text,
+        originalText: i === 0 ? cue.originalText : undefined
+      });
+      cursor = Math.max(cursor + 240, partEnd) + gapMs;
+    }
+  }
+
+  return result;
+}
+
 /**
  * Builds dedicated system instructions for:
  * - Cinematic Movie Dialogue Translation (`dub` & `captions-only`, or STT + AI Translation)
@@ -1797,9 +1908,11 @@ ${speakerRule}
     opts.targetLanguage === 'my'
       ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!`
       : '';
-  const speakerNote = opts.speakerDiarization
-    ? `\n- SPEAKER TURNS: When multiple characters exchange quick lines inside a cue or change speakers, mark speaker turns cleanly (e.g., "- ဘယ်သွားနေတာလဲ").`
-    : '';
+  const speakerNote = isCaptionsOnly
+    ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE TWO SPEAKERS!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
+    : opts.speakerDiarization
+      ? `\n- SPEAKER TURNS: Start a new cue whenever the speaker changes.`
+      : '';
   const zeroSkipRule = isCaptionsOnly
     ? `\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word reaction (such as "等等", "什么?", "快走", "好") from 0ms to the final second! NEVER skip, drop, compress, or summarize away ANY line from the audio, timestamped transcript, or burned-in on-screen subtitles.`
     : '';
@@ -1809,8 +1922,8 @@ TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into ${langL
 CRITICAL ANTI-RECAP RULES (MUST OBEY):
 1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate what the characters are saying in first/second person as if they are speaking on screen!
 2. STRICTLY FORBIDDEN RECAP PHRASES: NEVER write third-person movie recap narrator commentary such as "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
-3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the timestamped Whisper transcript and audio speech. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
-4. ${isCaptionsOnly ? 'CRISP MOVIE SUBTITLE LINES (INCLUDING SHORT LINES): Keep each cue to 1 clean subtitle line (1 to 12 words, up to 54 characters) so viewers read effortlessly while listening to original audio. ALWAYS keep short 1–3 word exclamations and replies as their own timed cues!' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
+3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the exact moment THAT ONE speaker starts and stops speaking that single line. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
+4. ${isCaptionsOnly ? 'ONE SHORT LINE PER SPEAKER TURN: Each cue MUST hold ONLY ONE speaker\'s single short utterance (1 to 10 words, max ~46 characters, typically 0.5s–2.5s). Split every speaker change and every back-and-forth reply into its own separate timed cue!' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
 5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
 }
 
@@ -5257,11 +5370,81 @@ export interface ParsedVideoSourceUrl {
 }
 
 const PRIVATE_OR_LOCAL_HOST_REGEX =
-  /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|0\.0\.0\.0|\[::1\]|::1)$/i;
+  /^(localhost|.*\.localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+|0\.\d+\.\d+\.\d+|\[::1\]|::1|\[::\]|::|metadata\.google\.internal|metadata\.goog)$/i;
+
+/**
+ * Checks whether an IPv4 or IPv6 literal belongs to loopback, private RFC1918, link-local,
+ * cloud metadata, CGNAT, multicast, or reserved address space.
+ */
+export function isPrivateOrReservedIp(rawIp: string | undefined | null): boolean {
+  const cleaned = String(rawIp || '')
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase();
+  if (!cleaned) return true;
+
+  // Handle IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1 or ::ffff:169.254.169.254
+  const mappedV4 = cleaned.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+  const ip = mappedV4 ? mappedV4[1] : cleaned;
+
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b, c, d] = [Number(v4[1]), Number(v4[2]), Number(v4[3]), Number(v4[4])];
+    if ([a, b, c, d].some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // Link-local & cloud metadata (169.254.169.254)
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
+    if (a === 192 && b === 168) return true; // RFC1918
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true; // Multicast & reserved
+    return false;
+  }
+
+  // IPv6 private/local ranges
+  if (ip.includes(':')) {
+    if (ip === '::' || ip === '::1') return true;
+    if (/^(fc|fd)[0-9a-f]{2}:/i.test(ip)) return true; // ULA fc00::/7
+    if (/^fe[89ab][0-9a-f]:/i.test(ip)) return true; // Link-local fe80::/10
+    if (/^ff[0-9a-f]{2}:/i.test(ip)) return true; // Multicast
+    if (/^::ffff:/i.test(ip)) return true; // Unparsed IPv4-mapped IPv6
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Validates that an outbound video or redirect URL is strictly public http(s) and does not target
+ * localhost, private networks, cloud metadata endpoints, or embedded credentials.
+ */
+export function isAllowedPublicVideoStreamUrl(rawUrl: string | undefined | null): boolean {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed || trimmed.length > 4096) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+  if (parsed.username || parsed.password) return false;
+  const host = parsed.hostname.toLowerCase();
+  if (!host) return false;
+  if (
+    PRIVATE_OR_LOCAL_HOST_REGEX.test(host) ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.localhost')
+  ) {
+    return false;
+  }
+  if (isPrivateOrReservedIp(host)) return false;
+  return true;
+}
 
 /**
  * Extracts, validates, and classifies a user-pasted video URL or mobile share message
- * (e.g. "Check out this clip https://vt.tiktok.com/ZSptXq56x/" or RedNote share text "xhslink.com/a/abc123")
+ * (e.g. "Check out this clip https://vt.tiktok.com/ZSptXq56x/", "v.douyin.com/iXXX/", or RedNote share text "xhslink.com/a/abc123")
  * without breaking on surrounding text.
  */
 export function parseAndNormalizeVideoSourceUrl(
@@ -5282,7 +5465,7 @@ export function parseAndNormalizeVideoSourceUrl(
   const urlMatch = trimmed.match(/https?:\/\/[^\s"'<>`]+/i);
   const bareSocialMatch = !urlMatch
     ? trimmed.match(
-        /(?:www\.|vt\.|vm\.|m\.)?(?:xhslink\.com|xiaohongshu\.com|rednote\.com|tiktok\.com|douyin\.com|youtu\.be|youtube\.com|fb\.watch)\/[^\s"'<>`！。，、）】」]+/i
+        /(?:www\.|vt\.|vm\.|v\.|m\.)?(?:xhslink\.com|xiaohongshu\.com|rednote\.com|tiktok\.com|douyin\.com|iesdouyin\.com|youtu\.be|youtube\.com|fb\.watch)\/[^\s"'<>`！。，、）】」]+/i
       )
     : null;
   const candidate = (
@@ -5315,7 +5498,7 @@ export function parseAndNormalizeVideoSourceUrl(
   }
 
   const host = parsed.hostname.toLowerCase();
-  if (!host || PRIVATE_OR_LOCAL_HOST_REGEX.test(host) || host.endsWith('.local') || host.endsWith('.internal')) {
+  if (!isAllowedPublicVideoStreamUrl(parsed.toString())) {
     return {
       valid: false,
       normalizedUrl: '',
@@ -5355,75 +5538,182 @@ export function parseAndNormalizeVideoSourceUrl(
 }
 
 export interface RedNoteExtractedMedia {
+  /** True watermark-free original uploaded video URLs constructed from `originVideoKey`. */
+  originVideoUrls: string[];
+  /** Secondary playback streams (H.264/H.265 masterUrl/backupUrls/og:video) used only if originVideoKey is unavailable. */
+  fallbackStreamUrls: string[];
+  /** Combined ordered candidate list: originVideoUrls strictly first, then fallbackStreamUrls. */
   videoUrls: string[];
+  hasOriginVideoKey: boolean;
   title: string;
   durationSec: number;
 }
 
-/**
- * Extracts clean, watermark-free MP4 stream URLs from RedNote (Xiaohongshu) HTML / __INITIAL_STATE__ payloads.
- * Prefers `originVideoKey` (raw no-watermark CDN asset) and `stream.h264` master URLs, filtering out watermarked streams.
- */
-export function extractRedNoteVideoInfoFromHtml(html: string | undefined | null): RedNoteExtractedMedia {
-  if (!html || typeof html !== 'string') {
-    return { videoUrls: [], title: '', durationSec: 0 };
-  }
-  const normalized = html
-    .replace(/\\u002F/gi, '/')
-    .replace(/\\\//g, '/')
-    .replace(/&amp;/g, '&');
+const REDNOTE_ORIGIN_CDN_HOSTS = [
+  'sns-video-bd.xhscdn.com',
+  'sns-bak-v1.xhscdn.com',
+  'sns-video-hw.xhscdn.com',
+  'sns-video-qc.xhscdn.com',
+  'sns-video-al.xhscdn.com',
+  'sns-video-hs.xhscdn.com',
+  'sns-video-ak.xhscdn.com'
+];
 
-  const urls: string[] = [];
+/**
+ * Extracts the 24-hex Xiaohongshu / RedNote note ID from common desktop & mobile URLs.
+ */
+export function extractRedNoteNoteId(rawUrl: string | undefined | null): string | null {
+  const input = String(rawUrl || '').trim();
+  if (!input) return null;
+  const match = input.match(
+    /(?:\/(?:explore|discovery\/item|note|item)\/|\/user\/profile\/[a-f0-9]+\/)([a-f0-9]{24})(?:[/?#]|$)/i
+  );
+  return match?.[1] || null;
+}
+
+/**
+ * Builds prioritized Xiaohongshu / RedNote page URLs (preserving `xsec_token` & `xsec_source`)
+ * so `/discovery/item/<id>` and `/explore/<id>` are both probed to reliably obtain `originVideoKey`.
+ */
+export function buildRedNoteCandidatePageUrls(urls: Array<string | undefined | null>): string[] {
+  const out: string[] = [];
   const seen = new Set<string>();
-  const addUrl = (raw: string | undefined | null) => {
-    if (!raw) return;
-    let clean = raw.trim().replace(/^http:\/\//i, 'https://');
-    if (!clean.startsWith('https://')) return;
-    // Skip explicit watermarked endpoints
-    if (/watermark=1|\/wm_|_wm\.mp4/i.test(clean)) return;
+  const pushUnique = (u: string | undefined | null) => {
+    const clean = String(u || '').trim();
+    if (!clean || !isAllowedPublicVideoStreamUrl(clean)) return;
     if (!seen.has(clean)) {
       seen.add(clean);
-      urls.push(clean);
+      out.push(clean);
     }
   };
 
-  // 1) Highest priority: raw no-watermark originVideoKey (e.g. "originVideoKey":"pre_post/..." or "stream/...")
-  const originKeyMatches = normalized.matchAll(/"originVideoKey"\s*:\s*"([^"\\]+)"/g);
-  for (const m of originKeyMatches) {
-    const key = (m[1] || '').replace(/^\/+/, '').trim();
-    if (key && key.length >= 6 && !key.startsWith('http')) {
-      addUrl(`https://sns-video-bd.xhscdn.com/${key}`);
-      addUrl(`https://sns-video-hw.xhscdn.com/${key}`);
-      addUrl(`https://sns-video-qc.xhscdn.com/${key}`);
-    } else if (key.startsWith('http')) {
-      addUrl(key);
+  for (const raw of urls) {
+    if (!raw) continue;
+    const canonical = normalizeRedNoteCanonicalUrl(raw);
+    pushUnique(canonical);
+
+    const noteId = extractRedNoteNoteId(canonical);
+    if (noteId) {
+      let query = '';
+      try {
+        const parsed = new URL(canonical);
+        const keep = new URLSearchParams();
+        const xsecToken = parsed.searchParams.get('xsec_token');
+        const xsecSource = parsed.searchParams.get('xsec_source');
+        if (xsecToken) keep.set('xsec_token', xsecToken);
+        if (xsecSource) keep.set('xsec_source', xsecSource);
+        const qs = keep.toString();
+        if (qs) query = `?${qs}`;
+      } catch {}
+      pushUnique(`https://www.xiaohongshu.com/discovery/item/${noteId}${query}`);
+      pushUnique(`https://www.xiaohongshu.com/explore/${noteId}${query}`);
     }
   }
 
-  // 2) H264 stream masterUrl / backupUrls from __INITIAL_STATE__ (browser-native MP4 without watermark)
+  return out;
+}
+
+/**
+ * Extracts clean, watermark-free MP4 stream URLs from RedNote (Xiaohongshu) HTML / __INITIAL_STATE__ / JSON payloads.
+ * Strictly prioritizes `originVideoKey` (the raw, 100% watermark-free original uploaded file on xhscdn)
+ * before any playback `stream.h264` or `og:video` fallback streams.
+ */
+export function extractRedNoteVideoInfoFromHtml(html: string | undefined | null): RedNoteExtractedMedia {
+  if (!html || typeof html !== 'string') {
+    return {
+      originVideoUrls: [],
+      fallbackStreamUrls: [],
+      videoUrls: [],
+      hasOriginVideoKey: false,
+      title: '',
+      durationSec: 0
+    };
+  }
+  const normalized = html
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&');
+
+  const originVideoUrls: string[] = [];
+  const fallbackStreamUrls: string[] = [];
+  const seenOrigin = new Set<string>();
+  const seenFallback = new Set<string>();
+
+  const addOriginUrl = (raw: string | undefined | null) => {
+    if (!raw) return;
+    const clean = raw.trim().replace(/^http:\/\//i, 'https://');
+    if (!isAllowedPublicVideoStreamUrl(clean)) return;
+    if (/watermark=1|mark=1|\/wm_|_wm\.mp4|\/playwm\//i.test(clean)) return;
+    if (!seenOrigin.has(clean)) {
+      seenOrigin.add(clean);
+      originVideoUrls.push(clean);
+    }
+  };
+
+  const addFallbackUrl = (raw: string | undefined | null) => {
+    if (!raw) return;
+    const clean = raw.trim().replace(/^http:\/\//i, 'https://');
+    if (!isAllowedPublicVideoStreamUrl(clean)) return;
+    // Skip explicit watermarked endpoints
+    if (/watermark=1|mark=1|\/wm_|_wm\.mp4|\/playwm\//i.test(clean)) return;
+    if (!seenOrigin.has(clean) && !seenFallback.has(clean)) {
+      seenFallback.add(clean);
+      fallbackStreamUrls.push(clean);
+    }
+  };
+
+  // 1) HIGHEST PRIORITY: True watermark-free `originVideoKey` (e.g. "originVideoKey":"pre_post/..." or originVideoKey:"01e...")
+  const originKeyMatches = normalized.matchAll(
+    /(?:["']?originVideoKey["']?)\s*:\s*["']([^"'\\]+)["']/g
+  );
+  for (const m of originKeyMatches) {
+    const key = (m[1] || '').replace(/^\/+/, '').trim();
+    if (!key || key.length < 6) continue;
+    if (/^https?:\/\//i.test(key)) {
+      addOriginUrl(key);
+    } else if (/^\/\//.test(m[1] || '')) {
+      addOriginUrl(`https:${m[1]}`);
+    } else {
+      for (const host of REDNOTE_ORIGIN_CDN_HOSTS) {
+        addOriginUrl(`https://${host}/${key}`);
+      }
+    }
+  }
+
+  // 2) Secondary: H264/H265 stream masterUrl / backupUrls from __INITIAL_STATE__
   const masterUrlMatches = normalized.matchAll(
-    /"(?:masterUrl|url)"\s*:\s*"((?:https?:)?\/\/sns-video-[^"\\]+\.(?:xhscdn\.com|xiaohongshu\.com)[^"\\]+)"/gi
+    /"(?:masterUrl|url)"\s*:\s*"((?:https?:)?\/\/sns-(?:video|bak)-[^"\\]+\.(?:xhscdn\.com|xiaohongshu\.com)[^"\\]+)"/gi
   );
   for (const m of masterUrlMatches) {
     const candidate = m[1].startsWith('//') ? `https:${m[1]}` : m[1];
-    addUrl(candidate);
+    // Raw `pre_post/` assets on xhscdn are also watermark-free originals even when referenced directly
+    if (/\/pre_post\//i.test(candidate)) {
+      addOriginUrl(candidate);
+    } else {
+      addFallbackUrl(candidate);
+    }
   }
 
   // 3) backupUrls array items on xhscdn
   const backupMatches = normalized.matchAll(
-    /"((?:https?:)?\/\/sns-video-[^"\\]+\.xhscdn\.com\/[^"\\]+\.mp4[^"\\]*)"/gi
+    /"((?:https?:)?\/\/sns-(?:video|bak)-[^"\\]+\.xhscdn\.com\/[^"\\]+\.mp4[^"\\]*)"/gi
   );
   for (const m of backupMatches) {
     const candidate = m[1].startsWith('//') ? `https:${m[1]}` : m[1];
-    addUrl(candidate);
+    if (/\/pre_post\//i.test(candidate)) {
+      addOriginUrl(candidate);
+    } else {
+      addFallbackUrl(candidate);
+    }
   }
 
-  // 4) OpenGraph og:video meta fallback
+  // 4) OpenGraph og:video meta fallback (lowest priority — often watermarked on XHS)
   const ogVideoMatch = normalized.match(
     /<meta\s+(?:property|name)=["']og:video(?::url)?["']\s+content=["']([^"']+)["']/i
   );
   if (ogVideoMatch?.[1]) {
-    addUrl(ogVideoMatch[1]);
+    addFallbackUrl(ogVideoMatch[1]);
   }
 
   // Title & duration extraction
@@ -5435,6 +5725,177 @@ export function extractRedNoteVideoInfoFromHtml(html: string | undefined | null)
   title = (jsonTitleMatch?.[1] || ogTitleMatch?.[1] || '')
     .replace(/\s*-\s*小红书\s*$/i, '')
     .replace(/\s*-\s*RedNote\s*$/i, '')
+    .trim();
+
+  let durationSec = 0;
+  const durMatch = normalized.match(/"duration"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
+  if (durMatch?.[1]) {
+    const d = Number(durMatch[1]);
+    if (Number.isFinite(d) && d > 0) {
+      durationSec = d > 1000 ? Math.round(d / 1000) : Math.round(d);
+    }
+  }
+
+  const videoUrls = [...originVideoUrls, ...fallbackStreamUrls];
+  return {
+    originVideoUrls,
+    fallbackStreamUrls,
+    videoUrls,
+    hasOriginVideoKey: originVideoUrls.length > 0,
+    title,
+    durationSec
+  };
+}
+
+/**
+ * Selects strictly watermark-free TikTok/Douyin streams from a TikWM API payload.
+ * Never includes `wmplay` (watermarked) and converts any `/playwm/` path to `/play/`.
+ */
+export function selectWatermarkFreeTikTokStreams(
+  data:
+    | {
+        hdplay?: string;
+        play?: string;
+        wmplay?: string;
+      }
+    | undefined
+    | null
+): string[] {
+  if (!data || typeof data !== 'object') return [];
+  const rawCandidates = [data.hdplay, data.play];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of rawCandidates) {
+    if (typeof item !== 'string') continue;
+    let url = item.trim();
+    if (!url) continue;
+    if (url.startsWith('/')) {
+      url = `https://www.tikwm.com${url}`;
+    }
+    // Strip Douyin/TikTok playwm watermark flag if present
+    url = url.replace(/\/playwm\//gi, '/play/').replace(/([?&])watermark=1(&|$)/i, '$1watermark=0$2');
+    if (!isAllowedPublicVideoStreamUrl(url)) continue;
+    if (!seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
+  }
+  return out;
+}
+
+/**
+ * Extracts a numeric Douyin `aweme_id` (15–22 digits) from desktop, share, modal, or redirect URLs.
+ */
+export function extractDouyinAwemeId(rawUrl: string | undefined | null): string | null {
+  const input = String(rawUrl || '').trim();
+  if (!input) return null;
+  const pathMatch = input.match(/\/(?:video|share\/video|note|slides)\/(\d{15,22})(?:[/?#]|$)/i);
+  if (pathMatch?.[1]) return pathMatch[1];
+  const queryMatch = input.match(/[?&](?:modal_id|vid|aweme_id|item_ids)=(\d{15,22})(?:[&#]|$)/i);
+  if (queryMatch?.[1]) return queryMatch[1];
+  return null;
+}
+
+/**
+ * Converts a Douyin playback URL (e.g. `.../aweme/v1/playwm/?video_id=...`) into its
+ * clean, watermark-free `/play/` counterpart and validates it as a public URL.
+ */
+export function normalizeDouyinPlayUrlToNoWatermark(rawUrl: string | undefined | null): string | null {
+  const input = String(rawUrl || '')
+    .trim()
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&');
+  if (!input) return null;
+  const withProto = input.startsWith('//')
+    ? `https:${input}`
+    : input.replace(/^http:\/\//i, 'https://');
+  const clean = withProto
+    .replace(/\/playwm\//gi, '/play/')
+    .replace(/([?&])watermark=1(&|$)/i, '$1watermark=0$2');
+  return isAllowedPublicVideoStreamUrl(clean) ? clean : null;
+}
+
+export interface DouyinExtractedMedia {
+  videoUrls: string[];
+  title: string;
+  durationSec: number;
+}
+
+/**
+ * Parses Douyin mobile share page HTML (`iesdouyin.com/share/video/<id>/`, `_ROUTER_DATA`, `RENDER_DATA`)
+ * to extract clean, watermark-free `/play/` video stream URLs.
+ */
+export function extractDouyinVideoInfoFromHtml(html: string | undefined | null): DouyinExtractedMedia {
+  if (!html || typeof html !== 'string') {
+    return { videoUrls: [], title: '', durationSec: 0 };
+  }
+
+  let decoded = html;
+  const renderDataMatch = html.match(
+    /<script[^>]*id=["']RENDER_DATA["'][^>]*>([^<]+)<\/script>/i
+  );
+  if (renderDataMatch?.[1]) {
+    try {
+      decoded = `${decoded}\n${decodeURIComponent(renderDataMatch[1])}`;
+    } catch {}
+  }
+
+  const normalized = decoded
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&');
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const addCleanUrl = (raw: string | undefined | null) => {
+    const clean = normalizeDouyinPlayUrlToNoWatermark(raw);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      urls.push(clean);
+    }
+  };
+
+  // 1) Highest reliability: `play_addr` -> `uri` (direct snssdk watermark-free 1080p/720p play endpoint)
+  const playAddrUriMatch = normalized.match(
+    /"play_addr"\s*:\s*\{[^{}]{0,600}?"uri"\s*:\s*"([a-zA-Z0-9_-]{12,80})"/
+  );
+  if (playAddrUriMatch?.[1]) {
+    const vid = playAddrUriMatch[1];
+    addCleanUrl(`https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(vid)}&ratio=1080p&line=0`);
+    addCleanUrl(`https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(vid)}&ratio=720p&line=0`);
+    addCleanUrl(`https://www.iesdouyin.com/aweme/v1/play/?video_id=${encodeURIComponent(vid)}&ratio=1080p&line=0`);
+  }
+
+  // 2) `play_addr.url_list` items (converting /playwm/ -> /play/)
+  const urlListMatches = normalized.matchAll(
+    /"play_addr(?:_h264|_265)?"\s*:\s*\{[^{}]{0,1200}?"url_list"\s*:\s*\[([^\]]+)\]/g
+  );
+  for (const m of urlListMatches) {
+    const inner = m[1] || '';
+    for (const uMatch of inner.matchAll(/"((?:https?:)?\/\/[^"]+)"/g)) {
+      addCleanUrl(uMatch[1]);
+    }
+  }
+
+  // 3) Direct aweme/v1/play(wm) URLs anywhere in page JSON
+  const directPlayMatches = normalized.matchAll(
+    /"((?:https?:)?\/\/[^"]*(?:aweme\.snssdk\.com|iesdouyin\.com|douyinvod\.com|zjcdn\.com)[^"]*(?:\/play(?:wm)?\/|\/video\/tos\/)[^"]*)"/gi
+  );
+  for (const m of directPlayMatches) {
+    addCleanUrl(m[1]);
+  }
+
+  // Title & duration
+  let title = '';
+  const descMatch = normalized.match(/"desc"\s*:\s*"([^"\\]{2,160})"/);
+  const ogTitleMatch = normalized.match(
+    /<meta\s+(?:property|name)=["']og:title["']\s+content=["']([^"']+)["']/i
+  );
+  title = (descMatch?.[1] || ogTitleMatch?.[1] || '')
+    .replace(/\s*-\s*抖音\s*$/i, '')
     .trim();
 
   let durationSec = 0;

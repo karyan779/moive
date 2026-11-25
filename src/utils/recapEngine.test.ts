@@ -50,6 +50,7 @@ import {
   findUncoveredTranscriptSegments,
   mergeMissingDialogueCues,
   applyBurmeseDialogueExclamationRules,
+  splitMultiSpeakerDialogueCues,
   buildCinematicTranslateSystemPrompt,
   extractJobIdFromVideoUrl,
   MAX_SAFE_BLOB_DOWNLOAD_BYTES,
@@ -63,7 +64,15 @@ import {
   computeRangeDownloadChunks,
   extractCustomDomainHostname,
   resolveCustomAuthDomainInfo,
-  isGoogleRedirectUriAuthorizedHtml
+  isGoogleRedirectUriAuthorizedHtml,
+  isPrivateOrReservedIp,
+  isAllowedPublicVideoStreamUrl,
+  extractRedNoteNoteId,
+  buildRedNoteCandidatePageUrls,
+  selectWatermarkFreeTikTokStreams,
+  extractDouyinAwemeId,
+  normalizeDouyinPlayUrlToNoWatermark,
+  extractDouyinVideoInfoFromHtml
 } from './recapEngine.ts';
 
 test('formatDuration formats seconds into M:SS and H:MM:SS', () => {
@@ -1532,7 +1541,8 @@ test('Translate Captions-Only helpers catch missed lines, preserve dense STT seg
     sttMode: 'translate'
   });
   assert.ok(captionsPrompt.includes('ZERO-SKIP 100% DIALOGUE COVERAGE'));
-  assert.ok(captionsPrompt.includes('1 to 12 words'));
+  assert.ok(captionsPrompt.includes('STRICT ONE SPEAKER'));
+  assert.ok(captionsPrompt.includes('1 to 10 words'));
   assert.ok(captionsPrompt.includes('哎呀'));
   assert.ok(captionsPrompt.includes('အိုက်ယား'));
 
@@ -1645,6 +1655,194 @@ test('Precise millisecond STT formatting filters hallucinations and normalizeDia
     assert.ok(driftFree[i].start_ms >= driftFree[i - 1].end_ms, 'Must remain non-overlapping');
   }
 });
+
+test('splitMultiSpeakerDialogueCues separates merged two-speaker turns & Q&A into individual timed cues without splitting same-speaker exclamations', () => {
+  const mergedGeminiCues = [
+    { id: 'c1', start_ms: 1000, end_ms: 4200, text: '- မင်းဘယ်သွားမလို့လဲ? - ငါအိမ်ပြန်တော့မယ်' },
+    { id: 'c2', start_ms: 4500, end_ms: 7500, text: 'ဟေ့ ခဏနေဦး! ဘာဖြစ်လို့လဲ?' },
+    { id: 'c3', start_ms: 8000, end_ms: 10000, text: 'အိုက်ယား! ဘယ်လိုဖြစ်တာလဲ' },
+    { id: 'c4', start_ms: 10500, end_ms: 13500, text: 'မင်းဒီကိုဘာလာလုပ်တာလဲ။ ငါမင်းကိုလာရှာတာ။' }
+  ];
+
+  const split = splitMultiSpeakerDialogueCues(mergedGeminiCues);
+  assert.equal(split.length, 7);
+  assert.equal(split[0].text, 'မင်းဘယ်သွားမလို့လဲ?');
+  assert.equal(split[1].text, 'ငါအိမ်ပြန်တော့မယ်');
+  assert.equal(split[0].start_ms, 1000);
+  assert.equal(split[1].end_ms, 4200);
+  assert.ok(split[1].start_ms > split[0].end_ms);
+
+  assert.equal(split[2].text, 'ဟေ့ ခဏနေဦး!');
+  assert.equal(split[3].text, 'ဘာဖြစ်လို့လဲ?');
+
+  // Same-speaker leading exclamation stays intact as ONE cue
+  assert.equal(split[4].text, 'အိုက်ယား! ဘယ်လိုဖြစ်တာလဲ');
+
+  // Two Burmese sentences separated by ။ split cleanly into 2 individual cues
+  assert.equal(split[5].text, 'မင်းဒီကိုဘာလာလုပ်တာလဲ');
+  assert.equal(split[6].text, 'ငါမင်းကိုလာရှာတာ');
+});
+
+test('VPS URL fetcher safety guards block private/loopback/metadata hosts while allowing public video CDNs', () => {
+  assert.equal(isAllowedPublicVideoStreamUrl('https://sns-video-bd.xhscdn.com/pre_post/abc123.mp4'), true);
+  assert.equal(isAllowedPublicVideoStreamUrl('https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300'), true);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://127.0.0.1:3000/secret'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://localhost/admin'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://169.254.169.254/latest/meta-data/'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://10.0.0.1/internal.mp4'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://192.168.1.5/video.mp4'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://172.16.0.12/video.mp4'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://[::1]/video.mp4'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('http://metadata.google.internal/computeMetadata/v1/'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('https://user:pass@example.com/v.mp4'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('file:///etc/passwd'), false);
+  assert.equal(isAllowedPublicVideoStreamUrl('javascript:alert(1)'), false);
+
+  assert.equal(isPrivateOrReservedIp('127.0.0.1'), true);
+  assert.equal(isPrivateOrReservedIp('::ffff:127.0.0.1'), true);
+  assert.equal(isPrivateOrReservedIp('::ffff:169.254.169.254'), true);
+  assert.equal(isPrivateOrReservedIp('fc00::1'), true);
+  assert.equal(isPrivateOrReservedIp('fe80::1'), true);
+  assert.equal(isPrivateOrReservedIp('8.8.8.8'), false);
+  assert.equal(isPrivateOrReservedIp('2606:4700:4700::1111'), false);
+
+  // Protocol-less v.douyin.com mobile share snippet parses cleanly as Douyin
+  const douyinShare = parseAndNormalizeVideoSourceUrl('3.89 复制打开抖音，看看视频 v.douyin.com/iR8xYz9A/ 很好看');
+  assert.equal(douyinShare.valid, true);
+  assert.equal(douyinShare.platform, 'douyin');
+  assert.equal(douyinShare.normalizedUrl, 'https://v.douyin.com/iR8xYz9A/');
+});
+
+test('RedNote (Xiaohongshu) extractor prioritizes raw watermark-free originVideoKey ahead of fallback streams and builds discovery/item URLs', () => {
+  const noteUrl = 'https://www.xiaohongshu.com/explore/67a1b2c3d4e5f60123456789?xsec_token=AB12CD&xsec_source=pc_feed';
+  assert.equal(extractRedNoteNoteId(noteUrl), '67a1b2c3d4e5f60123456789');
+
+  const pages = buildRedNoteCandidatePageUrls([noteUrl]);
+  assert.ok(
+    pages.includes(
+      'https://www.xiaohongshu.com/discovery/item/67a1b2c3d4e5f60123456789?xsec_token=AB12CD&xsec_source=pc_feed'
+    )
+  );
+  assert.ok(
+    pages.includes(
+      'https://www.xiaohongshu.com/explore/67a1b2c3d4e5f60123456789?xsec_token=AB12CD&xsec_source=pc_feed'
+    )
+  );
+
+  const mockXhsHtml = `
+    <meta property="og:video" content="https://sns-video-qc.xhscdn.com/stream/110/watermarked_preview.mp4" />
+    <script>
+      window.__INITIAL_STATE__ = {
+        "title": "北京旅行Vlog - 小红书",
+        "duration": 24000,
+        "consumer": {"originVideoKey": "pre_post\\u002F1040g00g31cleanraw.mp4"},
+        "stream": {
+          "h264": [
+            {"masterUrl": "https://sns-video-hw.xhscdn.com/stream/1/110/258/transcoded.mp4"},
+            {"masterUrl": "https://sns-video-hw.xhscdn.com/stream/110/clip.mp4?watermark=1"}
+          ]
+        }
+      };
+    </script>
+  `;
+  const extracted = extractRedNoteVideoInfoFromHtml(mockXhsHtml);
+  assert.equal(extracted.hasOriginVideoKey, true);
+  assert.equal(extracted.title, '北京旅行Vlog');
+  assert.equal(extracted.durationSec, 24);
+  assert.equal(
+    extracted.originVideoUrls[0],
+    'https://sns-video-bd.xhscdn.com/pre_post/1040g00g31cleanraw.mp4'
+  );
+  assert.ok(
+    extracted.originVideoUrls.includes(
+      'https://sns-bak-v1.xhscdn.com/pre_post/1040g00g31cleanraw.mp4'
+    )
+  );
+  // Watermarked stream MUST be excluded
+  assert.equal(
+    extracted.videoUrls.some((u) => u.includes('watermark=1')),
+    false
+  );
+  // Origin video URLs MUST come strictly before fallback streams
+  assert.equal(extracted.videoUrls[0], extracted.originVideoUrls[0]);
+  assert.ok(
+    extracted.fallbackStreamUrls.includes(
+      'https://sns-video-hw.xhscdn.com/stream/1/110/258/transcoded.mp4'
+    )
+  );
+});
+
+test('TikTok & Douyin resolvers strictly exclude watermarked streams and rewrite Douyin /playwm/ to /play/', () => {
+  // TikWM must ONLY pick hdplay and play — NEVER wmplay
+  const tikStreams = selectWatermarkFreeTikTokStreams({
+    hdplay: '/video/media/hdplay/73991234.mp4',
+    play: 'https://v16m.tiktokcdn.com/clean_play.mp4',
+    wmplay: 'https://v16m.tiktokcdn.com/watermarked_wmplay.mp4'
+  });
+  assert.deepEqual(tikStreams, [
+    'https://www.tikwm.com/video/media/hdplay/73991234.mp4',
+    'https://v16m.tiktokcdn.com/clean_play.mp4'
+  ]);
+  assert.equal(tikStreams.some((u) => u.includes('wmplay')), false);
+
+  // Douyin aweme_id extraction across share, video, and modal URLs
+  assert.equal(
+    extractDouyinAwemeId('https://www.douyin.com/video/7412345678901234567'),
+    '7412345678901234567'
+  );
+  assert.equal(
+    extractDouyinAwemeId('https://www.iesdouyin.com/share/video/7412345678901234567/?region=CN'),
+    '7412345678901234567'
+  );
+  assert.equal(
+    extractDouyinAwemeId('https://www.douyin.com/discover?modal_id=7412345678901234567'),
+    '7412345678901234567'
+  );
+
+  // /playwm/ -> /play/ and watermark=1 -> watermark=0 rewrite
+  assert.equal(
+    normalizeDouyinPlayUrlToNoWatermark(
+      'http://aweme.snssdk.com/aweme/v1/playwm/?video_id=v0300fg10000clean&watermark=1&ratio=720p'
+    ),
+    'https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300fg10000clean&watermark=0&ratio=720p'
+  );
+
+  // Douyin mobile share page _ROUTER_DATA HTML extraction produces clean /play/ URLs
+  const mockDouyinHtml = `
+    <script>
+      window._ROUTER_DATA = {
+        "loaderData": {
+          "video_(id)/page": {
+            "videoInfoRes": {
+              "item_list": [{
+                "desc": "精彩剧情剪辑 - 抖音",
+                "duration": 19500,
+                "video": {
+                  "play_addr": {
+                    "uri": "v0300fg10000douyinclean99",
+                    "url_list": [
+                      "https://aweme.snssdk.com/aweme/v1/playwm/?video_id=v0300fg10000douyinclean99&ratio=720p&line=0"
+                    ]
+                  }
+                }
+              }]
+            }
+          }
+        }
+      };
+    </script>
+  `;
+  const dyInfo = extractDouyinVideoInfoFromHtml(mockDouyinHtml);
+  assert.equal(dyInfo.title, '精彩剧情剪辑');
+  assert.equal(dyInfo.durationSec, 20);
+  assert.ok(dyInfo.videoUrls.length >= 2);
+  assert.ok(dyInfo.videoUrls[0].includes('/aweme/v1/play/?video_id=v0300fg10000douyinclean99'));
+  assert.equal(
+    dyInfo.videoUrls.some((u) => u.includes('/playwm/')),
+    false
+  );
+});
+
 
 
 

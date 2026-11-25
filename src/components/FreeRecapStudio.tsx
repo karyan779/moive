@@ -725,7 +725,9 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setUrlLoadError(null);
     setStudioErrorMsg(null);
     setUrlLoadStatusText(
-      uiLang === 'my' ? 'Video Link မှ ဗီဒီယို ဆွဲယူနေပါသည်...' : 'Fetching video from URL...'
+      uiLang === 'my'
+        ? 'VPS Speed ဖြင့် Watermark မပါဘဲ ဗီဒီယို ဆွဲယူနေပါသည်...'
+        : 'Fetching video at VPS speed (No Watermark)...'
     );
 
     try {
@@ -796,7 +798,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             if (pollData.stage_message) {
               setUrlLoadStatusText(
                 uiLang === 'my'
-                  ? `Video Link မှ ဆွဲယူနေပါသည် (${pollData.progress || 40}%)...`
+                  ? `VPS Speed ဖြင့် Watermark မပါဘဲ ဆွဲယူနေပါသည် (${pollData.progress || 40}%)...`
                   : String(pollData.stage_message)
               );
             }
@@ -3595,7 +3597,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   <input
                     type="url"
                     aria-label="Paste video URL"
-                    placeholder="TikTok · RedNote (xhslink) · YouTube · FB Link..."
+                    placeholder="TikTok · RedNote (xhslink) · Douyin · YouTube · FB Link..."
                     value={sourceUrlInput}
                     disabled={isLoadingUrl}
                     onChange={(e) => {
@@ -3613,8 +3615,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   {!urlLoadError && !isLoadingUrl && (
                     <p className="mt-2 text-center text-[11px] font-medium text-stone-400 dark:text-slate-500">
                       {uiLang === 'my'
-                        ? 'TikTok & RedNote (Watermark မပါ) · YouTube · FB · IG · Direct MP4'
-                        : 'TikTok & RedNote (No Watermark) · YouTube · FB · IG · Direct MP4'}
+                        ? 'VPS Speed တိုက်ရိုက်ဆွဲ · TikTok · RedNote · Douyin (Watermark မပါ) · YouTube · FB · MP4'
+                        : 'VPS Speed Direct Fetch · TikTok · RedNote · Douyin (No Watermark) · YouTube · FB · MP4'}
                     </p>
                   )}
                   {urlLoadError && (

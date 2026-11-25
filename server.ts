@@ -3,6 +3,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import dns from 'dns/promises';
 import crypto from 'crypto';
 import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
@@ -66,6 +67,7 @@ import {
   findUncoveredTranscriptSegments,
   mergeMissingDialogueCues,
   applyBurmeseDialogueExclamationRules,
+  splitMultiSpeakerDialogueCues,
   buildCinematicTranslateSystemPrompt,
   groupCuesIntoTimedBlocks,
   resolveSttStrategyForMode,
@@ -86,9 +88,16 @@ import {
   computeVisualKeyframePlan,
   parseFfmpegShowinfoPtsTimes,
   parseAndNormalizeVideoSourceUrl,
+  isAllowedPublicVideoStreamUrl,
+  isPrivateOrReservedIp,
   buildSafeFetchedVideoFilename,
   extractRedNoteVideoInfoFromHtml,
+  buildRedNoteCandidatePageUrls,
   normalizeRedNoteCanonicalUrl,
+  selectWatermarkFreeTikTokStreams,
+  extractDouyinAwemeId,
+  normalizeDouyinPlayUrlToNoWatermark,
+  extractDouyinVideoInfoFromHtml,
   isGeminiApiKeyExplicitlyInvalid,
   classifyGeminiTestConnectionResult,
   type AdminApiKeyRecord,
@@ -5158,12 +5167,12 @@ ${winContext ? `Timestamped Source Speech Transcript for this segment (0ms to ${
 CRITICAL DIALOGUE & TIMING RULES:
 - ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).${
               isCaptionsOnlyMode
-                ? `\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE timestamped line in the transcript AND every spoken sentence/reaction heard in the audio (including short 1–3 word reactions like "等等", "什么?", "好", "快走"). NEVER drop, skip, or omit ANY spoken line!`
+                ? `\n- ONE SPEAKER = ONE SEPARATE CUE (NEVER MERGE TWO PEOPLE!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST create a BRAND NEW separate cue object with its own exact start_ms and end_ms! NEVER join two people's dialogue or a question + answer into one cue (NEVER output "- Line A - Line B" or "Line A? Line B" together).\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue. NEVER drop, skip, or merge lines!`
                 : ''
             }${captionsVisualHint}${myanmarAiyaHint}
-- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms). Leave truly silent/music-only pauses uncaptioned.
+- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms) when that ONE speaker talks. Leave truly silent/music-only pauses uncaptioned.
 - All timestamps (start_ms, end_ms) MUST be in MILLISECONDS and strictly increasing.
-- ${isCaptionsOnlyMode ? 'Keep each subtitle cue concise and cinematic (1 clean line, 1 to 12 words, up to 54 characters). ALWAYS include short 1–3 word spoken lines!' : phraseLengthRule}`;
+- ${isCaptionsOnlyMode ? 'Keep each subtitle cue to ONE single speaker\'s short utterance (1 clean line, 1 to 10 words, max ~46 characters, ~0.5s–2.5s).' : phraseLengthRule}`;
           }
 
           const isHybridDialogueStyle = scriptStyle === 'hybrid';
@@ -5489,9 +5498,12 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             .filter((c: SubtitleCue) => c.text.length > 0);
 
           if (rawWinCues.length === 0) return [];
+          const separatedWin = isCaptionsOnlyMode
+            ? splitMultiSpeakerDialogueCues(rawWinCues)
+            : rawWinCues;
           const splitWin = splitCuesIntoShortPhrases(
-            rawWinCues,
-            isCaptionsOnlyMode ? 76 : isTranslateMode ? 54 : 74
+            separatedWin,
+            isCaptionsOnlyMode ? 58 : isTranslateMode ? 54 : 74
           );
           const normWin = isTranslateMode
             ? normalizeDialogueSubtitleCues(splitWin, winDurSec)
@@ -6225,7 +6237,10 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
 
     finalCues = isTranslateMode
       ? normalizeDialogueSubtitleCues(
-          splitCuesIntoShortPhrases(finalCues, isCaptionsOnlyMode ? 76 : 54),
+          splitCuesIntoShortPhrases(
+            isCaptionsOnlyMode ? splitMultiSpeakerDialogueCues(finalCues) : finalCues,
+            isCaptionsOnlyMode ? 58 : 54
+          ),
           safeDuration
         )
       : splitCuesIntoShortPhrases(finalCues, 74);
@@ -7938,26 +7953,97 @@ Strict Video-Scan & Title Rules:
     return ytDlpInstallPromise;
   }
 
+  const RESOLVED_JOBS_TEMP_DIR = path.resolve(JOBS_TEMP_DIR);
+
+  function assertPathInsideTempDir(targetPath: string): string {
+    const resolved = path.resolve(targetPath);
+    if (
+      resolved !== RESOLVED_JOBS_TEMP_DIR &&
+      !resolved.startsWith(RESOLVED_JOBS_TEMP_DIR + path.sep)
+    ) {
+      throw new Error('Destination path escapes temp directory.');
+    }
+    return resolved;
+  }
+
+  async function assertPublicOutboundUrl(rawUrl: string): Promise<string> {
+    if (!isAllowedPublicVideoStreamUrl(rawUrl)) {
+      throw new Error('Outbound URL blocked by network safety policy.');
+    }
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    // Skip DNS lookup for literal public IPs (already checked by isAllowedPublicVideoStreamUrl)
+    const isIpLiteral = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(':');
+    if (!isIpLiteral) {
+      try {
+        const records = await dns.lookup(host, { all: true });
+        if (!records || records.length === 0) {
+          throw new Error('Could not resolve host address.');
+        }
+        for (const rec of records) {
+          if (isPrivateOrReservedIp(rec.address)) {
+            throw new Error('Resolved host points to a private or reserved IP address.');
+          }
+        }
+      } catch (dnsErr) {
+        if (dnsErr instanceof Error && dnsErr.message.includes('private or reserved')) {
+          throw dnsErr;
+        }
+        // Allow transient DNS errors to surface naturally at fetch time unless explicitly private
+      }
+    }
+    return parsed.toString();
+  }
+
   async function downloadStreamToFileWithLimit(
     streamUrl: string,
     destPath: string,
     referer?: string,
-    timeoutMs = 55_000
+    timeoutMs = 55_000,
+    customUserAgent?: string
   ): Promise<{ ok: boolean; contentType: string; bytes: number }> {
-    const resp = await fetch(streamUrl, {
-      redirect: 'follow',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        ...(referer ? { Referer: referer } : {})
-      },
-      signal: AbortSignal.timeout(timeoutMs)
-    });
+    const safeDestPath = assertPathInsideTempDir(destPath);
+    let currentUrl = await assertPublicOutboundUrl(streamUrl);
+    const ua =
+      customUserAgent ||
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    let resp: Response | null = null;
+    for (let hop = 0; hop < 6; hop++) {
+      currentUrl = await assertPublicOutboundUrl(currentUrl);
+      const attemptResp = await fetch(currentUrl, {
+        redirect: 'manual',
+        headers: {
+          'User-Agent': ua,
+          Accept: '*/*',
+          ...(referer ? { Referer: referer } : {})
+        },
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      const loc = attemptResp.headers.get('location');
+      if (attemptResp.status >= 300 && attemptResp.status < 400 && loc) {
+        try {
+          attemptResp.body?.cancel().catch(() => {});
+        } catch {}
+        currentUrl = new URL(loc, currentUrl).toString();
+        continue;
+      }
+      resp = attemptResp;
+      break;
+    }
+
+    if (!resp) {
+      return { ok: false, contentType: '', bytes: 0 };
+    }
     const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
     if (!resp.ok || !resp.body) {
       return { ok: false, contentType, bytes: 0 };
     }
-    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+    if (
+      contentType.includes('text/html') ||
+      contentType.includes('application/json') ||
+      contentType.includes('text/plain')
+    ) {
       return { ok: false, contentType, bytes: 0 };
     }
     const contentLen = Number(resp.headers.get('content-length') || 0);
@@ -7966,7 +8052,7 @@ Strict Video-Scan & Title Rules:
     }
 
     let written = 0;
-    const ws = fs.createWriteStream(destPath);
+    const ws = fs.createWriteStream(safeDestPath);
     try {
       const reader = resp.body.getReader();
       while (true) {
@@ -8014,6 +8100,7 @@ Strict Video-Scan & Title Rules:
       height: number;
       sizeBytes: number;
       platform: string;
+      watermarkFree?: boolean;
     };
     error?: string;
     errorEn?: string;
@@ -8075,12 +8162,14 @@ Strict Video-Scan & Title Rules:
   async function resolveUrlWithCookies(
     startUrl: string,
     userAgent: string,
-    maxHops = 5
+    maxHops = 6,
+    defaultReferer?: string
   ): Promise<{ finalUrl: string; html: string; cookieHeader: string }> {
-    let currentUrl = startUrl;
+    let currentUrl = await assertPublicOutboundUrl(startUrl);
     const cookies = new Map<string, string>();
     let lastHtml = '';
     for (let hop = 0; hop < maxHops; hop++) {
+      currentUrl = await assertPublicOutboundUrl(currentUrl);
       const cookieHeader = Array.from(cookies.entries())
         .map(([k, v]) => `${k}=${v}`)
         .join('; ');
@@ -8090,7 +8179,7 @@ Strict Video-Scan & Title Rules:
           'User-Agent': userAgent,
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-          Referer: 'https://www.xiaohongshu.com/',
+          ...(defaultReferer ? { Referer: defaultReferer } : {}),
           ...(cookieHeader ? { Cookie: cookieHeader } : {})
         },
         signal: AbortSignal.timeout(15_000)
@@ -8110,6 +8199,9 @@ Strict Video-Scan & Title Rules:
       }
       const loc = resp.headers.get('location');
       if (resp.status >= 300 && resp.status < 400 && loc) {
+        try {
+          resp.body?.cancel().catch(() => {});
+        } catch {}
         currentUrl = new URL(loc, currentUrl).toString();
         continue;
       }
@@ -8143,9 +8235,14 @@ Strict Video-Scan & Title Rules:
     }
 
     const localUploadId = `loc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const destPath = path.join(JOBS_TEMP_DIR, `${localUploadId}_upload.mp4`);
+    const destPath = assertPathInsideTempDir(path.join(JOBS_TEMP_DIR, `${localUploadId}_upload.mp4`));
     let resolvedTitle = '';
     let resolvedDuration = 0;
+
+    const desktopUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+    const mobileUa =
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
     const cleanupDest = () => {
       try {
@@ -8153,38 +8250,60 @@ Strict Video-Scan & Title Rules:
       } catch {}
     };
 
+    const finalizeFetchedVideo = async (
+      platformLabel: string,
+      fallbackTitle: string,
+      watermarkFree: boolean,
+      ensureH264 = false
+    ): Promise<{ ok: true; payload: NonNullable<UrlFetchJobState['result']> } | null> => {
+      if (!fs.existsSync(destPath)) return null;
+      if (ensureH264) {
+        await ensureBrowserCompatibleH264Mp4(destPath);
+      }
+      const meta = await probeVideoDimensions(destPath);
+      if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
+        const filename = buildSafeFetchedVideoFilename(
+          resolvedTitle || fallbackTitle,
+          platformLabel,
+          localUploadId
+        );
+        return {
+          ok: true,
+          payload: {
+            ok: true,
+            localUploadId,
+            videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
+            filename,
+            title: resolvedTitle || fallbackTitle,
+            durationSec: Math.round(meta.durationSec || resolvedDuration || 15),
+            width: meta.width,
+            height: meta.height,
+            sizeBytes: fs.statSync(destPath).size,
+            platform: platformLabel,
+            watermarkFree
+          }
+        };
+      }
+      return null;
+    };
+
     try {
-      onProgress(20, `Resolving ${parsed.platform.toUpperCase()} video link...`);
+      await assertPublicOutboundUrl(parsed.normalizedUrl);
+      onProgress(20, `Resolving ${parsed.platform.toUpperCase()} video link at VPS speed...`);
 
       // Strategy 1: Direct MP4 / MOV / WEBM link
       if (parsed.platform === 'direct') {
         try {
-          onProgress(45, 'Downloading direct video file...');
+          onProgress(45, 'Downloading direct video file at VPS speed...');
           const dl = await downloadStreamToFileWithLimit(parsed.normalizedUrl, destPath);
-          if (dl.ok && fs.existsSync(destPath)) {
-            const meta = await probeVideoDimensions(destPath);
-            if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
-              const filename = buildSafeFetchedVideoFilename(
-                parsed.normalizedUrl.split('/').pop(),
-                'direct',
-                localUploadId
-              );
-              return {
-                ok: true,
-                payload: {
-                  ok: true,
-                  localUploadId,
-                  videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
-                  filename,
-                  title: filename.replace(/\.mp4$/i, ''),
-                  durationSec: Math.round(meta.durationSec),
-                  width: meta.width,
-                  height: meta.height,
-                  sizeBytes: fs.statSync(destPath).size,
-                  platform: parsed.platform
-                }
-              };
-            }
+          if (dl.ok) {
+            const done = await finalizeFetchedVideo(
+              'direct',
+              parsed.normalizedUrl.split('/').pop() || 'Direct Video',
+              true,
+              true
+            );
+            if (done) return done;
           }
           cleanupDest();
         } catch {
@@ -8192,16 +8311,15 @@ Strict Video-Scan & Title Rules:
         }
       }
 
-      // Strategy 2: TikTok & Douyin watermark-free resolver (TikWM API)
+      // Strategy 2: TikTok & Douyin Strictly Watermark-Free Resolver (TikWM API — hdplay & play ONLY, never wmplay)
       if (parsed.platform === 'tiktok' || parsed.platform === 'douyin') {
         try {
-          onProgress(35, 'Fetching watermark-free TikTok/Douyin stream...');
+          onProgress(32, `Fetching watermark-free ${parsed.platform.toUpperCase()} stream...`);
           const tikwmResp = await fetch(
             `https://www.tikwm.com/api/?url=${encodeURIComponent(parsed.normalizedUrl)}&hd=1`,
             {
               headers: {
-                'User-Agent':
-                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'User-Agent': desktopUa,
                 Accept: 'application/json'
               },
               signal: AbortSignal.timeout(18_000)
@@ -8221,46 +8339,24 @@ Strict Video-Scan & Title Rules:
             if (tikwmData?.code === 0 && tikwmData.data) {
               resolvedTitle = String(tikwmData.data.title || '').trim();
               resolvedDuration = Number(tikwmData.data.duration || 0);
-              const candidateStreams = [
-                tikwmData.data.hdplay,
-                tikwmData.data.play,
-                tikwmData.data.wmplay
-              ]
-                .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
-                .map((u) => (u.startsWith('/') ? `https://www.tikwm.com${u}` : u));
+              const candidateStreams = selectWatermarkFreeTikTokStreams(tikwmData.data);
 
               for (const streamUrl of candidateStreams) {
                 try {
-                  onProgress(58, 'Downloading MP4 video...');
+                  onProgress(58, `Downloading ${parsed.platform.toUpperCase()} HD MP4 (No Watermark)...`);
                   const dl = await downloadStreamToFileWithLimit(
                     streamUrl,
                     destPath,
                     'https://www.tikwm.com/'
                   );
-                  if (dl.ok && fs.existsSync(destPath)) {
-                    const meta = await probeVideoDimensions(destPath);
-                    if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
-                      const filename = buildSafeFetchedVideoFilename(
-                        resolvedTitle,
-                        parsed.platform,
-                        localUploadId
-                      );
-                      return {
-                        ok: true,
-                        payload: {
-                          ok: true,
-                          localUploadId,
-                          videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
-                          filename,
-                          title: resolvedTitle || `${parsed.platform.toUpperCase()} Video`,
-                          durationSec: Math.round(meta.durationSec || resolvedDuration || 15),
-                          width: meta.width,
-                          height: meta.height,
-                          sizeBytes: fs.statSync(destPath).size,
-                          platform: parsed.platform
-                        }
-                      };
-                    }
+                  if (dl.ok) {
+                    const done = await finalizeFetchedVideo(
+                      parsed.platform,
+                      `${parsed.platform.toUpperCase()} Video`,
+                      true,
+                      parsed.platform === 'douyin'
+                    );
+                    if (done) return done;
                   }
                   cleanupDest();
                 } catch {
@@ -8274,89 +8370,72 @@ Strict Video-Scan & Title Rules:
         }
       }
 
-      // Strategy 2B: RedNote (Xiaohongshu / xhslink.com / rednote.com) Watermark-Free Resolver
-      let redNoteResolvedUrl = '';
-      if (parsed.platform === 'rednote') {
+      // Strategy 2A: Dedicated Douyin Watermark-Free Direct Resolver (mobile share page /play/ rewrite)
+      if (parsed.platform === 'douyin') {
         try {
-          onProgress(35, 'Resolving RedNote (Xiaohongshu) watermark-free video...');
-          const desktopUa =
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-          const mobileUa =
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
-
-          const firstHop = await resolveUrlWithCookies(parsed.normalizedUrl, desktopUa);
-          redNoteResolvedUrl = normalizeRedNoteCanonicalUrl(firstHop.finalUrl || parsed.normalizedUrl);
-
+          onProgress(42, 'Resolving Douyin direct watermark-free stream...');
+          let awemeId = extractDouyinAwemeId(parsed.normalizedUrl);
           const htmlCandidates: string[] = [];
-          if (firstHop.html) htmlCandidates.push(firstHop.html);
 
-          const altUrls = Array.from(
-            new Set([redNoteResolvedUrl, normalizeRedNoteCanonicalUrl(parsed.normalizedUrl)].filter(Boolean))
-          );
-          for (const pageUrl of altUrls) {
-            for (const ua of [desktopUa, mobileUa]) {
-              if (htmlCandidates.some((h) => extractRedNoteVideoInfoFromHtml(h).videoUrls.length > 0)) {
-                break;
-              }
-              try {
-                const hopRes = await resolveUrlWithCookies(pageUrl, ua);
-                if (hopRes.finalUrl && !redNoteResolvedUrl) {
-                  redNoteResolvedUrl = normalizeRedNoteCanonicalUrl(hopRes.finalUrl);
-                }
-                if (hopRes.html) htmlCandidates.push(hopRes.html);
-              } catch {}
-            }
-          }
-
-          let extractedRedNote = { videoUrls: [] as string[], title: '', durationSec: 0 };
-          for (const htmlBody of htmlCandidates) {
-            const info = extractRedNoteVideoInfoFromHtml(htmlBody);
-            if (info.videoUrls.length > 0) {
-              extractedRedNote = info;
-              break;
-            }
-          }
-
-          if (extractedRedNote.title) resolvedTitle = extractedRedNote.title;
-          if (extractedRedNote.durationSec > 0) resolvedDuration = extractedRedNote.durationSec;
-
-          for (const streamUrl of extractedRedNote.videoUrls) {
+          if (!awemeId) {
             try {
-              onProgress(58, 'Downloading RedNote MP4 (No Watermark)...');
-              const dl = await downloadStreamToFileWithLimit(
-                streamUrl,
-                destPath,
-                'https://www.xiaohongshu.com/'
+              const hop = await resolveUrlWithCookies(parsed.normalizedUrl, mobileUa, 6);
+              awemeId = extractDouyinAwemeId(hop.finalUrl) || extractDouyinAwemeId(hop.html);
+              if (hop.html) htmlCandidates.push(hop.html);
+            } catch {}
+          }
+
+          if (awemeId) {
+            const sharePageUrl = `https://www.iesdouyin.com/share/video/${awemeId}/`;
+            try {
+              const shareHop = await resolveUrlWithCookies(
+                sharePageUrl,
+                mobileUa,
+                5,
+                'https://www.iesdouyin.com/'
               );
-              if (dl.ok && fs.existsSync(destPath)) {
-                await ensureBrowserCompatibleH264Mp4(destPath);
-                const meta = await probeVideoDimensions(destPath);
-                if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
-                  const filename = buildSafeFetchedVideoFilename(
-                    resolvedTitle || 'RedNote_NoWatermark',
-                    'rednote',
-                    localUploadId
-                  );
-                  return {
-                    ok: true,
-                    payload: {
-                      ok: true,
-                      localUploadId,
-                      videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
-                      filename,
-                      title: resolvedTitle || 'RedNote Video',
-                      durationSec: Math.round(meta.durationSec || resolvedDuration || 15),
-                      width: meta.width,
-                      height: meta.height,
-                      sizeBytes: fs.statSync(destPath).size,
-                      platform: 'rednote'
-                    }
-                  };
-                }
+              if (shareHop.html) htmlCandidates.unshift(shareHop.html);
+            } catch {}
+          }
+
+          const douyinCleanUrls: string[] = [];
+          const seenDouyin = new Set<string>();
+          for (const htmlBody of htmlCandidates) {
+            const info = extractDouyinVideoInfoFromHtml(htmlBody);
+            if (!resolvedTitle && info.title) resolvedTitle = info.title;
+            if (!resolvedDuration && info.durationSec > 0) resolvedDuration = info.durationSec;
+            for (const u of info.videoUrls) {
+              if (!seenDouyin.has(u)) {
+                seenDouyin.add(u);
+                douyinCleanUrls.push(u);
               }
-              cleanupDest();
-            } catch {
-              cleanupDest();
+            }
+          }
+
+          for (const streamUrl of douyinCleanUrls) {
+            for (const ref of [undefined, 'https://www.iesdouyin.com/']) {
+              try {
+                onProgress(60, 'Downloading Douyin MP4 (No Watermark)...');
+                const dl = await downloadStreamToFileWithLimit(
+                  streamUrl,
+                  destPath,
+                  ref,
+                  55_000,
+                  mobileUa
+                );
+                if (dl.ok) {
+                  const done = await finalizeFetchedVideo(
+                    'douyin',
+                    'Douyin_NoWatermark',
+                    true,
+                    true
+                  );
+                  if (done) return done;
+                }
+                cleanupDest();
+              } catch {
+                cleanupDest();
+              }
             }
           }
         } catch {
@@ -8364,16 +8443,256 @@ Strict Video-Scan & Title Rules:
         }
       }
 
-      // Strategy 3: Universal yt-dlp extractor (YouTube, Shorts, TikTok, RedNote XiaoHongShu fallback, Facebook, Instagram, etc.)
-      onProgress(65, 'Extracting video stream with yt-dlp...');
+      // Strategy 2B: RedNote (Xiaohongshu / xhslink.com / rednote.com) Strictly Watermark-Free Resolver
+      // Prioritizes raw `originVideoKey` (100% no-logo original file) across all xhscdn mirrors, trying NO Referer first.
+      let redNoteResolvedUrl = '';
+      if (parsed.platform === 'rednote') {
+        try {
+          onProgress(32, 'Resolving RedNote (Xiaohongshu) original no-watermark video...');
+
+          const htmlCandidates: string[] = [];
+          let foundOriginKey = false;
+          const collectRedNoteHtml = (htmlBody: string | undefined | null) => {
+            if (!htmlBody) return;
+            htmlCandidates.push(htmlBody);
+            const probe = extractRedNoteVideoInfoFromHtml(htmlBody);
+            if (probe.hasOriginVideoKey) foundOriginKey = true;
+          };
+
+          // First follow short link (xhslink.com) with desktop & mobile UAs
+          try {
+            const firstHop = await resolveUrlWithCookies(
+              parsed.normalizedUrl,
+              desktopUa,
+              6,
+              'https://www.xiaohongshu.com/'
+            );
+            redNoteResolvedUrl = normalizeRedNoteCanonicalUrl(
+              firstHop.finalUrl || parsed.normalizedUrl
+            );
+            collectRedNoteHtml(firstHop.html);
+          } catch {}
+
+          const candidatePages = buildRedNoteCandidatePageUrls([
+            redNoteResolvedUrl,
+            parsed.normalizedUrl
+          ]);
+          const probedPages = new Set<string>();
+
+          // Keep probing `/discovery/item/<id>` and `/explore/<id>` with both Mobile & Desktop UAs until `originVideoKey` is found!
+          for (let idx = 0; idx < candidatePages.length; idx++) {
+            const pageUrl = candidatePages[idx];
+            if (foundOriginKey || probedPages.has(pageUrl)) continue;
+            probedPages.add(pageUrl);
+            for (const ua of [mobileUa, desktopUa]) {
+              if (foundOriginKey) break;
+              try {
+                const hopRes = await resolveUrlWithCookies(
+                  pageUrl,
+                  ua,
+                  6,
+                  'https://www.xiaohongshu.com/'
+                );
+                if (hopRes.finalUrl) {
+                  const canonicalHop = normalizeRedNoteCanonicalUrl(hopRes.finalUrl);
+                  if (!redNoteResolvedUrl || redNoteResolvedUrl.includes('xhslink.com')) {
+                    redNoteResolvedUrl = canonicalHop;
+                  }
+                  const extraPages = buildRedNoteCandidatePageUrls([canonicalHop]);
+                  for (const ep of extraPages) {
+                    if (!candidatePages.includes(ep) && candidatePages.length < 10) {
+                      candidatePages.push(ep);
+                    }
+                  }
+                }
+                collectRedNoteHtml(hopRes.html);
+              } catch {}
+            }
+          }
+
+          const originVideoUrls: string[] = [];
+          const fallbackStreamUrls: string[] = [];
+          const seenOrigin = new Set<string>();
+          const seenFallback = new Set<string>();
+
+          for (const htmlBody of htmlCandidates) {
+            const info = extractRedNoteVideoInfoFromHtml(htmlBody);
+            if (!resolvedTitle && info.title) resolvedTitle = info.title;
+            if (!resolvedDuration && info.durationSec > 0) resolvedDuration = info.durationSec;
+            for (const u of info.originVideoUrls) {
+              if (!seenOrigin.has(u)) {
+                seenOrigin.add(u);
+                originVideoUrls.push(u);
+              }
+            }
+            for (const u of info.fallbackStreamUrls) {
+              if (!seenOrigin.has(u) && !seenFallback.has(u)) {
+                seenFallback.add(u);
+                fallbackStreamUrls.push(u);
+              }
+            }
+          }
+
+          // If HTML scraping did not surface `originVideoKey`, query yt-dlp JSON metadata to see if XHS exposed originVideoKey there!
+          if (originVideoUrls.length === 0) {
+            const ytDlpBinProbe = await resolveYtDlpBinaryPath();
+            if (ytDlpBinProbe) {
+              try {
+                const ytProbeUrl = await assertPublicOutboundUrl(
+                  normalizeRedNoteCanonicalUrl(redNoteResolvedUrl || parsed.normalizedUrl)
+                );
+                const { stdout: ytJsonRaw } = await execFileAsync(
+                  ytDlpBinProbe,
+                  [
+                    '--dump-single-json',
+                    '--no-warnings',
+                    '--no-playlist',
+                    '--add-header',
+                    'Referer:https://www.xiaohongshu.com/',
+                    '--',
+                    ytProbeUrl
+                  ],
+                  { timeout: 30_000, maxBuffer: 12 * 1024 * 1024 }
+                );
+                const jsonExtracted = extractRedNoteVideoInfoFromHtml(ytJsonRaw);
+                if (!resolvedTitle && jsonExtracted.title) resolvedTitle = jsonExtracted.title;
+                for (const u of jsonExtracted.originVideoUrls) {
+                  if (!seenOrigin.has(u)) {
+                    seenOrigin.add(u);
+                    originVideoUrls.push(u);
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          // Phase 1: Try TRUE watermark-free `originVideoKey` URLs FIRST — try WITHOUT Referer first (avoids xhscdn 403), then with Referer!
+          for (const streamUrl of originVideoUrls) {
+            for (const ref of [undefined, 'https://www.xiaohongshu.com/']) {
+              try {
+                onProgress(56, 'Downloading RedNote original MP4 (No Watermark)...');
+                const dl = await downloadStreamToFileWithLimit(
+                  streamUrl,
+                  destPath,
+                  ref,
+                  55_000,
+                  mobileUa
+                );
+                if (dl.ok) {
+                  const done = await finalizeFetchedVideo(
+                    'rednote',
+                    'RedNote_NoWatermark',
+                    true,
+                    true
+                  );
+                  if (done) return done;
+                }
+                cleanupDest();
+              } catch {
+                cleanupDest();
+              }
+            }
+          }
+
+          // Phase 2: Only if ALL originVideoKey mirrors failed, try clean non-watermarked fallback streams
+          for (const streamUrl of fallbackStreamUrls) {
+            for (const ref of ['https://www.xiaohongshu.com/', undefined]) {
+              try {
+                onProgress(62, 'Downloading RedNote MP4 stream...');
+                const dl = await downloadStreamToFileWithLimit(
+                  streamUrl,
+                  destPath,
+                  ref,
+                  55_000,
+                  desktopUa
+                );
+                if (dl.ok) {
+                  const done = await finalizeFetchedVideo('rednote', 'RedNote Video', false, true);
+                  if (done) return done;
+                }
+                cleanupDest();
+              } catch {
+                cleanupDest();
+              }
+            }
+          }
+        } catch {
+          cleanupDest();
+        }
+      }
+
+      // Strategy 3: Universal yt-dlp extractor (YouTube, Shorts, TikTok no-watermark fallback, Douyin/RedNote fallback, Facebook, Instagram)
+      onProgress(68, 'Extracting video stream at VPS speed...');
       const ytDlpBin = await resolveYtDlpBinaryPath();
       if (ytDlpBin) {
         try {
-          const ytOutTemplate = path.join(JOBS_TEMP_DIR, `${localUploadId}_ytdl.%(ext)s`);
-          const ytTargetUrl =
+          const ytOutTemplate = assertPathInsideTempDir(
+            path.join(JOBS_TEMP_DIR, `${localUploadId}_ytdl.%(ext)s`)
+          );
+          const ytTargetUrl = await assertPublicOutboundUrl(
             parsed.platform === 'rednote'
               ? normalizeRedNoteCanonicalUrl(redNoteResolvedUrl || parsed.normalizedUrl)
-              : parsed.normalizedUrl;
+              : parsed.normalizedUrl
+          );
+
+          // For Douyin fallback: inspect yt-dlp JSON first and rewrite any /playwm/ URL to /play/ (watermark-free)
+          if (parsed.platform === 'douyin') {
+            try {
+              const { stdout: dyJsonRaw } = await execFileAsync(
+                ytDlpBin,
+                ['--dump-single-json', '--no-warnings', '--no-playlist', '--', ytTargetUrl],
+                { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }
+              );
+              const dyParsed = JSON.parse(dyJsonRaw) as {
+                title?: string;
+                url?: string;
+                formats?: Array<{ url?: string; vcodec?: string; height?: number }>;
+              };
+              if (!resolvedTitle && dyParsed.title) resolvedTitle = String(dyParsed.title).trim();
+              const dyUrls = [
+                dyParsed.url,
+                ...(Array.isArray(dyParsed.formats)
+                  ? dyParsed.formats
+                      .filter((f) => f && f.vcodec && f.vcodec !== 'none' && f.url)
+                      .sort((a, b) => Number(b.height || 0) - Number(a.height || 0))
+                      .map((f) => f.url)
+                  : [])
+              ]
+                .map((u) => normalizeDouyinPlayUrlToNoWatermark(u))
+                .filter((u): u is string => Boolean(u));
+
+              for (const cleanUrl of Array.from(new Set(dyUrls))) {
+                try {
+                  const dl = await downloadStreamToFileWithLimit(
+                    cleanUrl,
+                    destPath,
+                    undefined,
+                    55_000,
+                    mobileUa
+                  );
+                  if (dl.ok) {
+                    const done = await finalizeFetchedVideo(
+                      'douyin',
+                      'Douyin_NoWatermark',
+                      true,
+                      true
+                    );
+                    if (done) return done;
+                  }
+                  cleanupDest();
+                } catch {
+                  cleanupDest();
+                }
+              }
+            } catch {}
+          }
+
+          // Exclude watermarked TikTok/Douyin format IDs when running yt-dlp
+          const ytFormatSelector =
+            parsed.platform === 'tiktok' || parsed.platform === 'douyin'
+              ? 'bv*[format_id!*=watermark][format_id!*=download_addr][ext=mp4][height<=1080]+ba[ext=m4a]/b[format_id!*=watermark][format_id!*=download_addr][ext=mp4]/bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b'
+              : 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b';
+
           const ytArgs = [
             '--no-playlist',
             '--no-warnings',
@@ -8383,13 +8702,14 @@ Strict Video-Scan & Title Rules:
               ? ['--add-header', 'Referer:https://www.xiaohongshu.com/']
               : []),
             '-f',
-            'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b',
+            ytFormatSelector,
             '--merge-output-format',
             'mp4',
             '--ffmpeg-location',
             '/usr/bin/ffmpeg',
             '-o',
             ytOutTemplate,
+            '--',
             ytTargetUrl
           ];
           await execFileAsync(ytDlpBin, ytArgs, { timeout: 85_000, maxBuffer: 10 * 1024 * 1024 });
@@ -8405,7 +8725,20 @@ Strict Video-Scan & Title Rules:
             if (!matchedFile.endsWith('.mp4')) {
               await execFileAsync(
                 'ffmpeg',
-                ['-y', '-i', matchedFile, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', destPath],
+                [
+                  '-y',
+                  '-i',
+                  matchedFile,
+                  '-c:v',
+                  'libx264',
+                  '-preset',
+                  'veryfast',
+                  '-c:a',
+                  'aac',
+                  '-movflags',
+                  '+faststart',
+                  destPath
+                ],
                 { timeout: 60_000 }
               );
               try {
@@ -8415,30 +8748,13 @@ Strict Video-Scan & Title Rules:
               fs.renameSync(matchedFile, destPath);
             }
           }
-          if (fs.existsSync(destPath)) {
-            if (parsed.platform === 'rednote') {
-              await ensureBrowserCompatibleH264Mp4(destPath);
-            }
-            const meta = await probeVideoDimensions(destPath);
-            if (meta.durationSec > 0.4 && meta.width > 0 && meta.height > 0) {
-              const filename = buildSafeFetchedVideoFilename(resolvedTitle, parsed.platform, localUploadId);
-              return {
-                ok: true,
-                payload: {
-                  ok: true,
-                  localUploadId,
-                  videoUrl: `/api/recap/video/${localUploadId}_upload.mp4`,
-                  filename,
-                  title: resolvedTitle || `${parsed.platform.toUpperCase()} Video`,
-                  durationSec: Math.round(meta.durationSec),
-                  width: meta.width,
-                  height: meta.height,
-                  sizeBytes: fs.statSync(destPath).size,
-                  platform: parsed.platform
-                }
-              };
-            }
-          }
+          const done = await finalizeFetchedVideo(
+            parsed.platform,
+            `${parsed.platform.toUpperCase()} Video`,
+            parsed.platform === 'tiktok',
+            parsed.platform === 'rednote' || parsed.platform === 'douyin'
+          );
+          if (done) return done;
           cleanupDest();
         } catch (ytErr) {
           console.warn('[URL Fetch yt-dlp error]:', ytErr instanceof Error ? ytErr.message : ytErr);
