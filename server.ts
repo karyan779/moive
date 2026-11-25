@@ -2719,7 +2719,7 @@ async function transcribeWithDirectGroqKey(
   audioBuffer: Buffer,
   apiKey: string,
   sttModel: SttEngineId = 'whisper-large-v3-turbo',
-  opts: { maxSegments?: number } = {}
+  opts: { maxSegments?: number; preciseMs?: boolean } = {}
 ): Promise<string> {
   const form = new FormData();
   const blob = new Blob([new Uint8Array(audioBuffer)], { type: 'audio/mpeg' });
@@ -2746,13 +2746,18 @@ async function transcribeWithDirectGroqKey(
     text?: string;
     segments?: Array<{ start?: number; end?: number; text?: string }>;
   };
-  return formatTimedSttSegments(data?.segments, String(data?.text || '').trim(), opts.maxSegments ?? 120);
+  return formatTimedSttSegments(
+    data?.segments,
+    String(data?.text || '').trim(),
+    opts.maxSegments ?? 120,
+    Boolean(opts.preciseMs)
+  );
 }
 
 async function transcribeAudioWithGroqPool(
   audioBuffer: Buffer,
   sttModel: SttEngineId = 'whisper-large-v3-turbo',
-  opts: { maxSegments?: number } = {}
+  opts: { maxSegments?: number; preciseMs?: boolean } = {}
 ): Promise<{ text: string; keyLabel: string } | null> {
   if (!audioBuffer || audioBuffer.length < 200) return null;
   try {
@@ -2776,7 +2781,7 @@ function loadCloudflareWorkersAiConfig(): { accountId: string; apiToken: string 
 async function transcribeAudioWithWorkersAi(
   audioBuffer: Buffer,
   sttModel: SttEngineId = 'whisper-large-v3-turbo',
-  opts: { maxSegments?: number; vadFilter?: boolean } = {}
+  opts: { maxSegments?: number; vadFilter?: boolean; preciseMs?: boolean } = {}
 ): Promise<string | null> {
   const cfg = loadCloudflareWorkersAiConfig();
   if (!cfg || !audioBuffer || shouldSkipWorkersAiForPayloadSize(audioBuffer.length)) return null;
@@ -2801,7 +2806,11 @@ async function transcribeAudioWithWorkersAi(
       return null;
     }
     const json = await resp.json();
-    const parsedText = parseWorkersAiWhisperTimedResult(json, opts.maxSegments ?? 120);
+    const parsedText = parseWorkersAiWhisperTimedResult(
+      json,
+      opts.maxSegments ?? 120,
+      Boolean(opts.preciseMs)
+    );
     return parsedText || null;
   } catch (err) {
     console.warn('[Workers AI STT] Request failed:', err);
@@ -4596,6 +4605,7 @@ async function startServer() {
       editConfig,
       isSttOnly = false,
       sttMode = 'translate',
+      captionsEngine,
       speakerDiarization = false
     } = (rawBody || {}) as {
       isFreeMode?: boolean;
@@ -4629,6 +4639,7 @@ async function startServer() {
       editConfig?: DeepRecapEditConfig;
       isSttOnly?: boolean;
       sttMode?: 'transcribe' | 'translate';
+      captionsEngine?: 'gemini' | 'whisper';
       speakerDiarization?: boolean;
     };
 
@@ -4775,6 +4786,12 @@ async function startServer() {
 
     const isTranslateMode = mode === 'translate' || Boolean(isSttOnly);
     const isCaptionsOnlyMode = isTranslateMode && (translateAudio === 'captions-only' || Boolean(isSttOnly));
+    const effectiveCaptionsEngine: 'gemini' | 'whisper' =
+      captionsEngine === 'whisper' ? 'whisper' : 'gemini';
+    const isWhisperLockedCaptions =
+      isCaptionsOnlyMode && !isSttOnly && effectiveCaptionsEngine === 'whisper';
+    const isGeminiDirectCaptions =
+      isCaptionsOnlyMode && !isSttOnly && effectiveCaptionsEngine === 'gemini';
     const safeDuration = Math.max(6, Math.min(isFreeMode ? FREE_MAX_DURATION_SEC : 10800, probedDuration));
     const styleDef = SCRIPT_STYLE_PROMPTS[scriptStyle] || SCRIPT_STYLE_PROMPTS.narrator;
     const systemInstruction =
@@ -4819,18 +4836,20 @@ async function startServer() {
     }
 
     // 1b. Speech-to-Text pre-pass (strict 35s overall ceiling so 48% NEVER stalls indefinitely)
-    onProgress(48, 'Listening to original audio...');
+    // Skip Whisper STT when user explicitly selected Gemini Direct in Captions-Only mode so
+    // Whisper hallucinations never contaminate Gemini's direct audio + visual subtitle reading.
+    onProgress(48, isGeminiDirectCaptions ? 'Preparing direct audio & frames...' : 'Listening to original audio...');
     let groqTranscript = '';
     let sttProviderUsed: 'cloudflare-workers-ai' | 'groq' | 'none' = 'none';
-    if (!isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
+    if (!isGeminiDirectCaptions && !isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
       const sttOrder = resolveSttStrategyForMode(
         Boolean(isFreeMode),
         Boolean(freeGroqKey),
         Boolean(loadCloudflareWorkersAiConfig())
       );
       const sttOpts = isTranslateMode
-        ? { maxSegments: 1000, vadFilter: !isCaptionsOnlyMode }
-        : { maxSegments: 120, vadFilter: true };
+        ? { maxSegments: 1000, vadFilter: true, preciseMs: true }
+        : { maxSegments: 120, vadFilter: true, preciseMs: false };
       const runSttChain = async () => {
         for (const step of sttOrder) {
           if (groqTranscript) break;
@@ -4919,7 +4938,7 @@ async function startServer() {
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
           : '';
-        const timeWindows = computeAudioScriptWindows(safeDuration, isCaptionsOnlyMode ? 45 : 75);
+        const timeWindows = computeAudioScriptWindows(safeDuration, isCaptionsOnlyMode ? 30 : 75);
 
         const extractVisualKeyframesForSegment = async (
           srcVideoPath: string | null,
@@ -4933,7 +4952,7 @@ async function startServer() {
           const useLightCaptionsFrames = isCaptionsOnlyMode && !isSttOnly;
           const plan = computeVisualKeyframePlan(
             segDurSec,
-            useLightCaptionsFrames ? 10 : prioritizeEndingTail ? 22 : 16,
+            useLightCaptionsFrames ? 12 : prioritizeEndingTail ? 22 : 16,
             useLightCaptionsFrames ? false : prioritizeEndingTail
           );
 
@@ -5433,26 +5452,33 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           const winDurMs = Math.round(winDurSec * 1000);
           const winEndSec = winOffsetMs / 1000 + winDurSec;
           const unitMultiplier =
-            maxReturnedEnd > 0 && maxReturnedEnd <= Math.max(winDurSec, winEndSec) * 1.5 && maxReturnedEnd <= 900
+            maxReturnedEnd > 0 &&
+            maxReturnedEnd <= Math.max(winDurSec, winEndSec) * 1.5 &&
+            maxReturnedEnd <= 600 &&
+            rawEnds.every((v: number) => v <= Math.max(winDurSec, winEndSec) * 1.6)
               ? 1000
               : 1;
 
           const firstScaledStart = Math.round((rawStarts[0] || 0) * unitMultiplier);
           const scaledMaxEnd = Math.round(maxReturnedEnd * unitMultiplier);
           const looksGlobal =
-            winOffsetMs > 0 && firstScaledStart >= winOffsetMs - 2000 && scaledMaxEnd > winDurMs + 4000;
+            winOffsetMs > 0 &&
+            firstScaledStart >= winOffsetMs - 2000 &&
+            (scaledMaxEnd > winDurMs + 2000 || firstScaledStart >= winOffsetMs * 0.8);
 
           const rawWinCues: SubtitleCue[] = parsedObj.cues
-            .map((c: { start_ms: number; end_ms: number; text: string }, idx: number) => {
-              let rawStart = Math.round((Number(c.start_ms) || 0) * unitMultiplier);
-              let rawEnd = Math.round((Number(c.end_ms) || 0) * unitMultiplier);
+            .map((c: { start_ms?: number; end_ms?: number; text?: string }, idx: number) => {
+              const hasStart = c.start_ms !== undefined && c.start_ms !== null && Number.isFinite(Number(c.start_ms));
+              const hasEnd = c.end_ms !== undefined && c.end_ms !== null && Number.isFinite(Number(c.end_ms));
+              let rawStart = hasStart ? Math.round(Number(c.start_ms) * unitMultiplier) : idx * 2500;
+              let rawEnd = hasEnd ? Math.round(Number(c.end_ms) * unitMultiplier) : rawStart + 2000;
               if (looksGlobal) {
                 rawStart = Math.max(0, rawStart - winOffsetMs);
-                rawEnd = Math.max(rawStart + 800, rawEnd - winOffsetMs);
+                rawEnd = Math.max(rawStart + 350, rawEnd - winOffsetMs);
               }
-              const minCueDurMs = isCaptionsOnlyMode ? 400 : 800;
-              const startMs = Math.max(0, Math.min(winDurMs - 300, rawStart || idx * 2500));
-              const endMs = Math.max(startMs + minCueDurMs, Math.min(winDurMs, rawEnd || startMs + 2400));
+              const minCueDurMs = isCaptionsOnlyMode ? 320 : 800;
+              const startMs = Math.max(0, Math.min(winDurMs - 260, rawStart));
+              const endMs = Math.max(startMs + minCueDurMs, Math.min(winDurMs, rawEnd));
               return {
                 id: `cue-w-${idx + 1}`,
                 start_ms: startMs,
@@ -5463,7 +5489,10 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
             .filter((c: SubtitleCue) => c.text.length > 0);
 
           if (rawWinCues.length === 0) return [];
-          const splitWin = splitCuesIntoShortPhrases(rawWinCues, isTranslateMode ? 54 : 74);
+          const splitWin = splitCuesIntoShortPhrases(
+            rawWinCues,
+            isCaptionsOnlyMode ? 76 : isTranslateMode ? 54 : 74
+          );
           const normWin = isTranslateMode
             ? normalizeDialogueSubtitleCues(splitWin, winDurSec)
             : normalizeRecapTimelineCues(splitWin, winDurSec);
@@ -5474,8 +5503,118 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           }));
         };
 
-        let multiWindowSucceeded = false;
-        if (timeWindows.length > 1) {
+        // 2a. Whisper 1:1 Timestamp-Locked Captions-Only Translation Path
+        // Locks 100% of start_ms / end_ms to Whisper's exact millisecond speech boundaries
+        // while Gemini translates each line 1-to-1 with full surrounding dialogue context.
+        let whisperLockedSucceeded = false;
+        if (isWhisperLockedCaptions && effectiveContext) {
+          const whisperSourceCues = parseTimedSttTranscriptToCues(effectiveContext, safeDuration);
+          if (whisperSourceCues.length > 0) {
+            try {
+              const batchSize = 25;
+              const totalBatches = Math.ceil(whisperSourceCues.length / batchSize);
+              const translatedLockedCues: SubtitleCue[] = [];
+              let prevTailHint = '';
+
+              for (let b = 0; b < totalBatches; b++) {
+                const batch = whisperSourceCues.slice(b * batchSize, (b + 1) * batchSize);
+                const pct = 58 + Math.round(((b + 1) / totalBatches) * 14);
+                onProgress(
+                  pct,
+                  `Translating Whisper synced lines (Part ${b + 1}/${totalBatches})...`
+                );
+                const numberedLines = batch
+                  .map(
+                    (seg, i) =>
+                      `${i + 1}. [${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.text}`
+                  )
+                  .join('\n');
+                const aiyaBatchRule =
+                  targetLanguage === 'my'
+                    ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a source line literally contains "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated line!`
+                    : '';
+                const batchPrompt = `Translate ALL ${batch.length} numbered movie dialogue lines below into natural spoken ${langLabel} (1-to-1, exact same order, NEVER skip, merge, or reorder any line!).
+${prevTailHint ? `Previous dialogue context (for pronoun/story consistency ONLY — do NOT repeat): ${prevTailHint}\n` : ''}RULES:
+- Output EXACTLY ${batch.length} items in cues[] matching lines 1..${batch.length} in order.
+- Keep each item's EXACT start_ms and end_ms from the input.
+- Natural movie subtitle dialogue only (NO third-person movie recap narration!).
+- Fix obvious minor speech-to-text homophone typos using conversation context so the Burmese meaning is 100% natural and accurate.${aiyaBatchRule}
+
+LINES TO TRANSLATE:
+${numberedLines}
+
+Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, '')}", scriptText: "...", cues: [{ start_ms, end_ms, text }] }.`;
+
+                const batchResp = await invokeGeminiWithParts([{ text: batchPrompt }]);
+                if (!batchResp?.text) {
+                  throw new Error(`Empty Gemini response for Whisper batch ${b + 1}`);
+                }
+                const batchParsed = JSON.parse(batchResp.text);
+                if (b === 0 && batchParsed?.title) {
+                  finalTitle = String(batchParsed.title);
+                }
+                const returnedCues: Array<{ start_ms?: number; end_ms?: number; text?: string }> =
+                  Array.isArray(batchParsed?.cues) ? batchParsed.cues : [];
+                if (returnedCues.length === 0) {
+                  throw new Error(`Zero cues parsed for Whisper batch ${b + 1}`);
+                }
+
+                // Lock EVERY translated cue strictly to Whisper's exact millisecond start_ms & end_ms!
+                const exactCountMatch = returnedCues.length === batch.length;
+                const usedReturnIndices = new Set<number>();
+                for (let i = 0; i < batch.length; i++) {
+                  const srcSeg = batch[i];
+                  let matched: { start_ms?: number; end_ms?: number; text?: string } | undefined;
+                  if (exactCountMatch) {
+                    matched = returnedCues[i];
+                  } else {
+                    let bestIdx = -1;
+                    let bestDiff = Infinity;
+                    for (let r = 0; r < returnedCues.length; r++) {
+                      if (usedReturnIndices.has(r)) continue;
+                      const rcStart = Number(returnedCues[r]?.start_ms);
+                      if (!Number.isFinite(rcStart)) continue;
+                      const diff = Math.abs(rcStart - srcSeg.start_ms);
+                      if (diff <= 400 && diff < bestDiff) {
+                        bestDiff = diff;
+                        bestIdx = r;
+                      }
+                    }
+                    if (bestIdx >= 0) {
+                      usedReturnIndices.add(bestIdx);
+                      matched = returnedCues[bestIdx];
+                    }
+                  }
+                  const translatedText = String(matched?.text || '').trim();
+                  if (!translatedText) continue;
+                  translatedLockedCues.push({
+                    id: `cue-${translatedLockedCues.length + 1}`,
+                    start_ms: srcSeg.start_ms,
+                    end_ms: srcSeg.end_ms,
+                    text: translatedText,
+                    originalText: srcSeg.text
+                  });
+                }
+                prevTailHint = batch
+                  .slice(-2)
+                  .map((seg) => seg.text)
+                  .join(' / ');
+              }
+
+              if (translatedLockedCues.length >= Math.max(1, Math.floor(whisperSourceCues.length * 0.6))) {
+                finalCues = normalizeDialogueSubtitleCues(translatedLockedCues, safeDuration);
+                finalScriptText = finalCues.map((c) => c.text).join(' ');
+                usedLiveGemini = true;
+                whisperLockedSucceeded = true;
+              }
+            } catch (whisperBatchErr) {
+              console.warn('[Whisper 1:1 Locked Captions] Falling back to Gemini multimodal windows:', whisperBatchErr);
+            }
+          }
+        }
+
+        let multiWindowSucceeded = whisperLockedSucceeded;
+        if (!whisperLockedSucceeded && timeWindows.length > 1) {
           try {
             const stitchedCues: SubtitleCue[] = [];
             let storyContextHint = '';
@@ -5491,14 +5630,15 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
               if (inputVideoPath && fs.existsSync(inputVideoPath)) {
                 const winMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_win_${win.index}.mp3`);
                 try {
+                  // Place -ss AFTER -i for sample-accurate audio slicing (zero keyframe seek drift!)
                   await execFileAsync('ffmpeg', [
                     '-y',
+                    '-i',
+                    inputVideoPath,
                     '-ss',
                     String(win.startSec),
                     '-t',
                     String(win.durationSec),
-                    '-i',
-                    inputVideoPath,
                     '-vn',
                     '-ar',
                     '16000',
@@ -5524,14 +5664,14 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                 win.index === timeWindows.length - 1
               );
 
-              let winTranscript = sliceTimedTranscriptForWindow(
-                effectiveContext,
-                win.startSec,
-                win.endSec
-              );
-              if (!winTranscript && winAudioBuffer) {
+              let winTranscript = isGeminiDirectCaptions
+                ? ''
+                : sliceTimedTranscriptForWindow(effectiveContext, win.startSec, win.endSec);
+              if (!isGeminiDirectCaptions && !winTranscript && winAudioBuffer) {
                 try {
-                  const winSttOpts = isTranslateMode ? { maxSegments: 1000 } : {};
+                  const winSttOpts = isTranslateMode
+                    ? { maxSegments: 1000, preciseMs: true }
+                    : {};
                   if (freeGroqKey) {
                     winTranscript = await transcribeWithDirectGroqKey(winAudioBuffer, freeGroqKey, sttModel, winSttOpts);
                   } else if (!isFreeMode) {
@@ -5623,12 +5763,18 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
 
             if (stitchedCues.length > 0) {
               const seamGapMs = isCaptionsOnlyMode ? 20 : 90;
-              const minStitchedDurMs = isCaptionsOnlyMode ? 350 : 450;
+              const minStitchedDurMs = isCaptionsOnlyMode ? 280 : 450;
               const maxTotalMs = Math.round(safeDuration * 1000);
               let seamCursorMs = isCaptionsOnlyMode ? 0 : 60;
               finalCues = stitchedCues.map((c, idx) => {
-                const s = Math.max(seamCursorMs, Math.min(maxTotalMs - 300, c.start_ms));
-                const e = Math.min(maxTotalMs, Math.max(s + minStitchedDurMs, c.end_ms));
+                const s = Math.max(seamCursorMs, Math.min(maxTotalMs - 260, c.start_ms));
+                const nextStart = idx + 1 < stitchedCues.length ? stitchedCues[idx + 1].start_ms : maxTotalMs;
+                const maxEndBeforeNext =
+                  isCaptionsOnlyMode && idx + 1 < stitchedCues.length && nextStart > s + 280
+                    ? nextStart - seamGapMs
+                    : maxTotalMs;
+                const desiredEnd = Math.min(maxTotalMs, Math.max(s + minStitchedDurMs, c.end_ms));
+                const e = Math.min(maxTotalMs, Math.max(s + 240, Math.min(desiredEnd, maxEndBeforeNext)));
                 seamCursorMs = Math.min(maxTotalMs, e + seamGapMs);
                 return {
                   ...c,
@@ -5664,7 +5810,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
           }
           const singlePassPrompt = buildPromptForWindow(
             safeDuration,
-            effectiveContext,
+            isGeminiDirectCaptions ? '' : effectiveContext,
             0,
             1,
             0,
@@ -5717,9 +5863,11 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
         }
 
         // 2c. Captions-Only Missing-Line Coverage Audit & Targeted 1-to-1 Repair Pass
-        // If Whisper heard timestamped spoken segments that Gemini accidentally skipped, translate ONLY those missed lines and merge them cleanly!
+        // Only run when Whisper transcript was actually used (skip in Gemini Direct mode and Whisper 1:1 locked mode).
         if (
           isCaptionsOnlyMode &&
+          !whisperLockedSucceeded &&
+          !isGeminiDirectCaptions &&
           !(isSttOnly && sttMode === 'transcribe') &&
           usedLiveGemini &&
           effectiveContext
@@ -6076,7 +6224,10 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
     }
 
     finalCues = isTranslateMode
-      ? normalizeDialogueSubtitleCues(splitCuesIntoShortPhrases(finalCues, 54), safeDuration)
+      ? normalizeDialogueSubtitleCues(
+          splitCuesIntoShortPhrases(finalCues, isCaptionsOnlyMode ? 76 : 54),
+          safeDuration
+        )
       : splitCuesIntoShortPhrases(finalCues, 74);
     if (isTranslateMode && targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')) {
       finalCues = applyBurmeseDialogueExclamationRules(

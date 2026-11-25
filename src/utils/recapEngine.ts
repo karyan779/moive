@@ -203,6 +203,7 @@ export interface RecapJobRecord {
   autoFlowLogs: AutoFlowLogStep[];
   isSttOnly?: boolean;
   sttMode?: 'transcribe' | 'translate';
+  captionsEngine?: 'gemini' | 'whisper';
 }
 
 export interface ScriptStylePromptDefinition {
@@ -793,27 +794,70 @@ function formatSecBadge(sec: number): string {
   return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
 }
 
+function formatSecBadgePrecise(sec: number): string {
+  const safe = Math.max(0, Number.isFinite(sec) ? sec : 0);
+  const mins = Math.floor(safe / 60);
+  const rem = safe - mins * 60;
+  const whole = Math.floor(rem);
+  const centis = Math.min(99, Math.round((rem - whole) * 100));
+  if (centis === 100) {
+    return `${String(mins).padStart(2, '0')}:${String(whole + 1).padStart(2, '0')}.00`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(whole).padStart(2, '0')}.${String(centis).padStart(2, '0')}`;
+}
+
+const WHISPER_HALLUCINATION_REGEX =
+  /^(?:谢谢观看|感谢观看|感谢收看|请不吝点赞|请订阅|订阅|点赞|关注|字幕由|字幕提供|字幕制作|优优独播剧场|中文字幕|影视字幕|Thank you for watching\.?|Thanks for watching\.?|Please subscribe\.?|Subtitles? by\b.*|Translated by\b.*|Amara\.org.*|MBC|KBS|SBS|[\s.,!?…\-~•♪♫。，！？、]+)$/i;
+
+export function isHallucinatedSttText(rawText: string): boolean {
+  const clean = String(rawText || '').trim();
+  if (!clean) return true;
+  if (WHISPER_HALLUCINATION_REGEX.test(clean)) return true;
+  // Filter obvious single-character repetition loops (e.g. "啊啊啊啊啊啊啊" or "哈哈哈哈哈哈哈")
+  if (clean.length >= 6 && /^(.)\1{5,}$/.test(clean.replace(/[\s.,!?。，！？]/g, ''))) {
+    return true;
+  }
+  return false;
+}
+
 export function formatTimedSttSegments(
   segments: Array<{ start?: unknown; end?: unknown; text?: unknown }> | undefined | null,
   fallbackPlainText = '',
-  maxSegments = 120
+  maxSegments = 120,
+  preciseMs = false
 ): string {
   if (!Array.isArray(segments) || segments.length === 0) {
     return fallbackPlainText.trim();
   }
-  const clean = segments
-    .map((s) => {
-      const start = Number(s?.start);
-      const end = Number(s?.end);
-      const text = typeof s?.text === 'string' ? s.text.trim() : '';
-      if (!text) return null;
-      return {
-        start: Number.isFinite(start) ? Math.max(0, start) : 0,
-        end: Number.isFinite(end) ? Math.max(Number.isFinite(start) ? start : 0, end) : 0,
-        text
-      };
-    })
-    .filter((s): s is { start: number; end: number; text: string } => s !== null);
+  const clean: Array<{ start: number; end: number; text: string }> = [];
+  let prevNorm = '';
+  let repeatRun = 0;
+
+  for (const s of segments) {
+    const start = Number(s?.start);
+    const end = Number(s?.end);
+    const text = typeof s?.text === 'string' ? s.text.trim() : '';
+    if (!text) continue;
+    if (preciseMs && isHallucinatedSttText(text)) continue;
+
+    // Suppress 3+ consecutive identical Whisper hallucination loops in precise mode
+    const norm = text.replace(/[\s.,!?。，！？]/g, '').toLowerCase();
+    if (preciseMs && norm && norm === prevNorm) {
+      repeatRun += 1;
+      if (repeatRun >= 2) continue;
+    } else {
+      prevNorm = norm;
+      repeatRun = 0;
+    }
+
+    const safeStart = Number.isFinite(start) ? Math.max(0, start) : 0;
+    const safeEnd = Number.isFinite(end) ? Math.max(safeStart, end) : safeStart;
+    clean.push({
+      start: safeStart,
+      end: safeEnd,
+      text
+    });
+  }
 
   if (clean.length === 0) {
     return fallbackPlainText.trim();
@@ -830,12 +874,25 @@ export function formatTimedSttSegments(
     }
   }
 
+  if (preciseMs) {
+    return sampled
+      .map(
+        (s) =>
+          `[${formatSecBadgePrecise(s.start)} - ${formatSecBadgePrecise(Math.max(s.start + 0.25, s.end))}] ${s.text}`
+      )
+      .join('\n');
+  }
+
   return sampled
     .map((s) => `[${formatSecBadge(s.start)} - ${formatSecBadge(Math.max(s.start + 1, s.end))}] ${s.text}`)
     .join('\n');
 }
 
-export function parseWorkersAiWhisperTimedResult(payload: unknown, maxSegments = 120): string {
+export function parseWorkersAiWhisperTimedResult(
+  payload: unknown,
+  maxSegments = 120,
+  preciseMs = false
+): string {
   const plain = parseWorkersAiWhisperResult(payload);
   if (!payload || typeof payload !== 'object') return plain;
   const data = payload as {
@@ -843,7 +900,7 @@ export function parseWorkersAiWhisperTimedResult(payload: unknown, maxSegments =
       segments?: Array<{ start?: unknown; end?: unknown; text?: unknown }>;
     };
   };
-  return formatTimedSttSegments(data.result?.segments, plain, maxSegments);
+  return formatTimedSttSegments(data.result?.segments, plain, maxSegments, preciseMs);
 }
 
 export type SttProviderOrder = ('user_groq' | 'workers_ai' | 'groq_pool')[];
@@ -1147,7 +1204,8 @@ export function buildChronologicalSceneLockGuide(
   if (!timedTranscript || typeof timedTranscript !== 'string' || !timedTranscript.trim()) {
     return '';
   }
-  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+  const lineRegex =
+    /^\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\s*-\s*(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\]\s*(.+)$/;
   const toSec = (a: string, b: string, c?: string) =>
     c !== undefined ? Number(a) * 3600 + Number(b) * 60 + Number(c) : Number(a) * 60 + Number(b);
 
@@ -1156,7 +1214,7 @@ export function buildChronologicalSceneLockGuide(
     const m = rawLine.trim().match(lineRegex);
     if (!m) continue;
     const startSec = toSec(m[1], m[2], m[3]);
-    const endSec = Math.max(startSec + 1, toSec(m[4], m[5], m[6]));
+    const endSec = Math.max(startSec + 0.25, toSec(m[4], m[5], m[6]));
     const text = m[7].trim();
     if (text) parsedLines.push({ startSec, endSec, text });
   }
@@ -1250,9 +1308,12 @@ export function sliceTimedTranscriptForWindow(
   if (!timedTranscript || typeof timedTranscript !== 'string' || !timedTranscript.trim()) {
     return '';
   }
-  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+  const lineRegex =
+    /^\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\s*-\s*(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\]\s*(.+)$/;
   const toSec = (a: string, b: string, c?: string) =>
     c !== undefined ? Number(a) * 3600 + Number(b) * 60 + Number(c) : Number(a) * 60 + Number(b);
+
+  const hasFractional = /\[\d{1,2}:\d{2}\.\d+/.test(timedTranscript);
 
   const rawLines = timedTranscript
     .split(/\r?\n/)
@@ -1264,7 +1325,7 @@ export function sliceTimedTranscriptForWindow(
     const m = line.match(lineRegex);
     if (!m) continue;
     const s = toSec(m[1], m[2], m[3]);
-    const e = Math.max(s + 1, toSec(m[4], m[5], m[6]));
+    const e = Math.max(s + (hasFractional ? 0.25 : 1), toSec(m[4], m[5], m[6]));
     const text = m[7].trim();
     if (text) timedEntries.push({ s, e, text });
   }
@@ -1277,6 +1338,16 @@ export function sliceTimedTranscriptForWindow(
   const winDur = Math.max(1, endSec - startSec);
   const matching = timedEntries.filter((item) => item.s < endSec && item.e > startSec);
   if (matching.length === 0) return '';
+
+  if (hasFractional) {
+    return matching
+      .map((item) => {
+        const relStart = Math.max(0, Math.min(winDur - 0.25, item.s - startSec));
+        const relEnd = Math.max(relStart + 0.25, Math.min(winDur, item.e - startSec));
+        return `[${formatSecBadgePrecise(relStart)} - ${formatSecBadgePrecise(relEnd)}] ${item.text}`;
+      })
+      .join('\n');
+  }
 
   return matching
     .map((item) => {
@@ -1373,10 +1444,17 @@ export function normalizeDialogueSubtitleCues(
     const c = clean[i];
     const scaledStart = Math.round(c.start_ms * scale);
     const scaledEnd = Math.round(c.end_ms * scale);
-    const rawDur = Math.max(450, scaledEnd - scaledStart);
+    const rawDur = Math.max(320, scaledEnd - scaledStart);
 
-    const startMs = Math.max(cursorMs, Math.min(totalMs - 400, scaledStart));
-    const endMs = Math.min(totalMs, Math.max(startMs + 380, startMs + rawDur));
+    const startMs = Math.max(cursorMs, Math.min(totalMs - 300, scaledStart));
+    const nextScaledStart =
+      i + 1 < clean.length ? Math.round(clean[i + 1].start_ms * scale) : totalMs;
+    const desiredEnd = Math.min(totalMs, Math.max(startMs + 280, startMs + rawDur));
+    // Cap endMs before the next cue's true start_ms (leaving a 20ms gap) so rapid consecutive
+    // dialogue lines NEVER snowball cumulative late drift across the video!
+    const maxEndBeforeNext =
+      i + 1 < clean.length && nextScaledStart > startMs + 300 ? nextScaledStart - 20 : totalMs;
+    const endMs = Math.min(totalMs, Math.max(startMs + 260, Math.min(desiredEnd, maxEndBeforeNext)));
 
     result.push({
       ...c,
@@ -1384,14 +1462,14 @@ export function normalizeDialogueSubtitleCues(
       start_ms: startMs,
       end_ms: endMs
     });
-    cursorMs = endMs + 40;
+    cursorMs = Math.min(totalMs, endMs + 20);
   }
   return result;
 }
 
 /**
- * Parses `[MM:SS - MM:SS] text` formatted Whisper STT segments directly into SubtitleCue[]
- * for verbatim Original Speech STT mode or resilient subtitle fallback.
+ * Parses `[MM:SS - MM:SS]` or `[MM:SS.cc - MM:SS.cc]` formatted Whisper STT segments directly
+ * into millisecond-accurate SubtitleCue[] for verbatim STT or Whisper-locked translation.
  */
 export function parseTimedSttTranscriptToCues(
   transcript: string,
@@ -1400,20 +1478,21 @@ export function parseTimedSttTranscriptToCues(
   if (!transcript || typeof transcript !== 'string') return [];
   const lines = transcript.split(/\r?\n/);
   const cues: SubtitleCue[] = [];
-  const lineRegex = /^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)$/;
+  const lineRegex =
+    /^\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\s*-\s*(\d{1,2}):(\d{2}(?:\.\d{1,3})?)(?::(\d{2}(?:\.\d{1,3})?))?\]\s*(.+)$/;
 
   const toMs = (a: string, b: string, c?: string) => {
     if (c !== undefined) {
-      return (Number(a) * 3600 + Number(b) * 60 + Number(c)) * 1000;
+      return Math.round((Number(a) * 3600 + Number(b) * 60 + Number(c)) * 1000);
     }
-    return (Number(a) * 60 + Number(b)) * 1000;
+    return Math.round((Number(a) * 60 + Number(b)) * 1000);
   };
 
   for (const rawLine of lines) {
     const m = rawLine.trim().match(lineRegex);
     if (!m) continue;
     const startMs = toMs(m[1], m[2], m[3]);
-    const endMs = Math.max(startMs + 500, toMs(m[4], m[5], m[6]));
+    const endMs = Math.max(startMs + 280, toMs(m[4], m[5], m[6]));
     const text = m[7].trim();
     if (!text) continue;
     cues.push({

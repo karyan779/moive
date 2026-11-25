@@ -874,7 +874,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     setVideoDuration(job.durationSec);
     setMode(job.mode);
     setTranslateAudio(job.translateAudio || 'dub');
-    setTranslationEngine(job.isSttOnly ? 'whisper' : 'gemini');
+    setTranslationEngine(job.captionsEngine || (job.isSttOnly ? 'whisper' : 'gemini'));
     setScriptStyle(job.scriptStyle);
     setTargetLanguage(job.targetLanguage);
     setVoiceGender(
@@ -1012,8 +1012,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         durationSec: safeDur,
         mode,
         translateAudio,
-        isSttOnly: mode === 'translate' && translationEngine === 'whisper',
-        sttMode: translationEngine === 'whisper' ? 'transcribe' : 'translate',
+        captionsEngine:
+          mode === 'translate' && translateAudio === 'captions-only' ? translationEngine : undefined,
+        isSttOnly: false,
+        sttMode: 'translate',
         scriptStyle,
         targetLanguage,
         voiceGender,
@@ -1223,8 +1225,10 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         resolution: effects.outputHD ? '1080p' : '720p',
         mode,
         translateAudio: mode === 'translate' ? translateAudio : undefined,
-        isSttOnly: mode === 'translate' && translationEngine === 'whisper',
-        sttMode: translationEngine === 'whisper' ? 'transcribe' : 'translate',
+        captionsEngine:
+          mode === 'translate' && translateAudio === 'captions-only' ? translationEngine : undefined,
+        isSttOnly: false,
+        sttMode: 'translate',
         scriptStyle,
         targetLanguage,
         voiceGender,
@@ -2143,13 +2147,13 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       {translateAudio === 'captions-only' && (
                         <div className="flex flex-col gap-1.5 border-t border-stone-200/70 pt-3 dark:border-slate-800">
                           <DottedTooltipLabel
-                            label="Captions Engine (Whisper / Gemini)"
-                            tooltip="Choose Whisper for direct speech-to-text transcription or Gemini AI for cinematic translation."
+                            label="Captions Engine"
+                            tooltip="Whisper locks subtitles 1:1 to exact speech timestamps before translating. Gemini listens directly to audio & on-screen subtitles without Whisper."
                           />
                           <SlidingPillToggle
                             options={[
-                              { value: 'gemini', label: 'Gemini AI Translation' },
-                              { value: 'whisper', label: 'Whisper STT Only' }
+                              { value: 'whisper', label: 'Whisper' },
+                              { value: 'gemini', label: 'Gemini' }
                             ]}
                             value={translationEngine}
                             onChange={(val) => {
@@ -2157,6 +2161,11 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                               setTranslationEngine(val);
                             }}
                           />
+                          <p className="text-[11px] leading-snug text-stone-500 dark:text-slate-400">
+                            {translationEngine === 'whisper'
+                              ? 'Whisper: Exact speech-timestamp 1:1 lock + Burmese translation'
+                              : 'Gemini: Direct audio + on-screen subtitle translation (no Whisper)'}
+                          </p>
                         </div>
                       )}
                     </>
@@ -3492,6 +3501,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                     translateAudio === 'captions-only'
                 )
               }
+              exactSubtitleTiming={mode === 'translate' && translateAudio === 'captions-only'}
               isOverlayEditMode={isOverlayEditMode}
               onToggleOverlayEditMode={setIsOverlayEditMode}
               onRemoveVideo={() => {

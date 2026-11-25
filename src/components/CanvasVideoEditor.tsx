@@ -57,6 +57,7 @@ interface CanvasVideoEditorProps {
   audioBase64?: string;
   voiceoverAudioUrl?: string | null;
   hasMuxedAudio?: boolean;
+  exactSubtitleTiming?: boolean;
   isOverlayEditMode: boolean;
   onToggleOverlayEditMode: (editing: boolean) => void;
   onRemoveVideo: () => void;
@@ -249,6 +250,7 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
   audioBase64,
   voiceoverAudioUrl = null,
   hasMuxedAudio = false,
+  exactSubtitleTiming = false,
   isOverlayEditMode,
   onToggleOverlayEditMode,
   onRemoveVideo,
@@ -885,8 +887,12 @@ export const CanvasVideoEditor: React.FC<CanvasVideoEditorProps> = ({
         : 'center center';
 
   // Active subtitle cue at current playback time, or held cue during short breath pauses (never flash cues[0] mid-video!)
+  // In Captions-Only mode during active playback, lock strictly to exact [start_ms, end_ms] so live preview matches exported MP4 1:1.
   const activeCue = findActiveCue(cues, currentTime * 1000);
-  const displayCue = findDisplayCueAtTime(cues, currentTime * 1000, 1800);
+  const displayCue =
+    exactSubtitleTiming && isPlaying
+      ? activeCue
+      : findDisplayCueAtTime(cues, currentTime * 1000, exactSubtitleTiming ? 200 : 1800);
   const activeSubLang = subtitleConfig.subtitleLanguage || targetLanguage;
   const langSample =
     TARGET_LANGUAGES.find((l) => l.code === activeSubLang)?.sampleCaption ||

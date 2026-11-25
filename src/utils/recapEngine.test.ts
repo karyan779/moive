@@ -1607,6 +1607,45 @@ test('Translate Captions-Only helpers catch missed lines, preserve dense STT seg
   assert.equal(normalizedBurmese[7].text, 'ဝိုး!');
 });
 
+test('Precise millisecond STT formatting filters hallucinations and normalizeDialogueSubtitleCues prevents cumulative snowball drift', () => {
+  const noisySegments = [
+    { start: 0.42, end: 1.18, text: '你好！' },
+    { start: 1.25, end: 1.92, text: '谢谢观看' }, // hallucination — must be dropped
+    { start: 2.05, end: 2.75, text: '你来啦？' },
+    { start: 2.8, end: 3.1, text: '啊啊啊啊啊啊啊' }, // repetition loop — must be dropped
+    { start: 3.22, end: 4.05, text: '快进来吧' }
+  ];
+  const preciseTimed = formatTimedSttSegments(noisySegments, '', 1000, true);
+  assert.ok(preciseTimed.includes('[00:00.42 - 00:01.18] 你好！'));
+  assert.ok(preciseTimed.includes('[00:02.05 - 00:02.75] 你来啦？'));
+  assert.ok(preciseTimed.includes('[00:03.22 - 00:04.05] 快进来吧'));
+  assert.ok(!preciseTimed.includes('谢谢观看'));
+  assert.ok(!preciseTimed.includes('啊啊啊啊啊啊啊'));
+
+  // Parse back with millisecond precision preserved (not rounded to whole seconds!)
+  const parsedMsCues = parseTimedSttTranscriptToCues(preciseTimed, 10);
+  assert.equal(parsedMsCues.length, 3);
+  assert.equal(parsedMsCues[0].start_ms, 420);
+  assert.equal(parsedMsCues[0].end_ms, 1180);
+  assert.equal(parsedMsCues[1].start_ms, 2050);
+  assert.equal(parsedMsCues[2].start_ms, 3220);
+
+  // Rapid slightly overlapping cues must NOT snowball late drift across 10 consecutive lines
+  const rapidOverlapping = Array.from({ length: 10 }, (_, i) => ({
+    id: `r-${i + 1}`,
+    start_ms: i * 1000,
+    end_ms: i * 1000 + 1350, // 350ms overlap with next cue
+    text: `စာကြောင်း ${i + 1}`
+  }));
+  const driftFree = normalizeDialogueSubtitleCues(rapidOverlapping, 15);
+  assert.equal(driftFree.length, 10);
+  // Last cue MUST still start right at ~9000ms (0ms snowball drift, NOT pushed to 12500ms!)
+  assert.equal(driftFree[9].start_ms, 9000);
+  for (let i = 1; i < driftFree.length; i++) {
+    assert.ok(driftFree[i].start_ms >= driftFree[i - 1].end_ms, 'Must remain non-overlapping');
+  }
+});
+
 
 
 
