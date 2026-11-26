@@ -2062,4 +2062,111 @@ test('Translate Captions-Only anti-hallucination strips time-skip/recap filler a
   assert.ok(guide.includes('6400ms - 11100ms'));
 });
 
+import {
+  hasForeignScriptLeakage,
+  findForeignScriptLeakedCueIndices,
+  splitWhisperSegmentsIntoUtterances,
+  tightenCaptionsOnlyCuePauses
+} from './recapEngine.ts';
+
+test('Mixed-language Burmese+Chinese leakage detection catches half-translated Gemini subtitles while accepting pure Burmese', () => {
+  // Exact screenshot bugs reported by user:
+  assert.equal(doesTextMatchSubtitleLanguage('အိုက်ယား...到家了宝宝...下车', 'my'), false);
+  assert.equal(doesTextMatchSubtitleLanguage('အိုက်ယား...这怎么抱嘛...你看你下临了', 'my'), false);
+  assert.equal(hasForeignScriptLeakage('အိုက်ယား...到家了宝宝...下车', 'my'), true);
+  assert.equal(hasForeignScriptLeakage('အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့', 'my'), false);
+  assert.equal(doesTextMatchSubtitleLanguage('အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့', 'my'), true);
+
+  const cues = [
+    { id: 'c1', start_ms: 1000, end_ms: 2800, text: 'အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့' },
+    { id: 'c2', start_ms: 3200, end_ms: 5400, text: 'အိုက်ယား...到家了宝宝...下车' },
+    { id: 'c3', start_ms: 6000, end_ms: 8200, text: 'မင်း မြန်မြန်ဆင်းလာတော့လေ' },
+    { id: 'c4', start_ms: 8500, end_ms: 10500, text: 'အိုက်ယား...这怎么抱嘛...你看你下临了' }
+  ];
+  assert.deepEqual(findForeignScriptLeakedCueIndices(cues, 'my'), [1, 3]);
+  assert.equal(needsSubtitleTranslation(cues, 'my'), true);
+
+  // Prompt explicitly enforces 100% pure Burmese with zero mixed Chinese characters
+  const prompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'captions-only'
+  });
+  assert.ok(prompt.includes('100% PURE BURMESE ONLY'));
+});
+
+test('splitWhisperSegmentsIntoUtterances breaks chained Whisper segments into crisp utterance-by-utterance turns with clear gaps', () => {
+  // 1) Word-level timestamps with spoken pause >= 0.30s between two utterances
+  const words = [
+    { word: '哎呀', start: 1.0, end: 1.3 },
+    { word: '到家了', start: 1.32, end: 1.75 },
+    { word: '宝宝下车', start: 1.78, end: 2.35 },
+    // 0.65s spoken pause here -> must split into a brand-new utterance!
+    { word: '你快点', start: 3.0, end: 3.45 },
+    { word: '下来了', start: 3.48, end: 3.95 }
+  ];
+  const fromWords = splitWhisperSegmentsIntoUtterances([], words);
+  assert.equal(fromWords.length, 2);
+  assert.equal(fromWords[0].text, '哎呀到家了宝宝下车');
+  assert.equal(fromWords[1].text, '你快点下来了');
+  assert.ok(
+    fromWords[1].start - fromWords[0].end >= 0.1,
+    `Expected >= 0.10s clear gap between utterances, got ${fromWords[1].start - fromWords[0].end}s`
+  );
+
+  // English word-level tokens still preserve word spaces while splitting on pauses
+  const enWords = splitWhisperSegmentsIntoUtterances([], [
+    { word: 'Wait', start: 0.5, end: 0.8 },
+    { word: 'here.', start: 0.85, end: 1.2 },
+    { word: 'Come', start: 1.7, end: 1.95 },
+    { word: 'now', start: 2.0, end: 2.3 }
+  ]);
+  assert.equal(enWords.length, 2);
+  assert.equal(enWords[0].text, 'Wait here.');
+  assert.equal(enWords[1].text, 'Come now');
+
+  // 2) Fallback segment-only input with two chained sentences in one Whisper block
+  const chainedSegs = [
+    { start: 10.0, end: 16.0, text: '哎呀到家了宝宝下车。你快点下来了我！' }
+  ];
+  const fromSegs = splitWhisperSegmentsIntoUtterances(chainedSegs);
+  assert.equal(fromSegs.length, 2);
+  assert.ok(fromSegs[1].start - fromSegs[0].end >= 0.1);
+});
+
+test('tightenCaptionsOnlyCuePauses trims trailing silence bloat and guarantees crisp clear-screen gaps between consecutive Whisper subtitles', () => {
+  // Chained back-to-back Whisper cues (end === next.start) + trailing silence bloat on cue 2
+  const stuckWhisperCues = [
+    { id: 'w1', start_ms: 1000, end_ms: 4000, text: 'အိမ်ရောက်ပြီ ဘေဘီ' },
+    { id: 'w2', start_ms: 4000, end_ms: 9500, text: 'ကားပေါ်က မြန်မြန်ဆင်းတော့' },
+    { id: 'w3', start_ms: 9500, end_ms: 11200, text: 'အင်းပါ လာပြီ' }
+  ];
+  const speechIntervals = [
+    { startMs: 1000, endMs: 2600 },
+    { startMs: 4000, endMs: 5800 },
+    { startMs: 9500, endMs: 10900 }
+  ];
+
+  const tightened = tightenCaptionsOnlyCuePauses(stuckWhisperCues, speechIntervals, 15);
+  assert.equal(tightened.length, 3);
+  // Cue 1 should trim down near speech end (2600 + 120 = 2720ms) instead of lingering to 4000ms
+  assert.ok(tightened[0].end_ms <= 2800, `Expected cue 1 end <= 2800ms, got ${tightened[0].end_ms}`);
+  // Cue 2 should trim down near speech end (5800 + 120 = 5920ms) instead of lingering to 9500ms!
+  assert.ok(tightened[1].end_ms <= 6100, `Expected cue 2 end <= 6100ms, got ${tightened[1].end_ms}`);
+
+  // Even without speech intervals, consecutive glued cues get a crisp >= 100ms clear gap
+  const tightenedNoIntervals = tightenCaptionsOnlyCuePauses(
+    [
+      { id: 'a1', start_ms: 1000, end_ms: 2500, text: 'ဟယ်လို' },
+      { id: 'a2', start_ms: 2500, end_ms: 4000, text: 'ဘာဖြစ်လို့လဲ' }
+    ],
+    [],
+    10
+  );
+  assert.ok(
+    tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms >= 100,
+    `Expected >= 100ms visual clear gap, got ${tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms}ms`
+  );
+});
+
+
 

@@ -949,6 +949,172 @@ export function formatTimedSttSegments(
     .join('\n');
 }
 
+export interface TimedSttSegmentInput {
+  start?: unknown;
+  end?: unknown;
+  text?: unknown;
+}
+
+export interface TimedSttWordInput {
+  word?: unknown;
+  start?: unknown;
+  end?: unknown;
+}
+
+/**
+ * Splits Whisper STT output into clean, individual single-turn utterances with crisp speech-end
+ * boundaries instead of long multi-sentence / back-to-back chained blocks:
+ * - When word-level timestamps (`words[]`) are present, splits on spoken pauses >= 300ms,
+ *   sentence-ending punctuation, or long clause breaks and locks end time tightly to lastWord.end.
+ * - When only segment-level timestamps exist, splits multi-sentence segments cleanly with a
+ *   brief 120ms clear gap between turns so subtitles never stay continuously glued together.
+ */
+export function splitWhisperSegmentsIntoUtterances(
+  segments: TimedSttSegmentInput[] | undefined | null,
+  words?: TimedSttWordInput[] | undefined | null
+): Array<{ start: number; end: number; text: string }> {
+  const validWords = Array.isArray(words)
+    ? words
+        .map((w) => ({
+          word: typeof w?.word === 'string' ? w.word.trim() : '',
+          start: Number(w?.start),
+          end: Number(w?.end)
+        }))
+        .filter((w) => w.word.length > 0 && Number.isFinite(w.start) && Number.isFinite(w.end))
+    : [];
+
+  if (validWords.length >= 2) {
+    const utterances: Array<{ start: number; end: number; text: string }> = [];
+    let bufWords: Array<{ word: string; start: number; end: number }> = [];
+
+    const joinWordsClean = (list: Array<{ word: string }>) => {
+      let out = '';
+      for (const item of list) {
+        const token = item.word;
+        if (!out) {
+          out = token;
+          continue;
+        }
+        const prevChar = out[out.length - 1];
+        const nextChar = token[0];
+        const isCjkOrPunct =
+          /[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0E00-\u0E7F\u1000-\u109F]/.test(prevChar) &&
+          /[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0E00-\u0E7F\u1000-\u109F]/.test(nextChar);
+        const isClosingPunct = /^[,.;:!?。，、！？…]/.test(token);
+        out += isCjkOrPunct || isClosingPunct ? token : ` ${token}`;
+      }
+      return out.trim();
+    };
+
+    const flush = (nextWordStart?: number) => {
+      if (bufWords.length === 0) return;
+      const text = joinWordsClean(bufWords);
+      const start = Math.max(0, bufWords[0].start);
+      let end = Math.max(start + 0.25, bufWords[bufWords.length - 1].end + 0.06);
+      if (typeof nextWordStart === 'number' && Number.isFinite(nextWordStart) && nextWordStart > start + 0.28) {
+        // Guarantee a crisp visual clear gap (~110ms) before the next utterance begins
+        end = Math.min(end, Math.max(start + 0.24, nextWordStart - 0.11));
+      }
+      if (text) {
+        utterances.push({ start, end, text });
+      }
+      bufWords = [];
+    };
+
+    for (let i = 0; i < validWords.length; i++) {
+      const cur = validWords[i];
+      const next = i + 1 < validWords.length ? validWords[i + 1] : null;
+      bufWords.push(cur);
+
+      const currentText = joinWordsClean(bufWords);
+      const currentDur = cur.end - bufWords[0].start;
+      const pauseToNext = next ? next.start - cur.end : 99;
+      const endsSentence = /[。！？!?…]$/.test(cur.word);
+      const endsClause = /[，,、;；]$/.test(cur.word);
+      const hasCjk = /[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(currentText);
+      const tooLongAtClause =
+        endsClause && ((hasCjk && currentText.length >= 12) || (!hasCjk && bufWords.length >= 7) || currentDur >= 2.2);
+      const hardLengthCap =
+        (hasCjk && currentText.length >= 22) || (!hasCjk && bufWords.length >= 12) || currentDur >= 3.4;
+
+      if (!next || pauseToNext >= 0.30 || endsSentence || tooLongAtClause || hardLengthCap) {
+        flush(next?.start);
+      }
+    }
+    flush();
+    if (utterances.length > 0) return utterances;
+  }
+
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  const out: Array<{ start: number; end: number; text: string }> = [];
+  for (const s of segments) {
+    const start = Number(s?.start);
+    const end = Number(s?.end);
+    const text = typeof s?.text === 'string' ? s.text.trim() : '';
+    if (!text) continue;
+    const safeStart = Number.isFinite(start) ? Math.max(0, start) : 0;
+    const safeEnd = Number.isFinite(end) ? Math.max(safeStart + 0.25, end) : safeStart + 1.5;
+
+    // Split multi-sentence Whisper segments into separate utterances
+    let parts = text
+      .split(/(?<=[。！？!?])\s*|\r?\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    // Also split overly long single-segment runs on clause commas so 2 speakers/clauses don't merge
+    const expanded: string[] = [];
+    for (const part of parts) {
+      const hasCjk = /[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(part);
+      if ((hasCjk && part.length >= 22) || (!hasCjk && part.length >= 52)) {
+        const sub = part
+          .split(/(?<=[，,、])\s*/)
+          .map((p) => p.trim())
+          .filter(Boolean);
+        if (sub.length > 1) {
+          let acc = '';
+          for (const piece of sub) {
+            const candidate = acc ? `${acc} ${piece}` : piece;
+            if (acc && ((hasCjk && candidate.length > 18) || (!hasCjk && candidate.length > 42))) {
+              expanded.push(acc.replace(/[，,、]+$/, '').trim());
+              acc = piece;
+            } else {
+              acc = candidate;
+            }
+          }
+          if (acc) expanded.push(acc.replace(/[，,、]+$/, '').trim());
+          continue;
+        }
+      }
+      expanded.push(part);
+    }
+    parts = expanded.filter(Boolean);
+
+    if (parts.length <= 1) {
+      out.push({ start: safeStart, end: safeEnd, text: parts[0] || text });
+      continue;
+    }
+
+    const totalDur = Math.max(parts.length * 0.35, safeEnd - safeStart);
+    const totalWeight = Math.max(1, parts.reduce((sum, p) => sum + Math.max(3, p.length), 0));
+    const gapSec = 0.12;
+    const usableDur = Math.max(parts.length * 0.25, totalDur - gapSec * (parts.length - 1));
+    let curStart = safeStart;
+    for (let i = 0; i < parts.length; i++) {
+      const isLast = i === parts.length - 1;
+      const share = Math.max(0.28, usableDur * (Math.max(3, parts[i].length) / totalWeight));
+      const remainingMin = (parts.length - 1 - i) * (0.28 + gapSec);
+      const curEnd = isLast ? safeEnd : Math.min(safeEnd - remainingMin, curStart + share);
+      out.push({
+        start: curStart,
+        end: Math.max(curStart + 0.25, curEnd),
+        text: parts[i]
+      });
+      curStart = Math.min(safeEnd - 0.25, Math.max(curStart + 0.25, curEnd) + gapSec);
+    }
+  }
+  return out;
+}
+
 export function parseWorkersAiWhisperTimedResult(
   payload: unknown,
   maxSegments = 120,
@@ -959,9 +1125,14 @@ export function parseWorkersAiWhisperTimedResult(
   const data = payload as {
     result?: {
       segments?: Array<{ start?: unknown; end?: unknown; text?: unknown }>;
+      words?: Array<{ word?: unknown; start?: unknown; end?: unknown }>;
     };
   };
-  return formatTimedSttSegments(data.result?.segments, plain, maxSegments, preciseMs);
+  const rawSegments = data.result?.segments;
+  const splitSegments = preciseMs
+    ? splitWhisperSegmentsIntoUtterances(rawSegments, data.result?.words)
+    : rawSegments;
+  return formatTimedSttSegments(splitSegments, plain, maxSegments, preciseMs);
 }
 
 export type SttProviderOrder = ('user_groq' | 'workers_ai' | 'groq_pool')[];
@@ -1971,7 +2142,7 @@ ${speakerRule}
       : '';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE: Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE (100% PURE BURMESE ONLY!): Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation). NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, or Thai words inside Burmese cue.text! Every single word MUST be translated completely into Burmese (e.g. "哎呀，到家了宝宝，下车" -> "အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့", NEVER "အိုက်ယား...到家了宝宝...下车")!\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
       : '';
   const speakerNote = isCaptionsOnly
     ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE TWO SPEAKERS!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
@@ -1983,9 +2154,9 @@ ${speakerRule}
     : '';
 
   return `You are TTAK MOVIE RECAP's Senior Cinematic Movie Dialogue Translator (${isCaptionsOnly ? 'Subtitles / Captions-Only Mode' : 'Voice Dubbing Mode'}).
-TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into ${langLabel}, synchronized tightly to the exact moments each line is spoken in the video.
+TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into 100% pure ${langLabel} (ZERO untranslated source-language characters!), synchronized tightly to the exact moments each line is spoken in the video.
 CRITICAL ANTI-RECAP RULES (MUST OBEY):
-1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate ONLY what the characters are physically speaking aloud in first/second person!
+1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate ONLY what the characters are physically speaking aloud in first/second person into 100% ${langLabel}!
 2. STRICTLY FORBIDDEN RECAP & TIME-SKIP PHRASES: NEVER write third-person movie recap narrator commentary or time-jump captions such as "10 မိနစ်ကြာပြီးသောအခါ", "မိနစ်ကြာပြီးသောအခါ", "နာရီကြာပြီးသောအခါ", "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
 3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the exact moment THAT ONE speaker starts and stops speaking that single line in the audio. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
 4. ${isCaptionsOnly ? 'ONE SHORT LINE PER SPEAKER TURN: Each cue MUST hold ONLY ONE speaker\'s single short utterance (1 to 10 words, max ~46 characters, typically 0.5s–2.5s). Split every speaker change and every back-and-forth reply into its own separate timed cue!' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
@@ -2088,6 +2259,78 @@ export function formatSpeechIntervalsGuide(intervals: SpeechActivityInterval[]):
     .slice(0, 45)
     .map((iv) => `[${fmt(iv.startMs)} - ${fmt(iv.endMs)}] (${iv.startMs}ms - ${iv.endMs}ms) Audio active`)
     .join('\n');
+}
+
+/**
+ * Tightens Captions-Only subtitle cues (especially Whisper-locked cues) so subtitles do NOT stay
+ * glued together continuously across silent pauses or back-to-back speaker turns:
+ * 1) If FFmpeg active-speech intervals are available and a cue's `end_ms` stretches past the end
+ *    of the spoken interval it started in (trailing silence bloat), trims `end_ms` to speech end + 120ms.
+ * 2) Caps overly stretched short utterances that linger across multi-second silence.
+ * 3) Ensures a crisp clear-screen breath gap (`>= 100ms`) between consecutive cues whenever the
+ *    previous cue has enough duration (`>= 520ms`) so each spoken line visibly appears and clears!
+ */
+export function tightenCaptionsOnlyCuePauses(
+  cues: SubtitleCue[],
+  speechIntervals: SpeechActivityInterval[] = [],
+  totalDurationSec?: number
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const totalMs =
+    typeof totalDurationSec === 'number' && Number.isFinite(totalDurationSec) && totalDurationSec > 0
+      ? Math.round(totalDurationSec * 1000)
+      : Math.max(...cues.map((c) => Number(c.end_ms) || 0), 4000);
+
+  const tightened = cues.map((cue) => {
+    const startMs = Math.max(0, Math.round(Number(cue.start_ms) || 0));
+    let endMs = Math.min(totalMs, Math.max(startMs + 320, Math.round(Number(cue.end_ms) || startMs + 1200)));
+
+    // 1) Trim trailing silence bloat using FFmpeg detected speech intervals when the cue covers
+    //    only a single active speech burst and then stretches >= 450ms into silence.
+    if (Array.isArray(speechIntervals) && speechIntervals.length > 0) {
+      const overlapping = speechIntervals.filter(
+        (iv) => Math.min(endMs, iv.endMs) - Math.max(startMs, iv.startMs) >= 180
+      );
+      if (overlapping.length >= 1) {
+        const lastActiveEnd = overlapping[overlapping.length - 1].endMs;
+        if (endMs - lastActiveEnd >= 450 && lastActiveEnd + 120 >= startMs + 380) {
+          endMs = Math.min(endMs, lastActiveEnd + 120);
+        }
+      }
+    }
+
+    // 2) Cap extreme trailing linger on short utterances (e.g. 12-char cue stretched to 5.5s)
+    const textLen = String(cue.text || '').trim().length;
+    const naturalMaxMs = Math.max(1900, Math.min(4800, 1100 + textLen * 95));
+    if (endMs - startMs > naturalMaxMs) {
+      endMs = startMs + naturalMaxMs;
+    }
+
+    return {
+      ...cue,
+      start_ms: startMs,
+      end_ms: Math.min(totalMs, Math.max(startMs + 300, endMs))
+    };
+  });
+
+  // 3) Guarantee a crisp visual clear-screen gap (>= 100ms) between consecutive spoken turns
+  //    so subtitles appear cleanly per utterance rather than staying glued continuously.
+  const minClearGapMs = 100;
+  for (let i = 0; i < tightened.length - 1; i++) {
+    const cur = tightened[i];
+    const next = tightened[i + 1];
+    const gap = next.start_ms - cur.end_ms;
+    if (gap < minClearGapMs) {
+      const targetEnd = next.start_ms - minClearGapMs;
+      if (targetEnd - cur.start_ms >= 420) {
+        cur.end_ms = targetEnd;
+      } else if (next.start_ms - cur.start_ms >= 360) {
+        cur.end_ms = Math.max(cur.start_ms + 300, next.start_ms - 60);
+      }
+    }
+  }
+
+  return tightened.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
 }
 
 export interface TimedCueBlock {
@@ -4162,20 +4405,73 @@ export function doesTextMatchSubtitleLanguage(
 
   switch (targetLang) {
     case 'my':
-      return hasMyanmar;
+      // Reject mixed half-Burmese / half-Chinese (or Korean/Japanese/Thai) leaked subtitles!
+      return hasMyanmar && !hasHan && !hasKorean && !hasThai && !hasKana;
     case 'th':
-      return hasThai && !hasMyanmar;
+      return hasThai && !hasMyanmar && !hasHan && !hasKorean && !hasKana;
     case 'ko':
-      return hasKorean && !hasMyanmar;
+      return hasKorean && !hasMyanmar && !hasHan && !hasThai && !hasKana;
     case 'zh':
-      return hasHan && !hasMyanmar && !hasKana;
+      return hasHan && !hasMyanmar && !hasKana && !hasKorean && !hasThai;
     case 'ja':
-      return (hasKana || hasHan) && !hasMyanmar;
+      return (hasKana || hasHan) && !hasMyanmar && !hasKorean && !hasThai;
     case 'en':
       return hasLatin && !hasMyanmar && !hasThai && !hasKorean && !hasHan && !hasKana;
     default:
       return !hasMyanmar;
   }
+}
+
+/**
+ * Detects whether a single subtitle cue contains untranslated foreign script leakage
+ * (for example, Chinese characters `到家了宝宝` mixed into a Burmese subtitle `အိုက်ယား...到家了宝宝`).
+ */
+export function hasForeignScriptLeakage(
+  text: string,
+  targetLang: TargetLanguageCode
+): boolean {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return false;
+  const hasMyanmar = /[\u1000-\u109F]/.test(trimmed);
+  const hasThai = /[\u0E00-\u0E7F]/.test(trimmed);
+  const hasKorean = /[\uAC00-\uD7AF\u1100-\u11FF]/.test(trimmed);
+  const hasHan = /[\u4E00-\u9FFF]/.test(trimmed);
+  const hasKana = /[\u3040-\u30FF]/.test(trimmed);
+
+  switch (targetLang) {
+    case 'my':
+      return hasHan || hasKorean || hasThai || hasKana || (!hasMyanmar && /[A-Za-z]{4,}/.test(trimmed));
+    case 'th':
+      return hasMyanmar || hasHan || hasKorean || hasKana;
+    case 'ko':
+      return hasMyanmar || hasHan || hasThai || hasKana;
+    case 'zh':
+      return hasMyanmar || hasKorean || hasThai || hasKana;
+    case 'ja':
+      return hasMyanmar || hasKorean || hasThai;
+    case 'en':
+      return hasMyanmar || hasHan || hasKorean || hasThai || hasKana;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Returns 0-based indices of all cues that contain leaked untranslated source-language script
+ * so a targeted 1-to-1 repair pass can translate ONLY those cues cleanly without shifting timing.
+ */
+export function findForeignScriptLeakedCueIndices(
+  cues: SubtitleCue[],
+  targetLang: TargetLanguageCode
+): number[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const leaked: number[] = [];
+  for (let i = 0; i < cues.length; i++) {
+    if (hasForeignScriptLeakage(cues[i]?.text || '', targetLang)) {
+      leaked.push(i);
+    }
+  }
+  return leaked;
 }
 
 /**

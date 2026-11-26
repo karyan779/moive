@@ -57,12 +57,14 @@ import {
   buildWorkersAiRunUrl,
   parseWorkersAiWhisperResult,
   parseWorkersAiWhisperTimedResult,
+  splitWhisperSegmentsIntoUtterances,
   formatTimedSttSegments,
   normalizeRecapTimelineCues,
   buildChronologicalSceneLockGuide,
   computeAudioScriptWindows,
   sliceTimedTranscriptForWindow,
   normalizeDialogueSubtitleCues,
+  tightenCaptionsOnlyCuePauses,
   parseTimedSttTranscriptToCues,
   findUncoveredTranscriptSegments,
   mergeMissingDialogueCues,
@@ -71,6 +73,7 @@ import {
   sanitizeCaptionsOnlyDialogueCues,
   parseFfmpegSilenceDetectToSpeechIntervals,
   formatSpeechIntervalsGuide,
+  findForeignScriptLeakedCueIndices,
   resolveAllowedSubtitleLanguage,
   resolveAllowedBurmeseFontStyle,
   splitMultiSpeakerDialogueCues,
@@ -2869,6 +2872,9 @@ async function transcribeWithDirectGroqKey(
   form.append('response_format', 'verbose_json');
   form.append('temperature', '0');
   form.append('timestamp_granularities[]', 'segment');
+  if (opts.preciseMs) {
+    form.append('timestamp_granularities[]', 'word');
+  }
 
   const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
     method: 'POST',
@@ -2886,9 +2892,13 @@ async function transcribeWithDirectGroqKey(
   const data = (await resp.json()) as {
     text?: string;
     segments?: Array<{ start?: number; end?: number; text?: string }>;
+    words?: Array<{ word?: string; start?: number; end?: number }>;
   };
+  const refinedSegments = opts.preciseMs
+    ? splitWhisperSegmentsIntoUtterances(data?.segments, data?.words)
+    : data?.segments;
   return formatTimedSttSegments(
-    data?.segments,
+    refinedSegments,
     String(data?.text || '').trim(),
     opts.maxSegments ?? 120,
     Boolean(opts.preciseMs)
@@ -3735,12 +3745,15 @@ async function startServer() {
     }));
     const lang: TargetLanguageCode = targetSubtitleLang || 'my';
 
-    // Fast path: returning to Burmese when original Burmese source text is already preserved
+    // Fast path: returning to Burmese ONLY when EVERY cue is already pure Burmese (no mixed Chinese/foreign script!)
     if (lang === 'my') {
-      const hasRealBurmeseSource = withSourceSaved.some((c) =>
-        doesTextMatchSubtitleLanguage(c.burmeseText || c.text, 'my')
-      );
-      if (hasRealBurmeseSource) {
+      const allPureBurmeseSource =
+        withSourceSaved.length > 0 &&
+        withSourceSaved.every((c) => {
+          const t = String(c.burmeseText || c.text || '').trim();
+          return !t || doesTextMatchSubtitleLanguage(t, 'my');
+        });
+      if (allPureBurmeseSource) {
         return withSourceSaved.map((c) => ({
           ...c,
           text: c.burmeseText || c.text
@@ -3802,7 +3815,7 @@ async function startServer() {
       const numberedInput = sourceLines
         .map((line, idx) => `${idx + 1}. ${line}`)
         .join('\n');
-      const prompt = `Translate all ${sourceLines.length} numbered movie subtitle lines below into natural, concise, accurate ${targetLangName} subtitles.\nCRITICAL RULES:\n- Output strictly in ${targetLangName} script ONLY.\n- Return EVERY line numbered 1 to ${sourceLines.length} in exact 1-to-1 order.\n- Preserve character names, numbers, and dramatic meaning.\n\n${numberedInput}`;
+      const prompt = `Translate all ${sourceLines.length} numbered movie subtitle lines below into natural, concise, accurate ${targetLangName} subtitles.\nCRITICAL RULES:\n- Output 100% PURE ${targetLangName} script ONLY! NEVER leave ANY untranslated Chinese (汉字), Korean, Japanese, or foreign words inside ${targetLangName} lines (if an input line is half-Burmese half-Chinese, translate the ENTIRE sentence cleanly into pure ${targetLangName}).\n- Return EVERY line numbered 1 to ${sourceLines.length} in exact 1-to-1 order.\n- Preserve character names, numbers, and dramatic meaning.\n\n${numberedInput}`;
       const subModels: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
         { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
         { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW }
@@ -5143,15 +5156,20 @@ async function startServer() {
           prioritizeEndingTail = true
         ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
           if (!srcVideoPath || !fs.existsSync(srcVideoPath)) return [];
-          // In Translate -> Captions-Only (Gemini Direct) mode, stay strictly AUDIO-SPEECH-ONLY
-          // so Gemini never hallucinates or translates on-screen time-skip intertitle cards
-          // ("10 minutes later" -> "10 မိနစ်ကြာပြီးသောအခါ") and requests stay fast & overload-free.
-          if (isGeminiDirectCaptions) return [];
           if (isTranslateMode && (!isCaptionsOnlyMode || Boolean(isSttOnly))) return [];
+          // For Translate -> Captions-Only (Gemini Direct), include 6 lightweight keyframes per 45s window
+          // so Gemini cross-reads burned-in Chinese/foreign dialogue subtitles accurately without bloating payload size.
           const useLightCaptionsFrames = isCaptionsOnlyMode && !isSttOnly;
+          const maxFrames = isGeminiDirectCaptions
+            ? 6
+            : useLightCaptionsFrames
+              ? 10
+              : prioritizeEndingTail
+                ? 22
+                : 16;
           const plan = computeVisualKeyframePlan(
             segDurSec,
-            useLightCaptionsFrames ? 12 : prioritizeEndingTail ? 22 : 16,
+            maxFrames,
             useLightCaptionsFrames ? false : prioritizeEndingTail
           );
 
@@ -5349,6 +5367,10 @@ async function startServer() {
               targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
                 ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
                 : '';
+            const pureTargetLanguageRule =
+              !(isSttOnly && sttMode === 'transcribe')
+                ? `\n- 100% PURE ${langLabel} OUTPUT ONLY (ZERO MIXED SCRIPT!): Translate EVERY SINGLE spoken word completely into natural ${langLabel}! NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, Thai, or source-language words inside cue.text (e.g. NEVER output half-Burmese half-Chinese like "အိုက်ယား...到家了宝宝...下车" — ALWAYS translate 100% into pure natural ${langLabel}!).`
+                : '';
             return `Segment Duration: ${winDurSec} seconds (${Math.round(winDurSec * 1000)} ms).${partBadge}
 STT Engine: ${sttModel}.
 Task: ${
@@ -5358,10 +5380,16 @@ Task: ${
             }.
 Target Language: ${isSttOnly && sttMode === 'transcribe' ? 'Original Spoken Language of Audio' : langLabel}.
 Video Title / Filename: ${title || 'Movie Clip'}.
-${winContext ? `Detected Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — align your cue start_ms & end_ms tightly to when the voices actually speak inside these windows!):\n${winContext}` : 'Listen carefully to the attached audio segment ONLY and transcribe/translate every actual spoken human dialogue line at its exact millisecond timestamp.'}
+${
+              winContext
+                ? `Detected Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — align your cue start_ms & end_ms tightly to when the voices actually speak inside these windows!):\n${winContext}`
+                : isSttOnly && sttMode === 'transcribe'
+                  ? 'Listen carefully to the attached audio segment and transcribe every actual spoken human dialogue line verbatim at its exact millisecond timestamp.'
+                  : `Listen carefully to the attached audio segment${hasVisualKeyframes ? ' and cross-check any burned-in dialogue subtitles visible in the attached frames' : ''}, then TRANSLATE every actual spoken human dialogue line 100% into pure ${langLabel} at its exact millisecond timestamp.`
+            }
 
 CRITICAL DIALOGUE & TIMING RULES:
-- ONLY output actual SPOKEN human dialogue heard in THIS audio segment! NEVER invent movie-recap commentary, time-skip intertitles (such as "10 မိနစ်ကြာပြီးသောအခါ", "10 minutes later", "နာရီကြာပြီးသောအခါ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့"), or subtitles during music-only / silent parts! If this segment has only music or silence with no speech, return an empty cues array [].${
+- ONLY output actual SPOKEN human dialogue heard in THIS audio segment! NEVER invent movie-recap commentary, time-skip intertitles (such as "10 မိနစ်ကြာပြီးသောအခါ", "10 minutes later", "နာရီကြာပြီးသောအခါ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့"), or subtitles during music-only / silent parts! If this segment has only music or silence with no speech, return an empty cues array [].${pureTargetLanguageRule}${
               isCaptionsOnlyMode
                 ? `\n- ONE SPEAKER = ONE SEPARATE CUE (NEVER MERGE TWO PEOPLE!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST create a BRAND NEW separate cue object with its own exact start_ms and end_ms! NEVER join two people's dialogue or a question + answer into one cue (NEVER output "- Line A - Line B" or "Line A? Line B" together).\n- ZERO-SKIP 100% SPOKEN COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue locked to the exact voice timing!`
                 : ''
@@ -5746,7 +5774,8 @@ ${prevTailHint ? `Previous dialogue context (for pronoun/story consistency ONLY 
 - Output EXACTLY ${batch.length} items in cues[] matching lines 1..${batch.length} in order.
 - Keep each item's EXACT start_ms and end_ms from the input.
 - Natural movie subtitle dialogue only (NO third-person movie recap narration!).
-- Fix obvious minor speech-to-text homophone typos using conversation context so the Burmese meaning is 100% natural and accurate.${aiyaBatchRule}
+- 100% PURE ${langLabel} ONLY: NEVER leave any Chinese (汉字), Korean, Japanese, or untranslated source words inside cues[].text!
+- Fix obvious minor speech-to-text homophone typos using conversation context so the ${langLabel} meaning is 100% natural and accurate.${aiyaBatchRule}
 
 LINES TO TRANSLATE:
 ${numberedLines}
@@ -6522,6 +6551,67 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, targetLanguage);
       }
     }
+
+    // Mandatory Foreign-Script Leakage Auto-Repair for Translate Mode (eliminates half-Burmese / half-Chinese cues!)
+    if (isTranslateMode && !(isSttOnly && sttMode === 'transcribe') && finalCues.length > 0) {
+      const leakedIndices = findForeignScriptLeakedCueIndices(finalCues, targetLanguage);
+      if (leakedIndices.length > 0) {
+        onProgress(82, `Polishing ${leakedIndices.length} subtitle lines into pure ${targetLanguage.toUpperCase()}...`);
+        try {
+          const subsetToFix = leakedIndices.map((idx) => ({
+            ...finalCues[idx],
+            burmeseText: undefined
+          }));
+          const repairedSubset = await translateSubtitleCuesToLanguage(subsetToFix, targetLanguage, {
+            allowOwnerPool: !isFreeMode,
+            userGeminiApiKey: freeGeminiKey,
+            userGroqApiKey: freeGroqKey
+          });
+          for (let k = 0; k < leakedIndices.length; k++) {
+            const origIdx = leakedIndices[k];
+            const repairedText = String(repairedSubset[k]?.text || '').trim();
+            if (repairedText && doesTextMatchSubtitleLanguage(repairedText, targetLanguage)) {
+              finalCues[origIdx] = {
+                ...finalCues[origIdx],
+                text: repairedText,
+                burmeseText: targetLanguage === 'my' ? repairedText : finalCues[origIdx].burmeseText
+              };
+            }
+          }
+          if (isCaptionsOnlyMode && targetLanguage === 'my') {
+            finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, 'my');
+          }
+        } catch (repairErr) {
+          console.warn('[Captions Auto-Repair] Failed to repair mixed-script cues:', repairErr);
+        }
+      }
+    }
+
+    // Tighten Captions-Only speech pause boundaries so Whisper & Gemini subtitles disappear cleanly
+    // between spoken turns instead of staying continuously stuck together across pauses.
+    if (isCaptionsOnlyMode && finalCues.length > 0) {
+      let fullSpeechIntervals: Array<{ startMs: number; endMs: number }> = [];
+      if (inputVideoPath && fs.existsSync(inputVideoPath)) {
+        try {
+          const silRes = await execFileAsync('ffmpeg', [
+            '-i',
+            inputVideoPath,
+            '-vn',
+            '-af',
+            'silencedetect=noise=-34dB:d=0.32',
+            '-f',
+            'null',
+            '-'
+          ]);
+          fullSpeechIntervals = parseFfmpegSilenceDetectToSpeechIntervals(
+            silRes?.stderr || '',
+            safeDuration
+          );
+        } catch {}
+      }
+      finalCues = tightenCaptionsOnlyCuePauses(finalCues, fullSpeechIntervals, safeDuration);
+    }
+
     finalCues = finalCues.map((c) => ({ ...c, burmeseText: c.burmeseText || c.text }));
     finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
 
