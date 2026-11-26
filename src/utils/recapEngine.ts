@@ -2142,7 +2142,7 @@ ${speakerRule}
       : '';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE (100% PURE BURMESE ONLY!): Translate like professional Burmese cinema/drama subtitles & dubbing matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation. NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, or Thai words inside Burmese cue.text! Every single word MUST be translated completely into Burmese (e.g. "哎呀，到家了宝宝，下车" -> "အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့", NEVER "အိုက်ယား...到家了宝宝...下车")!\n- STRICT BURMESE GENDER PRONOUN RULE (FEMALE SPEAKER = "ရှင်", NEVER "မင်း"!): Pay close attention to whether a FEMALE voice or MALE voice is speaking in the audio (and visual frames)! Whenever a FEMALE character (ကောင်မလေး / မိန်းကလေး) speaks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" / "ရှင့်ရဲ့" for "you" (and "ကျွန်မ" / "ညီမ" for "I") — NEVER use "မင်း" when a girl/woman is speaking! (Example: Female voice saying "你快点下来" -> "ရှင်...မြန်မြန်ဆင်းလာတော့လေ", NEVER "မင်း မြန်မြန်ဆင်းလာတော့"!). Only use "မင်း" / "ကိုယ်" / "ငါ" when a MALE speaker is talking.\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE (100% PURE BURMESE ONLY & ACCURATE CONTEXTUAL MEANING!): Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency). ALWAYS translate the TRUE INTENDED MEANING, idioms, and conversational nuance of the whole sentence in context — NEVER translate words mechanically one-by-one into awkward or wrong Burmese meanings! If an STT transcript has homophone typos, ALWAYS trust the actual spoken audio and burned-in on-screen dialogue subtitles as truth. NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, or Thai words inside Burmese cue.text! Every single word MUST be translated completely into Burmese (e.g. "哎呀，到家了宝宝，下车" -> "အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့", NEVER "အိုက်ယား...到家了宝宝...下车")!\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
       : '';
   const speakerNote = isCaptionsOnly
     ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE OR CHAIN CONTINUOUSLY!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue the EXACT millisecond Speaker A stops talking and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! Leave a clean uncaptioned gap between speaker turns — NEVER stretch Speaker A's end_ms up to Speaker B's start_ms and NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
@@ -2396,6 +2396,86 @@ export function snapGeminiCaptionsToSpeechAnchors(
   });
 
   return normalizeDialogueSubtitleCues(snapped, totalDurationSec);
+}
+
+/**
+ * Updates a single subtitle cue's editable text while keeping its exact millisecond timestamps intact.
+ * Syncs `burmeseText` as well when editing in Burmese so language toggles and MP4 export use the user's edit.
+ */
+export function updateSubtitleCueText(
+  cues: SubtitleCue[],
+  cueId: string,
+  newText: string,
+  activeSubtitleLang: TargetLanguageCode = 'my'
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  return cues.map((cue) => {
+    if (cue.id !== cueId) return cue;
+    return {
+      ...cue,
+      text: newText,
+      burmeseText: activeSubtitleLang === 'my' ? newText : cue.burmeseText
+    };
+  });
+}
+
+/**
+ * Deletes a single subtitle cue by ID without mutating remaining cues' timestamps.
+ */
+export function deleteSubtitleCueById(cues: SubtitleCue[], cueId: string): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  return cues.filter((cue) => cue.id !== cueId);
+}
+
+/**
+ * Replaces every occurrence of `findQuery` with `replaceWith` across all subtitle cues
+ * (useful for fixing a recurring mistranslated word or character name in one tap).
+ */
+export function replaceSubtitleTextAcrossCues(
+  cues: SubtitleCue[],
+  findQuery: string,
+  replaceWith: string,
+  activeSubtitleLang: TargetLanguageCode = 'my'
+): { cues: SubtitleCue[]; matchCount: number } {
+  if (!Array.isArray(cues) || cues.length === 0) return { cues: [], matchCount: 0 };
+  const needle = String(findQuery || '');
+  if (!needle) return { cues, matchCount: 0 };
+
+  let matchCount = 0;
+  const next = cues.map((cue) => {
+    const current = String(cue.text || '');
+    if (!current.includes(needle)) return cue;
+    const parts = current.split(needle);
+    matchCount += parts.length - 1;
+    const updated = parts.join(replaceWith);
+    return {
+      ...cue,
+      text: updated,
+      burmeseText: activeSubtitleLang === 'my' ? updated : cue.burmeseText
+    };
+  });
+  return { cues: next, matchCount };
+}
+
+/**
+ * Exports subtitle cues as a readable timestamped `.TXT` script file (`[MM:SS - MM:SS] text`).
+ */
+export function exportCuesToPlainText(cues: SubtitleCue[]): string {
+  if (!Array.isArray(cues) || cues.length === 0) return '';
+  const fmt = (ms: number) => {
+    const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
+  return cues
+    .map((cue) => {
+      const clean = String(cue.text || '').replace(/\r?\n/g, ' ').trim();
+      if (!clean) return '';
+      return `[${fmt(cue.start_ms)} - ${fmt(cue.end_ms)}] ${clean}`;
+    })
+    .filter(Boolean)
+    .join('\n');
 }
 
 export interface TimedCueBlock {

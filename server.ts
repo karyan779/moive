@@ -5158,11 +5158,11 @@ async function startServer() {
         ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
           if (!srcVideoPath || !fs.existsSync(srcVideoPath)) return [];
           if (isTranslateMode && (!isCaptionsOnlyMode || Boolean(isSttOnly))) return [];
-          // For Translate -> Captions-Only (Gemini Direct), include 6 lightweight keyframes per 45s window
-          // so Gemini cross-reads burned-in Chinese/foreign dialogue subtitles accurately without bloating payload size.
+          // For Translate -> Captions-Only (Gemini Direct), include 10 crisp keyframes per 24s window (~1 every 2.4s)
+          // so Gemini clearly reads burned-in Chinese/foreign dialogue subtitles and verifies true meaning alongside audio.
           const useLightCaptionsFrames = isCaptionsOnlyMode && !isSttOnly;
           const maxFrames = isGeminiDirectCaptions
-            ? 6
+            ? 10
             : useLightCaptionsFrames
               ? 10
               : prioritizeEndingTail
@@ -5366,7 +5366,7 @@ async function startServer() {
                 : '';
             const myanmarAiyaHint =
               targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
-                ? `\n- STRICT BURMESE GENDER PRONOUN RULE (FEMALE SPEAKER = "ရှင်", NEVER "မင်း"!): Listen to the speaker's voice gender (and check who is speaking in the frames)! Whenever a FEMALE character (ကောင်မလေး / မိန်းကလေး) speaks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" / "ရှင့်ရဲ့" for "you" (NEVER use "မင်း" when a female speaks!). Only use "မင်း" / "ကိုယ်" / "ငါ" for MALE speakers.\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
+                ? `\n- ACCURATE CONTEXTUAL MEANING (NO LITERAL NONSENSE!): Understand who is speaking, the emotional tone, slang, and idioms from the audio + frames + surrounding lines, then write natural, 100% accurate spoken Burmese matching the true meaning of each sentence (if the STT hint below has homophone typos, ALWAYS trust the actual spoken voice and burned-in subtitles on the frames!).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
                 : '';
             const pureTargetLanguageRule =
               !(isSttOnly && sttMode === 'transcribe')
@@ -5383,10 +5383,10 @@ Target Language: ${isSttOnly && sttMode === 'transcribe' ? 'Original Spoken Lang
 Video Title / Filename: ${title || 'Movie Clip'}.
 ${
               winContext
-                ? `Millisecond Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — translate EVERY SINGLE spoken line without skipping ANY, verify the exact words & speaker gender directly from the attached audio${hasVisualKeyframes ? ' and burned-in subtitles in the frames' : ''}, and LOCK each cue's start_ms & end_ms tightly to when that speaker starts and stops talking!):\n${winContext}`
+                ? `Millisecond Speech Timing Anchors & Rough STT Hint for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — NOTE: STT text may contain Chinese/Asian homophone typos, so ALWAYS prioritize the actual spoken audio${hasVisualKeyframes ? ' and burned-in on-screen subtitles in the attached frames' : ''} to get the 100% exact true meaning! Translate EVERY SINGLE spoken line without skipping ANY, and LOCK each cue's start_ms & end_ms tightly to when that speaker starts and stops talking!):\n${winContext}`
                 : isSttOnly && sttMode === 'transcribe'
                   ? 'Listen carefully to the attached audio segment and transcribe every actual spoken human dialogue line verbatim at its exact millisecond timestamp.'
-                  : `Listen carefully to the attached audio segment${hasVisualKeyframes ? ' and cross-check any burned-in dialogue subtitles visible in the attached frames' : ''}, then TRANSLATE every actual spoken human dialogue line 100% into pure ${langLabel} at its exact millisecond timestamp.`
+                  : `Listen carefully to the attached audio segment${hasVisualKeyframes ? ' and cross-check any burned-in dialogue subtitles visible in the attached frames' : ''}, then TRANSLATE every actual spoken human dialogue line 100% into pure ${langLabel} with accurate contextual meaning at its exact millisecond timestamp.`
             }
 
 CRITICAL DIALOGUE & TIMING RULES:
@@ -5531,7 +5531,14 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                       config: {
                         systemInstruction,
                         ...(supportsThinkingLevel
-                          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                          ? {
+                              thinkingConfig: {
+                                thinkingLevel:
+                                  isGeminiDirectCaptions && targetModel !== 'gemini-3.1-flash-lite'
+                                    ? ThinkingLevel.MEDIUM
+                                    : ThinkingLevel.LOW
+                              }
+                            }
                           : {}),
                         responseMimeType: 'application/json',
                         responseSchema: {
@@ -5768,7 +5775,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                   .join('\n');
                 const aiyaBatchRule =
                   targetLanguage === 'my'
-                    ? `\n- STRICT BURMESE FEMALE PRONOUN RULE: Whenever a FEMALE speaker addresses a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" (NEVER use "မင်း" for a female speaker!).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a source line literally contains "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated line!`
+                    ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a source line literally contains "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated line!`
                     : '';
                 const batchPrompt = `Translate ALL ${batch.length} numbered movie dialogue lines below into natural spoken ${langLabel} (1-to-1, exact same order, NEVER skip, merge, or reorder any line!).
 ${prevTailHint ? `Previous dialogue context (for pronoun/story consistency ONLY — do NOT repeat): ${prevTailHint}\n` : ''}RULES:
@@ -6203,8 +6210,8 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
               const repairLinesText = uncoveredSegs
                 .map((seg, idx) => `${idx + 1}. [${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.text}`)
                 .join('\n');
-              const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below 100% into pure ${langLabel} (1-to-1, do NOT skip ANY line, ZERO untranslated Chinese/source words!).
-${targetLanguage === 'my' ? 'STRICT RULES:\n- FEMALE SPEAKER PRONOUN: Whenever a female speaker talks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" (NEVER use "မင်း" for a female speaker!).\n- ONLY when a line literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation or line.\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
+              const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below 100% into pure, natural, accurate ${langLabel} (1-to-1, do NOT skip ANY line, ZERO untranslated Chinese/source words, fix any obvious STT homophone typos using conversation context!).
+${targetLanguage === 'my' ? 'STRICT RULE: ONLY when a line literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation or line.\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
 ${repairLinesText}
 
 Return JSON { title: "${String(finalTitle || 'Captions').replace(/"/g, '')}", scriptText: "...", cues: [{ start_ms, end_ms, text }] } containing ALL ${uncoveredSegs.length} translated cues in the exact same order.`;

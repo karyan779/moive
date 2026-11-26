@@ -26,7 +26,8 @@ import {
   SlidersHorizontal,
   Upload,
   Film,
-  ShieldCheck
+  ShieldCheck,
+  Edit3
 } from 'lucide-react';
 import {
   SCRIPT_STYLE_PROMPTS,
@@ -53,6 +54,7 @@ import {
   calculateSubtitleScalePercent,
   calculateCreditCost,
   exportCuesToSrt,
+  exportCuesToPlainText,
   resolveStudioWorkflowStep,
   getDefaultAntiCopyrightEffects,
   COLOR_SHIFT_PRESETS,
@@ -94,6 +96,7 @@ import {
 } from './CanvasVideoEditor';
 import { ThumbnailStudioModal } from './ThumbnailStudioModal';
 import { CopyrightTimedOverlaysPanel } from './CopyrightTimedOverlaysPanel';
+import { SubtitleEditorModal } from './SubtitleEditorModal';
 
 export type RightInspectorTab = 'settings' | 'history';
 
@@ -646,6 +649,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   const [studioErrorMsg, setStudioErrorMsg] = useState<string | null>(null);
   const studioErrorRef = useRef<HTMLDivElement | null>(null);
   const [isDownloadingMp3, setIsDownloadingMp3] = useState<boolean>(false);
+  const [isSubtitleEditorOpen, setIsSubtitleEditorOpen] = useState<boolean>(false);
 
   // AI Voice Preview State (Listen to Thiha / Nilar / Pro Voices before generating video)
   const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -1590,6 +1594,19 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
     const a = document.createElement('a');
     a.href = url;
     a.download = `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_burmese.srt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const handleDownloadTxt = () => {
+    playUiSound('tap');
+    const txtContent = exportCuesToPlainText(cues);
+    const blob = new Blob([txtContent], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(originalFilename || 'recap').replace(/\.[^.]+$/, '')}_subtitles.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -4084,14 +4101,29 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
               {isDone && hasLoadedVideo && (
                 <>
                   {cues.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={handleDownloadSrt}
-                      className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-stone-200/90 bg-white px-4 text-xs font-semibold text-stone-700 shadow-2xs transition-all hover:bg-stone-50 active:scale-95 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]"
-                    >
-                      <FileText className="size-3.5" />
-                      <span>.SRT</span>
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        data-testid="open-subtitle-editor-btn"
+                        onClick={() => {
+                          playUiSound('tap');
+                          setIsSubtitleEditorOpen(true);
+                        }}
+                        className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/12 px-3.5 text-xs font-semibold text-amber-700 shadow-2xs transition-all hover:bg-amber-500/20 active:scale-95 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25"
+                      >
+                        <Edit3 className="size-3.5" />
+                        <span>{uiLang === 'my' ? 'စာတန်းပြင်' : 'Edit Text'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDownloadSrt}
+                        className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-stone-200/90 bg-white px-4 text-xs font-semibold text-stone-700 shadow-2xs transition-all hover:bg-stone-50 active:scale-95 dark:border-slate-700/80 dark:bg-[#151C26] dark:text-slate-200 dark:hover:bg-[#1D2735]"
+                      >
+                        <FileText className="size-3.5" />
+                        <span>.SRT</span>
+                      </button>
+                    </>
                   )}
 
                   {!(mode === 'translate' && translateAudio === 'captions-only') && (
@@ -4225,14 +4257,28 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                       : `${videoDuration}s video · ~${creditCost} credit${creditCost !== 1 ? 's' : ''}`}
               </span>
               {isDone && cues.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handleDownloadSrt}
-                  className="inline-flex items-center gap-1 text-xs font-semibold text-teal-600 dark:text-teal-400 cursor-pointer"
-                >
-                  <FileText className="size-3.5" />
-                  <span>.SRT</span>
-                </button>
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    data-testid="mobile-open-subtitle-editor-btn"
+                    onClick={() => {
+                      playUiSound('tap');
+                      setIsSubtitleEditorOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/12 px-2 py-0.5 text-xs font-semibold text-amber-700 dark:text-amber-300 cursor-pointer"
+                  >
+                    <Edit3 className="size-3" />
+                    <span>{uiLang === 'my' ? 'စာတန်းပြင်' : 'Edit Text'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownloadSrt}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-teal-600 dark:text-teal-400 cursor-pointer"
+                  >
+                    <FileText className="size-3.5" />
+                    <span>.SRT</span>
+                  </button>
+                </div>
               )}
             </div>
 
@@ -4856,6 +4902,22 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             onNavigateToWallet();
           }
         }}
+      />
+
+      {/* Interactive Subtitle & Text Editor Modal (Edits sync live to Preview, .SRT, .TXT & MP4 Export) */}
+      <SubtitleEditorModal
+        isOpen={isSubtitleEditorOpen}
+        onClose={() => setIsSubtitleEditorOpen(false)}
+        uiLang={uiLang}
+        cues={cues}
+        activeSubtitleLang={effectiveSubtitleConfig.subtitleLanguage || targetLanguage}
+        currentTimeSec={previewCurrentTimeSec}
+        onChangeCues={setCues}
+        onSeekToSec={(sec) => {
+          setExternalSeekRequest((prev) => ({ sec, seq: (prev?.seq || 0) + 1 }));
+        }}
+        onDownloadSrt={handleDownloadSrt}
+        onDownloadTxt={handleDownloadTxt}
       />
     </div>
   );

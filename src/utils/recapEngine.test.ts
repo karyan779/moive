@@ -2168,22 +2168,29 @@ test('tightenCaptionsOnlyCuePauses trims trailing silence bloat and guarantees c
   );
 });
 
-import { snapGeminiCaptionsToSpeechAnchors } from './recapEngine.ts';
+import {
+  snapGeminiCaptionsToSpeechAnchors,
+  updateSubtitleCueText,
+  deleteSubtitleCueById,
+  replaceSubtitleTextAcrossCues,
+  exportCuesToPlainText
+} from './recapEngine.ts';
 
-test('Gemini Captions-Only enforces female pronoun ရှင် (not မင်း) and snaps drifted cues onto millisecond speech anchors', () => {
-  // 1) System prompt enforces female speaker pronoun "ရှင်" instead of "မင်း"
+test('Gemini Captions-Only restores original natural pronouns, enforces contextual meaning, and snaps drifted cues onto millisecond speech anchors', () => {
+  // 1) System prompt restores original pronouns (no forced female "ရှင်" override) and enforces contextual accuracy
   const capPrompt = buildCinematicTranslateSystemPrompt({
     targetLanguage: 'my',
     translateAudio: 'captions-only'
   });
-  assert.ok(capPrompt.includes('FEMALE SPEAKER = "ရှင်"'));
-  assert.ok(capPrompt.includes('NEVER use "မင်း" when a girl/woman is speaking'));
+  assert.equal(capPrompt.includes('FEMALE SPEAKER = "ရှင်"'), false);
+  assert.equal(capPrompt.includes('NEVER use "မင်း" when a girl/woman is speaking'), false);
+  assert.ok(capPrompt.includes('TRUE INTENDED MEANING'));
   assert.ok(capPrompt.includes('Leave a clean uncaptioned gap between speaker turns'));
 
   // 2) Drifted & continuously chained Gemini cues snap cleanly onto millisecond speech anchors with clear gaps
   const driftedGeminiCues = [
     { id: 'g1', start_ms: 1550, end_ms: 3500, text: 'အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ' },
-    { id: 'g2', start_ms: 3500, end_ms: 5900, text: 'ရှင်...မြန်မြန်ဆင်းလာတော့လေ' }
+    { id: 'g2', start_ms: 3500, end_ms: 5900, text: 'မင်း...မြန်မြန်ဆင်းလာတော့လေ' }
   ];
   const anchorTranscript = [
     '[00:01.05 - 00:02.45] 哎呀到家了宝宝',
@@ -2197,10 +2204,43 @@ test('Gemini Captions-Only enforces female pronoun ရှင် (not မင်�
   assert.equal(snapped[0].text, 'အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ');
   assert.equal(snapped[1].start_ms, 3100);
   assert.equal(snapped[1].end_ms, 4700);
-  assert.equal(snapped[1].text, 'ရှင်...မြန်မြန်ဆင်းလာတော့လေ');
+  assert.equal(snapped[1].text, 'မင်း...မြန်မြန်ဆင်းလာတော့လေ');
   // Clear 650ms gap between Speaker 1 finishing (2450ms) and Speaker 2 starting (3100ms)!
   assert.equal(snapped[1].start_ms - snapped[0].end_ms, 650);
 });
+
+test('Subtitle text editor helpers edit individual lines, batch Find & Replace, delete lines, and export .TXT cleanly', () => {
+  const initialCues = [
+    { id: 'cue-1', start_ms: 1000, end_ms: 3000, text: 'အိမ်ရောက်ပြီ ဘေဘီ', burmeseText: 'အိမ်ရောက်ပြီ ဘေဘီ' },
+    { id: 'cue-2', start_ms: 3400, end_ms: 5600, text: 'မင်း မြန်မြန်ဆင်းလာတော့', burmeseText: 'မင်း မြန်မြန်ဆင်းလာတော့' },
+    { id: 'cue-3', start_ms: 6000, end_ms: 8200, text: 'မင်း ဘာလို့ ကြာနေတာလဲ', burmeseText: 'မင်း ဘာလို့ ကြာနေတာလဲ' }
+  ];
+
+  // 1) Inline single-cue edit updates both text and burmeseText while preserving timestamps
+  const edited = updateSubtitleCueText(initialCues, 'cue-1', 'အိမ်ရောက်ပြီ အချစ်လေး', 'my');
+  assert.equal(edited[0].text, 'အိမ်ရောက်ပြီ အချစ်လေး');
+  assert.equal(edited[0].burmeseText, 'အိမ်ရောက်ပြီ အချစ်လေး');
+  assert.equal(edited[0].start_ms, 1000);
+  assert.equal(edited[0].end_ms, 3000);
+
+  // 2) Batch Find & Replace updates all matching cues
+  const replaced = replaceSubtitleTextAcrossCues(edited, 'မင်း', 'နင်', 'my');
+  assert.equal(replaced.matchCount, 2);
+  assert.equal(replaced.cues[1].text, 'နင် မြန်မြန်ဆင်းလာတော့');
+  assert.equal(replaced.cues[2].text, 'နင် ဘာလို့ ကြာနေတာလဲ');
+  assert.equal(replaced.cues[1].burmeseText, 'နင် မြန်မြန်ဆင်းလာတော့');
+
+  // 3) Delete cue by ID leaves other cues untouched
+  const afterDelete = deleteSubtitleCueById(replaced.cues, 'cue-2');
+  assert.equal(afterDelete.length, 2);
+  assert.equal(afterDelete[0].id, 'cue-1');
+  assert.equal(afterDelete[1].id, 'cue-3');
+
+  // 4) Plain .TXT export formats clean timestamped lines
+  const txt = exportCuesToPlainText(afterDelete);
+  assert.equal(txt, '[00:01 - 00:03] အိမ်ရောက်ပြီ အချစ်လေး\n[00:06 - 00:08] နင် ဘာလို့ ကြာနေတာလဲ');
+});
+
 
 
 
