@@ -68,6 +68,11 @@ import {
   mergeMissingDialogueCues,
   applyBurmeseDialogueExclamationRules,
   applyBurmeseCaptionsOnlyPunctuation,
+  sanitizeCaptionsOnlyDialogueCues,
+  parseFfmpegSilenceDetectToSpeechIntervals,
+  formatSpeechIntervalsGuide,
+  resolveAllowedSubtitleLanguage,
+  resolveAllowedBurmeseFontStyle,
   splitMultiSpeakerDialogueCues,
   buildCinematicTranslateSystemPrompt,
   groupCuesIntoTimedBlocks,
@@ -4098,18 +4103,27 @@ async function startServer() {
         userGeminiApiKey?: string;
         userGroqApiKey?: string;
       };
-      const translated = await translateSubtitleCuesToLanguage(cues, subtitleLanguage, {
+      if (isFreeMode && subtitleLanguage !== 'my') {
+        res.status(403).json({
+          ok: false,
+          error:
+            'Free Mode တွင် စာတန်းထိုးဘာသာစကားကို မြန်မာစာ (Burmese) တစ်မျိုးသာ အသုံးပြုနိုင်ပါသည်။ အခြားဘာသာစကားများအတွက် Credit Mode ကို အသုံးပြုပါ။'
+        });
+        return;
+      }
+      const effectiveTargetSubLang = resolveAllowedSubtitleLanguage(subtitleLanguage, Boolean(isFreeMode));
+      const translated = await translateSubtitleCuesToLanguage(cues, effectiveTargetSubLang, {
         allowOwnerPool: !isFreeMode,
         userGeminiApiKey: typeof userGeminiApiKey === 'string' ? userGeminiApiKey.trim() : undefined,
         userGroqApiKey: typeof userGroqApiKey === 'string' ? userGroqApiKey.trim() : undefined,
         sourceLanguage
       });
       const translatedCount = translated.filter((c) =>
-        doesTextMatchSubtitleLanguage(c.text, subtitleLanguage)
+        doesTextMatchSubtitleLanguage(c.text, effectiveTargetSubLang)
       ).length;
       res.json({
         ok: true,
-        subtitleLanguage,
+        subtitleLanguage: effectiveTargetSubLang,
         translatedCount,
         cues: translated
       });
@@ -4182,19 +4196,33 @@ async function startServer() {
         return;
       }
 
+      const effectiveExportSubtitleConfig: SubtitleOverlayConfig | undefined = subtitleConfig
+        ? {
+            ...subtitleConfig,
+            subtitleLanguage: resolveAllowedSubtitleLanguage(
+              subtitleConfig.subtitleLanguage,
+              Boolean(isFreeMode)
+            ),
+            fontStyle: resolveAllowedBurmeseFontStyle(
+              subtitleConfig.fontStyle,
+              Boolean(isFreeMode)
+            )
+          }
+        : undefined;
+
       // Safety net: ensure burned-in MP4 subtitles are translated to the requested Subtitle Language
       // even if the user clicked Download immediately after switching languages
       let exportCues: SubtitleCue[] = Array.isArray(cues) ? cues : [];
       if (
-        subtitleConfig?.enabled !== false &&
-        subtitleConfig?.subtitleLanguage &&
+        effectiveExportSubtitleConfig?.enabled !== false &&
+        effectiveExportSubtitleConfig?.subtitleLanguage &&
         exportCues.length > 0 &&
-        needsSubtitleTranslation(exportCues, subtitleConfig.subtitleLanguage)
+        needsSubtitleTranslation(exportCues, effectiveExportSubtitleConfig.subtitleLanguage)
       ) {
         try {
           exportCues = await translateSubtitleCuesToLanguage(
             exportCues,
-            subtitleConfig.subtitleLanguage,
+            effectiveExportSubtitleConfig.subtitleLanguage,
             {
               allowOwnerPool: !isFreeMode,
               userGeminiApiKey: typeof userGeminiApiKey === 'string' ? userGeminiApiKey.trim() : undefined,
@@ -4203,7 +4231,11 @@ async function startServer() {
           );
         } catch {}
       }
-      if (isCaptionsOnly && (subtitleConfig?.subtitleLanguage || 'my') === 'my' && exportCues.length > 0) {
+      if (
+        isCaptionsOnly &&
+        (effectiveExportSubtitleConfig?.subtitleLanguage || 'my') === 'my' &&
+        exportCues.length > 0
+      ) {
         exportCues = applyBurmeseCaptionsOnlyPunctuation(exportCues, 'my');
       }
 
@@ -4238,7 +4270,7 @@ async function startServer() {
         effects: effectiveExportEffects,
         blurEnabled,
         blurRegions,
-        subtitleConfig,
+        subtitleConfig: effectiveExportSubtitleConfig,
         editConfig: effectiveExportEditConfig,
         cues: exportCues
       });
@@ -4297,7 +4329,7 @@ async function startServer() {
               Boolean(effectiveExportEffects.mirror),
               false,
               exportCues,
-              subtitleConfig,
+              effectiveExportSubtitleConfig,
               Boolean(blurEnabled),
               blurRegions,
               expTag,
@@ -4312,7 +4344,7 @@ async function startServer() {
               outputVideoPath,
               durationSec,
               exportCues,
-              subtitleConfig,
+              effectiveExportSubtitleConfig,
               Boolean(blurEnabled),
               blurRegions,
               Boolean(effectiveExportEffects.mirror),
@@ -4823,6 +4855,20 @@ async function startServer() {
           }
         : editConfig;
 
+    const effectiveServerSubtitleConfig: SubtitleOverlayConfig | undefined = subtitleConfig
+      ? {
+          ...subtitleConfig,
+          subtitleLanguage: resolveAllowedSubtitleLanguage(
+            subtitleConfig.subtitleLanguage,
+            Boolean(isFreeMode)
+          ),
+          fontStyle: resolveAllowedBurmeseFontStyle(
+            subtitleConfig.fontStyle,
+            Boolean(isFreeMode)
+          )
+        }
+      : undefined;
+
     let effectiveTranscriptText = transcriptText || '';
 
     onProgress(38, 'Preparing video & extracting audio...');
@@ -5084,7 +5130,10 @@ async function startServer() {
         const timelineAnchorNote = isLongTimeline && !isTranslateMode
           ? `\n- MULTI-MINUTE SYNC ANCHORS: Distribute cues smoothly across ALL acts—Opening (0s–${q1Sec}s), Rising Conflict (${q1Sec}s–${q2Sec}s), Turning Point & Climax (${q2Sec}s–${q3Sec}s), and Finale (${q3Sec}s–${Math.round(safeDuration)}s)—locked directly to the timestamped transcript/audio at those exact seconds!`
           : '';
-        const timeWindows = computeAudioScriptWindows(safeDuration, isCaptionsOnlyMode ? 30 : 75);
+        const timeWindows = computeAudioScriptWindows(
+          safeDuration,
+          isGeminiDirectCaptions ? 45 : isCaptionsOnlyMode ? 30 : 75
+        );
 
         const extractVisualKeyframesForSegment = async (
           srcVideoPath: string | null,
@@ -5094,6 +5143,10 @@ async function startServer() {
           prioritizeEndingTail = true
         ): Promise<Array<{ relSec: number; relMs: number; timeBadge: string; base64: string }>> => {
           if (!srcVideoPath || !fs.existsSync(srcVideoPath)) return [];
+          // In Translate -> Captions-Only (Gemini Direct) mode, stay strictly AUDIO-SPEECH-ONLY
+          // so Gemini never hallucinates or translates on-screen time-skip intertitle cards
+          // ("10 minutes later" -> "10 မိနစ်ကြာပြီးသောအခါ") and requests stay fast & overload-free.
+          if (isGeminiDirectCaptions) return [];
           if (isTranslateMode && (!isCaptionsOnlyMode || Boolean(isSttOnly))) return [];
           const useLightCaptionsFrames = isCaptionsOnlyMode && !isSttOnly;
           const plan = computeVisualKeyframePlan(
@@ -5271,11 +5324,17 @@ async function startServer() {
             : '';
           const partBadge =
             totalWins > 1
-              ? `\nVideo Segment: Part ${winIndex + 1} of ${totalWins} (Global video time ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')} to ${Math.floor(winEndSec / 60)}:${String(Math.round(winEndSec % 60)).padStart(2, '0')}; output cue timestamps MUST be relative to this segment from 0ms to ${Math.round(winDurSec * 1000)}ms).${
-                  winIndex > 0
-                    ? `\nCONTINUATION & FACTUAL CONSISTENCY RULE: This is Part ${winIndex + 1} starting at ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')}. Keep exact character identities, room numbers, locations, and plot facts consistent with earlier segments and do NOT restart the opening hook!${prevSummaryHint ? ` Previous story context: "${prevSummaryHint}" — continue seamlessly without repeating.` : ''}`
-                    : '\nSEGMENT 1 RULE: Narrate ONLY the events in this first segment. Do NOT guess or invent how the movie ends later!'
-                }`
+              ? isTranslateMode
+                ? `\nAudio Segment: Part ${winIndex + 1} of ${totalWins} (Global video time ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')} to ${Math.floor(winEndSec / 60)}:${String(Math.round(winEndSec % 60)).padStart(2, '0')}; ALL output cue timestamps MUST be RELATIVE to this segment from 0ms to ${Math.round(winDurSec * 1000)}ms).${
+                    winIndex > 0 && prevSummaryHint
+                      ? `\nPRONOUN CONTEXT ONLY (do NOT repeat or narrate): Previous spoken lines were "${prevSummaryHint}".`
+                      : ''
+                  }`
+                : `\nVideo Segment: Part ${winIndex + 1} of ${totalWins} (Global video time ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')} to ${Math.floor(winEndSec / 60)}:${String(Math.round(winEndSec % 60)).padStart(2, '0')}; output cue timestamps MUST be relative to this segment from 0ms to ${Math.round(winDurSec * 1000)}ms).${
+                    winIndex > 0
+                      ? `\nCONTINUATION & FACTUAL CONSISTENCY RULE: This is Part ${winIndex + 1} starting at ${Math.floor(winStartSec / 60)}:${String(Math.round(winStartSec % 60)).padStart(2, '0')}. Keep exact character identities, room numbers, locations, and plot facts consistent with earlier segments and do NOT restart the opening hook!${prevSummaryHint ? ` Previous story context: "${prevSummaryHint}" — continue seamlessly without repeating.` : ''}`
+                      : '\nSEGMENT 1 RULE: Narrate ONLY the events in this first segment. Do NOT guess or invent how the movie ends later!'
+                  }`
               : '';
           const visualKeyframeNotice = hasVisualKeyframes
             ? `\n- MULTIMODAL VISUAL SCENE KEYFRAMES & BURNED-IN SUBTITLES ATTACHED: Timestamped scene frames [Visual Scene Frame at MM:SS (XXXXms)] and audio cover ONLY this exact segment. CAREFULLY READ any burned-in on-screen subtitles (Chinese/Korean/Japanese/Thai/English text at the bottom of the frames) together with the spoken audio & transcript so exact numbers, room numbers, names, and dialogue meanings are 100% accurate—never guess wrong numbers, never jump ahead, and never invent unrelated filler!`
@@ -5284,7 +5343,7 @@ async function startServer() {
           if (isTranslateMode) {
             const captionsVisualHint =
               isCaptionsOnlyMode && hasVisualKeyframes
-                ? `\n- BURNED-IN ON-SCREEN SUBTITLE CROSS-CHECK: Visual scene frames are attached so you can cross-read any burned-in original subtitles on screen alongside the spoken audio and Whisper transcript — if any spoken line was soft or masked by background music, capture and translate it too so ZERO lines are missed!`
+                ? `\n- BURNED-IN ON-SCREEN SUBTITLE CROSS-CHECK: Visual scene frames are attached so you can cross-read any burned-in original spoken subtitles on screen alongside the spoken audio — NEVER translate on-screen time-skip cards like "10 minutes later" or silent title cards!`
                 : '';
             const myanmarAiyaHint =
               targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
@@ -5295,20 +5354,20 @@ STT Engine: ${sttModel}.
 Task: ${
               isSttOnly && sttMode === 'transcribe'
                 ? 'Verbatim Speech-to-Text (STT) Subtitles in Original Spoken Language (DO NOT translate, DO NOT summarize).'
-                : `Cinematic Movie Dialogue Translation (${isCaptionsOnlyMode ? 'Captions Only — Subtitles Match Original Audio' : 'Dialogue Dubbing'})`
+                : `Cinematic Movie Dialogue Translation (${isCaptionsOnlyMode ? 'Captions Only — Subtitles Match Original Spoken Audio' : 'Dialogue Dubbing'})`
             }.
 Target Language: ${isSttOnly && sttMode === 'transcribe' ? 'Original Spoken Language of Audio' : langLabel}.
 Video Title / Filename: ${title || 'Movie Clip'}.
-${winContext ? `Timestamped Source Speech Transcript for this segment (0ms to ${Math.round(winDurSec * 1000)}ms):\n${winContext}` : 'Listen carefully to the attached audio segment and transcribe/translate every spoken dialogue line at its exact timestamp.'}
+${winContext ? `Detected Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — align your cue start_ms & end_ms tightly to when the voices actually speak inside these windows!):\n${winContext}` : 'Listen carefully to the attached audio segment ONLY and transcribe/translate every actual spoken human dialogue line at its exact millisecond timestamp.'}
 
 CRITICAL DIALOGUE & TIMING RULES:
-- ONLY output actual spoken dialogue / speech cues heard in THIS segment (NEVER summarize or narrate like a third-person movie recap!).${
+- ONLY output actual SPOKEN human dialogue heard in THIS audio segment! NEVER invent movie-recap commentary, time-skip intertitles (such as "10 မိနစ်ကြာပြီးသောအခါ", "10 minutes later", "နာရီကြာပြီးသောအခါ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့"), or subtitles during music-only / silent parts! If this segment has only music or silence with no speech, return an empty cues array [].${
               isCaptionsOnlyMode
-                ? `\n- ONE SPEAKER = ONE SEPARATE CUE (NEVER MERGE TWO PEOPLE!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST create a BRAND NEW separate cue object with its own exact start_ms and end_ms! NEVER join two people's dialogue or a question + answer into one cue (NEVER output "- Line A - Line B" or "Line A? Line B" together).\n- ZERO-SKIP 100% COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue. NEVER drop, skip, or merge lines!`
+                ? `\n- ONE SPEAKER = ONE SEPARATE CUE (NEVER MERGE TWO PEOPLE!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST create a BRAND NEW separate cue object with its own exact start_ms and end_ms! NEVER join two people's dialogue or a question + answer into one cue (NEVER output "- Line A - Line B" or "Line A? Line B" together).\n- ZERO-SKIP 100% SPOKEN COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue locked to the exact voice timing!`
                 : ''
             }${captionsVisualHint}${myanmarAiyaHint}
-- Lock every cue start_ms and end_ms directly to the exact milliseconds within this segment (0ms to ${Math.floor(winDurSec * 1000)}ms) when that ONE speaker talks. Leave truly silent/music-only pauses uncaptioned.
-- All timestamps (start_ms, end_ms) MUST be in MILLISECONDS and strictly increasing.
+- Lock every cue start_ms and end_ms directly to the exact milliseconds within THIS segment (0ms to ${Math.floor(winDurSec * 1000)}ms) when that ONE speaker talks. Leave silent/music-only pauses completely uncaptioned.
+- All timestamps (start_ms, end_ms) MUST be in MILLISECONDS (0 to ${Math.round(winDurSec * 1000)}) and strictly increasing.
 - ${isCaptionsOnlyMode ? 'Keep each subtitle cue to ONE single speaker\'s short utterance (1 clean line, 1 to 10 words, max ~46 characters, ~0.5s–2.5s).' : phraseLengthRule}`;
           }
 
@@ -5776,6 +5835,7 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
 
               let winAudioBase64: string | null = null;
               let winAudioBuffer: Buffer | null = null;
+              let winSpeechGuide = '';
               if (inputVideoPath && fs.existsSync(inputVideoPath)) {
                 const winMp3Path = path.join(JOBS_TEMP_DIR, `${jobId}_win_${win.index}.mp3`);
                 try {
@@ -5800,6 +5860,24 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
                   if (fs.existsSync(winMp3Path) && fs.statSync(winMp3Path).size > 200) {
                     winAudioBuffer = fs.readFileSync(winMp3Path);
                     winAudioBase64 = winAudioBuffer.toString('base64');
+                    if (isGeminiDirectCaptions) {
+                      try {
+                        const silOut = await execFileAsync('ffmpeg', [
+                          '-i',
+                          winMp3Path,
+                          '-af',
+                          'silencedetect=noise=-34dB:d=0.45',
+                          '-f',
+                          'null',
+                          '-'
+                        ]);
+                        const intervals = parseFfmpegSilenceDetectToSpeechIntervals(
+                          silOut?.stderr || '',
+                          win.durationSec
+                        );
+                        winSpeechGuide = formatSpeechIntervalsGuide(intervals);
+                      } catch {}
+                    }
                   }
                   if (fs.existsSync(winMp3Path)) fs.unlinkSync(winMp3Path);
                 } catch {}
@@ -5814,7 +5892,7 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
               );
 
               let winTranscript = isGeminiDirectCaptions
-                ? ''
+                ? winSpeechGuide
                 : sliceTimedTranscriptForWindow(effectiveContext, win.startSec, win.endSec);
               if (!isGeminiDirectCaptions && !winTranscript && winAudioBuffer) {
                 try {
@@ -5837,6 +5915,12 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
                 winKeyframes.length === 0
               ) {
                 throw new Error('CORRUPT_UPLOADED_VIDEO: Uploaded video could not be decoded for audio or frames');
+              }
+
+              // CRITICAL SYNC GUARD: In multi-window mode, NEVER attach full-video `extractedAudioBase64`
+              // when a window's sliced audio failed—that would feed 0:00..END audio into a mid-video window!
+              if (!winAudioBase64 && isGeminiDirectCaptions) {
+                continue;
               }
 
               const winPrompt = buildPromptForWindow(
@@ -5868,7 +5952,7 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
                     data: winAudioBase64
                   }
                 });
-              } else if (extractedAudioBase64) {
+              } else if (extractedAudioBase64 && !isTranslateMode) {
                 winParts.push({
                   inlineData: {
                     mimeType: 'audio/mp3',
@@ -5878,36 +5962,57 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
               }
               winParts.push({ text: winPrompt });
 
-              const winResp = await invokeGeminiWithParts(winParts);
-              if (!winResp?.text) {
-                throw new Error(`Empty Gemini response for window ${win.index + 1}`);
+              try {
+                const winResp = await invokeGeminiWithParts(winParts);
+                if (!winResp?.text) {
+                  if (isGeminiDirectCaptions) {
+                    console.warn(`[Gemini Captions] Empty response for window ${win.index + 1}; continuing remaining windows`);
+                    continue;
+                  }
+                  throw new Error(`Empty Gemini response for window ${win.index + 1}`);
+                }
+                const winParsed = JSON.parse(winResp.text);
+                if (win.index === 0 && winParsed.title) {
+                  finalTitle = winParsed.title;
+                }
+                let winCues = parseWindowResponseCues(
+                  winParsed,
+                  win.durationSec,
+                  Math.round(win.startSec * 1000)
+                );
+                if (isCaptionsOnlyMode) {
+                  winCues = sanitizeCaptionsOnlyDialogueCues(winCues);
+                }
+                if (winCues.length === 0) {
+                  if (isCaptionsOnlyMode) {
+                    // Music-only / silent movie interval legitimately has 0 spoken cues — do NOT throw away prior windows!
+                    continue;
+                  }
+                  throw new Error(`Zero cues parsed for window ${win.index + 1}`);
+                }
+                const numberCues = winCues
+                  .map((c) => c.text)
+                  .filter((t) => /[0-9၀-၉]/.test(t))
+                  .slice(-2);
+                const recentContextBits = isTranslateMode
+                  ? winCues.slice(-2).map((c) => c.text).filter(Boolean)
+                  : Array.from(
+                      new Set([
+                        winCues[0]?.text,
+                        ...numberCues,
+                        winCues[winCues.length - 2]?.text,
+                        winCues[winCues.length - 1]?.text
+                      ])
+                    ).filter(Boolean);
+                storyContextHint = recentContextBits.join(' -> ');
+                stitchedCues.push(...winCues);
+              } catch (singleWinErr) {
+                if (isGeminiDirectCaptions && stitchedCues.length > 0) {
+                  console.warn(`[Gemini Captions] Window ${win.index + 1} failed; preserving ${stitchedCues.length} synced cues:`, singleWinErr);
+                  continue;
+                }
+                throw singleWinErr;
               }
-              const winParsed = JSON.parse(winResp.text);
-              if (win.index === 0 && winParsed.title) {
-                finalTitle = winParsed.title;
-              }
-              const winCues = parseWindowResponseCues(
-                winParsed,
-                win.durationSec,
-                Math.round(win.startSec * 1000)
-              );
-              if (winCues.length === 0) {
-                throw new Error(`Zero cues parsed for window ${win.index + 1}`);
-              }
-              const numberCues = winCues
-                .map((c) => c.text)
-                .filter((t) => /[0-9၀-၉]/.test(t))
-                .slice(-2);
-              const recentContextBits = Array.from(
-                new Set([
-                  winCues[0]?.text,
-                  ...numberCues,
-                  winCues[winCues.length - 2]?.text,
-                  winCues[winCues.length - 1]?.text
-                ])
-              ).filter(Boolean);
-              storyContextHint = recentContextBits.join(' -> ');
-              stitchedCues.push(...winCues);
             }
 
             if (stitchedCues.length > 0) {
@@ -5957,9 +6062,28 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
           ) {
             throw new Error('CORRUPT_UPLOADED_VIDEO: Uploaded video could not be decoded for audio or frames');
           }
+          let singlePassSpeechGuide = '';
+          if (isGeminiDirectCaptions && inputVideoPath && fs.existsSync(inputVideoPath)) {
+            try {
+              const silOut = await execFileAsync('ffmpeg', [
+                '-i',
+                inputVideoPath,
+                '-t',
+                String(safeDuration),
+                '-af',
+                'silencedetect=noise=-34dB:d=0.45',
+                '-f',
+                'null',
+                '-'
+              ]);
+              singlePassSpeechGuide = formatSpeechIntervalsGuide(
+                parseFfmpegSilenceDetectToSpeechIntervals(silOut?.stderr || '', safeDuration)
+              );
+            } catch {}
+          }
           const singlePassPrompt = buildPromptForWindow(
             safeDuration,
-            isGeminiDirectCaptions ? '' : effectiveContext,
+            isGeminiDirectCaptions ? singlePassSpeechGuide : effectiveContext,
             0,
             1,
             0,
@@ -5995,7 +6119,10 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
           if (response?.text) {
             const parsed = JSON.parse(response.text);
             if (parsed.title) finalTitle = parsed.title;
-            const parsedSingleCues = parseWindowResponseCues(parsed, safeDuration, 0);
+            let parsedSingleCues = parseWindowResponseCues(parsed, safeDuration, 0);
+            if (isCaptionsOnlyMode) {
+              parsedSingleCues = sanitizeCaptionsOnlyDialogueCues(parsedSingleCues);
+            }
             if (parsedSingleCues.length > 0) {
               finalCues = parsedSingleCues.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
               finalScriptText = finalCues.map((c) => c.text).join(' ');
@@ -6391,6 +6518,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
         targetLanguage
       );
       if (isCaptionsOnlyMode) {
+        finalCues = sanitizeCaptionsOnlyDialogueCues(finalCues);
         finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, targetLanguage);
       }
     }
@@ -6398,18 +6526,18 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
     finalScriptText = finalCues.map((c) => c.burmeseText || c.text).join(' ');
 
     if (
-      subtitleConfig?.subtitleLanguage &&
-      (subtitleConfig.subtitleLanguage !== targetLanguage ||
-        needsSubtitleTranslation(finalCues, subtitleConfig.subtitleLanguage))
+      effectiveServerSubtitleConfig?.subtitleLanguage &&
+      (effectiveServerSubtitleConfig.subtitleLanguage !== targetLanguage ||
+        needsSubtitleTranslation(finalCues, effectiveServerSubtitleConfig.subtitleLanguage))
     ) {
-      onProgress(84, `Translating subtitles to ${subtitleConfig.subtitleLanguage.toUpperCase()}...`);
-      finalCues = await translateSubtitleCuesToLanguage(finalCues, subtitleConfig.subtitleLanguage, {
+      onProgress(84, `Translating subtitles to ${effectiveServerSubtitleConfig.subtitleLanguage.toUpperCase()}...`);
+      finalCues = await translateSubtitleCuesToLanguage(finalCues, effectiveServerSubtitleConfig.subtitleLanguage, {
         allowOwnerPool: !isFreeMode,
         userGeminiApiKey: freeGeminiKey,
         userGroqApiKey: freeGroqKey,
         sourceLanguage: targetLanguage
       });
-      if (isCaptionsOnlyMode && subtitleConfig.subtitleLanguage === 'my') {
+      if (isCaptionsOnlyMode && effectiveServerSubtitleConfig.subtitleLanguage === 'my') {
         finalCues = applyBurmeseCaptionsOnlyPunctuation(finalCues, 'my');
       }
     }
@@ -6453,7 +6581,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
       effects: effectiveServerEffects,
       blurEnabled,
       blurRegions,
-      subtitleConfig,
+      subtitleConfig: effectiveServerSubtitleConfig,
       editConfig: effectiveServerEditConfig,
       cues: finalCues
     });
@@ -6487,7 +6615,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
           Boolean(effectiveServerEffects.mirror),
           false,
           finalCues,
-          subtitleConfig,
+          effectiveServerSubtitleConfig,
           Boolean(blurEnabled),
           blurRegions,
           jobId,
@@ -6524,7 +6652,7 @@ Generate concise, natural, strictly increasing millisecond cues covering 0ms to 
           outputVideoPath,
           safeDuration,
           finalCues,
-          subtitleConfig,
+          effectiveServerSubtitleConfig,
           Boolean(blurEnabled),
           blurRegions,
           Boolean(effectiveServerEffects.mirror),

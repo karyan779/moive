@@ -38,8 +38,13 @@ import {
   DEFAULT_DEEPRECAP_EDIT_CONFIG,
   CAPTION_COLOR_PRESETS,
   BURMESE_FONT_STYLES,
+  FREE_BURMESE_FONT_ID,
   resolveBurmeseFontMeta,
   resolveSubtitleFontMeta,
+  isSubtitleLanguageAllowedInMode,
+  resolveAllowedSubtitleLanguage,
+  isBurmeseFontAllowedInMode,
+  resolveAllowedBurmeseFontStyle,
   isVoiceAllowedInMode,
   getVoicePreviewSampleText,
   loadSavedApiEngineConfig,
@@ -449,10 +454,48 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
   });
   const [isTranslatingSubtitles, setIsTranslatingSubtitles] = useState<boolean>(false);
   const [subtitleTranslateError, setSubtitleTranslateError] = useState<string | null>(null);
+  const [subtitleLangLockNotice, setSubtitleLangLockNotice] = useState<string | null>(null);
+  const [fontLockNotice, setFontLockNotice] = useState<string | null>(null);
   const subtitleTranslateSeqRef = useRef<number>(0);
 
-  const handleChangeSubtitleLanguage = async (nextSubLang: TargetLanguageCode) => {
+  const effectiveSubtitleConfig: SubtitleOverlayConfig = isFreeTier
+    ? {
+        ...subtitleConfig,
+        subtitleLanguage: resolveAllowedSubtitleLanguage(subtitleConfig.subtitleLanguage, true),
+        fontStyle: resolveAllowedBurmeseFontStyle(subtitleConfig.fontStyle, true)
+      }
+    : subtitleConfig;
+
+  const handleSelectBurmeseFont = (nextFont: BurmeseFontStyle) => {
+    if (!isBurmeseFontAllowedInMode(nextFont, isFreeTier)) {
+      playUiSound('error');
+      setFontLockNotice(
+        uiLang === 'my'
+          ? 'Free Mode တွင် Myanmar Font အလှ ၁ မျိုးသာ အသုံးပြုနိုင်ပါသည်။ ကျန် Font အလှအားလုံးကို Credit Mode တွင် အသုံးပြုနိုင်ပါသည်။'
+          : 'Free Mode includes 1 Myanmar font only. Switch to Credit Mode to unlock all artistic Myanmar fonts.'
+      );
+      return;
+    }
     playUiSound('select');
+    setFontLockNotice(null);
+    setSubtitleConfig((prev) => ({
+      ...prev,
+      fontStyle: nextFont
+    }));
+  };
+
+  const handleChangeSubtitleLanguage = async (nextSubLang: TargetLanguageCode) => {
+    if (!isSubtitleLanguageAllowedInMode(nextSubLang, isFreeTier)) {
+      playUiSound('error');
+      setSubtitleLangLockNotice(
+        uiLang === 'my'
+          ? 'Free Mode တွင် စာတန်းထိုးဘာသာစကားကို မြန်မာစာ (Burmese) တစ်မျိုးသာ အသုံးပြုနိုင်ပါသည်။ English, Thai, Japanese, Korean, Chinese တို့ကို Credit Mode တွင် အသုံးပြုနိုင်ပါသည်။'
+          : 'Free Mode supports Burmese subtitles only. English, Thai, Japanese, Korean & Chinese are Credit Mode Only.'
+      );
+      return;
+    }
+    playUiSound('select');
+    setSubtitleLangLockNotice(null);
     setSubtitleTranslateError(null);
     setSubtitleConfig((prev) => ({
       ...prev,
@@ -546,12 +589,22 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
 
   const [colorShiftLockNotice, setColorShiftLockNotice] = useState<string | null>(null);
 
-  // Sync Free Tier vs Pro Credit Tier effect defaults & Voice restriction when switching routes
+  // Sync Free Tier vs Pro Credit Tier effect defaults, Voice, Subtitle Language & Font restrictions when switching routes
   useEffect(() => {
     const modeChanged = prevFreeTierRef.current !== isFreeTier;
     prevFreeTierRef.current = isFreeTier;
     if (isFreeTier) {
       setEffects((prev) => ({ ...prev, outputHD: false, zoom: false, colorShiftPreset: 'vivid' }));
+      setSubtitleConfig((prev) => {
+        const clampedLang = resolveAllowedSubtitleLanguage(prev.subtitleLanguage, true);
+        const clampedFont = resolveAllowedBurmeseFontStyle(prev.fontStyle, true);
+        if (prev.subtitleLanguage === clampedLang && prev.fontStyle === clampedFont) return prev;
+        return {
+          ...prev,
+          subtitleLanguage: clampedLang,
+          fontStyle: clampedFont
+        };
+      });
       if (!isVoiceAllowedInMode(voiceGender, true)) {
         setVoiceGender('male');
       }
@@ -559,6 +612,8 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
       // Entering Credit Mode: ONLY FHD 1080p is auto-enabled; all optional edit toggles stay OFF
       setEffects(getDefaultAntiCopyrightEffects(false));
       setColorShiftLockNotice(null);
+      setSubtitleLangLockNotice(null);
+      setFontLockNotice(null);
     }
   }, [isFreeTier, voiceGender]);
 
@@ -1059,7 +1114,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         sttModel: savedEngineCfg.sttModel,
         breathPauseMs: savedEngineCfg.breathPauseMs,
         dynamicTempoFit: savedEngineCfg.dynamicTempoFit,
-        subtitleConfig,
+        subtitleConfig: effectiveSubtitleConfig,
         blurEnabled,
         blurRegions,
         aspectRatio,
@@ -1270,7 +1325,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
         highlightClips: data.highlight_clips || [],
         blurRegions,
         blurStyle,
-        subtitleConfig,
+        subtitleConfig: effectiveSubtitleConfig,
         effects: effectiveEffects,
         editConfig: effectiveEditConfig,
         autoFlowLogs: logs
@@ -1336,7 +1391,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
             mode,
             translateAudio,
             cues,
-            subtitleConfig,
+            subtitleConfig: effectiveSubtitleConfig,
             blurEnabled,
             blurRegions,
             mirrorFlip: effectiveEffects.mirror,
@@ -2564,58 +2619,80 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400">
                             {isTranslatingSubtitles
                               ? 'Translating...'
-                              : (subtitleConfig.subtitleLanguage || 'my') === targetLanguage
-                                ? `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB`
-                                : `${(subtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · ${targetLanguage.toUpperCase()} VOICE`}
+                              : isFreeTier
+                                ? 'FREE · MY ONLY'
+                                : (effectiveSubtitleConfig.subtitleLanguage || 'my') === targetLanguage
+                                  ? `${(effectiveSubtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB`
+                                  : `${(effectiveSubtitleConfig.subtitleLanguage || 'my').toUpperCase()} SUB · ${targetLanguage.toUpperCase()} VOICE`}
                           </span>
                         </div>
 
                         <select
                           data-testid="subtitle-language-select"
                           aria-label="Subtitle display language"
-                          value={subtitleConfig.subtitleLanguage || 'my'}
+                          value={effectiveSubtitleConfig.subtitleLanguage || 'my'}
                           disabled={isTranslatingSubtitles}
                           onChange={(e) => {
                             void handleChangeSubtitleLanguage(e.target.value as TargetLanguageCode);
                           }}
                           className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                         >
-                          {TARGET_LANGUAGES.map((langOpt) => (
-                            <option key={langOpt.code} value={langOpt.code}>
-                              {langOpt.flag} {langOpt.labelEn}{' '}
-                              {langOpt.code === targetLanguage
-                                ? '(Matches Voice Language)'
-                                : '(Translated Subtitles)'}
-                            </option>
-                          ))}
+                          {TARGET_LANGUAGES.map((langOpt) => {
+                            const isLocked = !isSubtitleLanguageAllowedInMode(langOpt.code, isFreeTier);
+                            return (
+                              <option key={langOpt.code} value={langOpt.code} disabled={isLocked}>
+                                {langOpt.flag} {langOpt.labelEn}{' '}
+                                {isLocked
+                                  ? '(Credit Mode Only)'
+                                  : langOpt.code === targetLanguage
+                                    ? '(Matches Voice Language)'
+                                    : '(Translated Subtitles)'}
+                              </option>
+                            );
+                          })}
                         </select>
 
                         {/* Quick Language Chips */}
                         <div className="grid grid-cols-3 gap-1.5">
                           {TARGET_LANGUAGES.map((langOpt) => {
-                            const activeSubLang = subtitleConfig.subtitleLanguage || 'my';
+                            const activeSubLang = effectiveSubtitleConfig.subtitleLanguage || 'my';
                             const isSelected = activeSubLang === langOpt.code;
+                            const isLocked = !isSubtitleLanguageAllowedInMode(langOpt.code, isFreeTier);
                             return (
                               <button
                                 key={langOpt.code}
                                 type="button"
                                 data-testid={`subtitle-lang-chip-${langOpt.code}`}
+                                data-locked={isLocked ? 'true' : 'false'}
+                                aria-disabled={isLocked || isTranslatingSubtitles}
                                 disabled={isTranslatingSubtitles}
                                 onClick={() => {
                                   void handleChangeSubtitleLanguage(langOpt.code);
                                 }}
-                                className={`flex items-center justify-center gap-1.5 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
+                                className={`flex items-center justify-center gap-1 rounded-xl border px-2 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
                                   isSelected
                                     ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
-                                    : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
+                                    : isLocked
+                                      ? 'border-stone-200/60 bg-stone-100/70 text-stone-400 hover:border-amber-400/50 dark:border-slate-800/80 dark:bg-[#101620] dark:text-slate-500'
+                                      : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
                                 }`}
                               >
                                 <span>{langOpt.flag}</span>
                                 <span className="truncate">{langOpt.labelEn}</span>
+                                {isLocked && <Lock className="size-2.5 shrink-0 text-amber-500/80" />}
                               </button>
                             );
                           })}
                         </div>
+
+                        {subtitleLangLockNotice && (
+                          <p
+                            data-testid="subtitle-lang-lock-notice"
+                            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-800 dark:text-amber-300"
+                          >
+                            {subtitleLangLockNotice}
+                          </p>
+                        )}
 
                         {subtitleTranslateError && (
                           <p
@@ -2626,88 +2703,115 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           </p>
                         )}
 
-                        {(subtitleConfig.subtitleLanguage || 'my') !== targetLanguage && (
+                        {(effectiveSubtitleConfig.subtitleLanguage || 'my') !== targetLanguage && (
                           <p className="text-[11px] leading-relaxed text-teal-700 dark:text-teal-400">
                             ✓ Voiceover stays{' '}
                             {TARGET_LANGUAGES.find((l) => l.code === targetLanguage)?.labelEn ||
                               targetLanguage}{' '}
                             while on-screen & exported subtitles translate to{' '}
-                            {TARGET_LANGUAGES.find((l) => l.code === subtitleConfig.subtitleLanguage)?.labelEn ||
-                              subtitleConfig.subtitleLanguage}
+                            {TARGET_LANGUAGES.find((l) => l.code === effectiveSubtitleConfig.subtitleLanguage)?.labelEn ||
+                              effectiveSubtitleConfig.subtitleLanguage}
                             .
                           </p>
                         )}
                       </div>
 
-                      {(subtitleConfig.subtitleLanguage || 'my') === 'my' && targetLanguage === 'my' && (
+                      {(effectiveSubtitleConfig.subtitleLanguage || 'my') === 'my' && targetLanguage === 'my' && (
                         <div className="flex flex-col gap-2 border-t border-stone-200/70 pt-3 dark:border-slate-800">
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-xs font-medium text-stone-500 dark:text-slate-400">
-                              Font Style
+                              Myanmar Font Style ({BURMESE_FONT_STYLES.length})
                             </span>
                             <span className="shrink-0 whitespace-nowrap font-mono text-[10px] font-bold text-teal-600 dark:text-teal-400">
-                              {resolveBurmeseFontMeta(subtitleConfig.fontStyle).badge}
+                              {isFreeTier
+                                ? 'FREE · 1 FONT'
+                                : resolveBurmeseFontMeta(effectiveSubtitleConfig.fontStyle).badge}
                             </span>
                           </div>
                           <select
                             data-testid="burmese-font-select"
-                            value={subtitleConfig.fontStyle}
+                            aria-label="Myanmar subtitle font style"
+                            value={effectiveSubtitleConfig.fontStyle}
                             onChange={(e) => {
-                              playUiSound('select');
-                              setSubtitleConfig({
-                                ...subtitleConfig,
-                                fontStyle: e.target.value as BurmeseFontStyle
-                              });
+                              handleSelectBurmeseFont(e.target.value as BurmeseFontStyle);
                             }}
                             style={{
-                              fontFamily: resolveBurmeseFontMeta(subtitleConfig.fontStyle).cssFontFamily
+                              fontFamily: resolveBurmeseFontMeta(effectiveSubtitleConfig.fontStyle).cssFontFamily
                             }}
                             className="h-10.5 w-full rounded-xl border border-stone-200/90 bg-white px-3 text-xs font-semibold text-stone-900 shadow-2xs outline-none focus:border-amber-500 cursor-pointer dark:border-slate-700/80 dark:bg-[#151C26] dark:text-white"
                           >
-                            {BURMESE_FONT_STYLES.map((fontOpt) => (
-                              <option key={fontOpt.id} value={fontOpt.id}>
-                                {fontOpt.label}
-                              </option>
-                            ))}
+                            {BURMESE_FONT_STYLES.map((fontOpt) => {
+                              const isFontLocked = !isBurmeseFontAllowedInMode(fontOpt.id, isFreeTier);
+                              return (
+                                <option key={fontOpt.id} value={fontOpt.id} disabled={isFontLocked}>
+                                  {isFontLocked ? `🔒 ${fontOpt.label}` : fontOpt.label}
+                                </option>
+                              );
+                            })}
                           </select>
 
-                          {/* Visual Myanmar Font Style Quick Chips */}
-                          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
-                            {BURMESE_FONT_STYLES.slice(0, 6).map((fontOpt) => {
-                              const isSelected = subtitleConfig.fontStyle === fontOpt.id;
+                          {/* Visual Myanmar Font Style Quick Grid (All Unicode Fonts) */}
+                          <div
+                            data-testid="burmese-font-grid"
+                            className="grid max-h-[290px] grid-cols-2 gap-1.5 overflow-y-auto pt-0.5 pr-1"
+                          >
+                            {BURMESE_FONT_STYLES.map((fontOpt) => {
+                              const isSelected = effectiveSubtitleConfig.fontStyle === fontOpt.id;
+                              const isFontLocked = !isBurmeseFontAllowedInMode(fontOpt.id, isFreeTier);
                               return (
                                 <button
                                   key={fontOpt.id}
                                   type="button"
                                   data-testid={`burmese-font-chip-${fontOpt.id}`}
-                                  onClick={() => {
-                                    playUiSound('select');
-                                    setSubtitleConfig({
-                                      ...subtitleConfig,
-                                      fontStyle: fontOpt.id
-                                    });
-                                  }}
-                                  style={{
-                                    fontFamily: fontOpt.cssFontFamily,
-                                    fontWeight: fontOpt.fontWeight,
-                                    letterSpacing: fontOpt.letterSpacing
-                                  }}
+                                  data-locked={isFontLocked ? 'true' : 'false'}
+                                  aria-disabled={isFontLocked}
+                                  onClick={() => handleSelectBurmeseFont(fontOpt.id)}
                                   className={`flex flex-col items-start rounded-xl border px-2.5 py-2 text-left transition-all cursor-pointer ${
                                     isSelected
                                       ? 'border-amber-500/80 bg-amber-500/12 text-amber-800 dark:text-amber-300 shadow-2xs'
-                                      : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
+                                      : isFontLocked
+                                        ? 'border-stone-200/60 bg-stone-100/70 text-stone-400 hover:border-amber-400/50 dark:border-slate-800/80 dark:bg-[#101620] dark:text-slate-500'
+                                        : 'border-stone-200/80 bg-[#FAF8F4] text-stone-700 hover:border-stone-300 dark:border-slate-800 dark:bg-[#151C26] dark:text-slate-300'
                                   }`}
                                 >
-                                  <span className="text-[11px] font-bold leading-snug w-full">
-                                    {fontOpt.shortName}
-                                  </span>
-                                  <span className="text-[10px] opacity-80 leading-relaxed w-full mt-0.5">
+                                  <div className="flex w-full items-center justify-between gap-1">
+                                    <span className="truncate text-[10.5px] font-bold leading-snug">
+                                      {fontOpt.shortName}
+                                    </span>
+                                    {fontOpt.freeAllowed ? (
+                                      <span className="shrink-0 rounded bg-emerald-500/15 px-1 py-0.5 font-mono text-[8.5px] font-bold text-emerald-700 dark:text-emerald-400">
+                                        FREE
+                                      </span>
+                                    ) : isFontLocked ? (
+                                      <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-amber-500/15 px-1 py-0.5 font-mono text-[8.5px] font-bold text-amber-700 dark:text-amber-400">
+                                        <Lock className="size-2.5" />
+                                        PRO
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <span
+                                    style={{
+                                      fontFamily: fontOpt.cssFontFamily,
+                                      fontWeight: fontOpt.fontWeight,
+                                      letterSpacing: fontOpt.letterSpacing
+                                    }}
+                                    className="mt-1 w-full truncate text-[11.5px] leading-relaxed opacity-90"
+                                  >
                                     စာတန်းထိုး နမူနာအလှ
                                   </span>
                                 </button>
                               );
                             })}
                           </div>
+
+                          {fontLockNotice && (
+                            <p
+                              data-testid="burmese-font-lock-notice"
+                              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-800 dark:text-amber-300"
+                            >
+                              {fontLockNotice}
+                            </p>
+                          )}
                         </div>
                       )}
 
@@ -2760,16 +2864,16 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           data-testid="sample-caption-preview-text"
                           style={{
                             fontFamily: resolveSubtitleFontMeta(
-                              subtitleConfig.fontStyle,
-                              subtitleConfig.subtitleLanguage
+                              effectiveSubtitleConfig.fontStyle,
+                              effectiveSubtitleConfig.subtitleLanguage
                             ).cssFontFamily,
                             fontWeight: resolveSubtitleFontMeta(
-                              subtitleConfig.fontStyle,
-                              subtitleConfig.subtitleLanguage
+                              effectiveSubtitleConfig.fontStyle,
+                              effectiveSubtitleConfig.subtitleLanguage
                             ).fontWeight,
                             letterSpacing: resolveSubtitleFontMeta(
-                              subtitleConfig.fontStyle,
-                              subtitleConfig.subtitleLanguage
+                              effectiveSubtitleConfig.fontStyle,
+                              effectiveSubtitleConfig.subtitleLanguage
                             ).letterSpacing,
                             fontSize: `${Math.max(7, Math.round(0.4 * subtitleConfig.fontSize))}px`,
                             color:
@@ -2789,7 +2893,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                           }`}
                         >
                           {TARGET_LANGUAGES.find(
-                            (l) => l.code === (subtitleConfig.subtitleLanguage || 'my')
+                            (l) => l.code === (effectiveSubtitleConfig.subtitleLanguage || 'my')
                           )?.sampleCaption || 'ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်'}
                         </span>
                       </div>
@@ -3778,7 +3882,7 @@ export const FreeRecapStudio: React.FC<FreeRecapStudioProps> = ({
                   setBlurMode('auto');
                 }
               }}
-              subtitleConfig={subtitleConfig}
+              subtitleConfig={effectiveSubtitleConfig}
               onChangeSubtitleConfig={setSubtitleConfig}
               effects={effectiveEffects}
               editConfig={effectiveEditConfig}

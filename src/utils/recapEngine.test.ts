@@ -87,7 +87,15 @@ import {
   isTimedOverlayFeatureAllowed,
   isCompleteTimecodeInput,
   formatBurmeseCaptionsOnlyPunctuation,
-  applyBurmeseCaptionsOnlyPunctuation
+  applyBurmeseCaptionsOnlyPunctuation,
+  sanitizeCaptionsOnlyDialogueCues,
+  parseFfmpegSilenceDetectToSpeechIntervals,
+  formatSpeechIntervalsGuide,
+  FREE_BURMESE_FONT_ID,
+  isSubtitleLanguageAllowedInMode,
+  resolveAllowedSubtitleLanguage,
+  isBurmeseFontAllowedInMode,
+  resolveAllowedBurmeseFontStyle
 } from './recapEngine.ts';
 
 test('formatDuration formats seconds into M:SS and H:MM:SS', () => {
@@ -410,13 +418,25 @@ test('computeAssSubtitleFontSize and buildAssRoundedBoxPath produce readable siz
 });
 
 test('BURMESE_FONT_STYLES and resolveBurmeseFontMeta map all Myanmar font styles to Unicode-accurate fonts', () => {
-  assert.equal(BURMESE_FONT_STYLES.length, 8);
+  assert.equal(BURMESE_FONT_STYLES.length, 19);
   const validUnicodeFamilies = new Set([
     'Padauk',
     'Pyidaungsu',
     'Noto Serif Myanmar',
+    'Noto Serif Myanmar Blk',
     'Noto Sans Myanmar',
-    'TharLon'
+    'TharLon',
+    'Myanmar Tagu',
+    'Myanmar Waso',
+    'Myanmar Khyay',
+    'Myanmar Sabae',
+    'Myanmar Gantgaw',
+    'Myanmar Yinmar',
+    'Myanmar Angoun',
+    'Myanmar Square',
+    'Masterpiece Uni Round',
+    'Cherry Unicode',
+    'Myanmar Sagar'
   ]);
   for (const style of BURMESE_FONT_STYLES) {
     assert.ok(
@@ -1969,5 +1989,77 @@ test('Translate Captions-Only Burmese punctuation converts ၊ and Myanmar-adjac
   });
   assert.ok(capPrompt.includes('...'));
   assert.ok(capPrompt.includes('၊'));
+  assert.ok(capPrompt.includes('10 မိနစ်ကြာပြီးသောအခါ'));
 });
+
+test('Subtitle Language Free Mode allows ONLY Burmese (my) and locks English/Thai/Japanese/Korean/Chinese to Credit Mode', () => {
+  assert.equal(isSubtitleLanguageAllowedInMode('my', true), true);
+  for (const lockedLang of ['en', 'th', 'ja', 'ko', 'zh'] as const) {
+    assert.equal(isSubtitleLanguageAllowedInMode(lockedLang, true), false);
+    assert.equal(resolveAllowedSubtitleLanguage(lockedLang, true), 'my');
+    // All languages unlocked in Credit Mode
+    assert.equal(isSubtitleLanguageAllowedInMode(lockedLang, false), true);
+    assert.equal(resolveAllowedSubtitleLanguage(lockedLang, false), lockedLang);
+  }
+  assert.equal(resolveAllowedSubtitleLanguage('my', false), 'my');
+});
+
+test('Myanmar Font catalog includes new artistic Unicode fonts with strictly 1 Free font and all others Credit Mode Only', () => {
+  assert.ok(BURMESE_FONT_STYLES.length >= 18, `Expected >= 18 Myanmar fonts, got ${BURMESE_FONT_STYLES.length}`);
+  const uniqueIds = new Set(BURMESE_FONT_STYLES.map((f) => f.id));
+  assert.equal(uniqueIds.size, BURMESE_FONT_STYLES.length);
+
+  const freeFonts = BURMESE_FONT_STYLES.filter((f) => f.freeAllowed);
+  const creditFonts = BURMESE_FONT_STYLES.filter((f) => !f.freeAllowed);
+  assert.equal(freeFonts.length, 1);
+  assert.equal(freeFonts[0].id, FREE_BURMESE_FONT_ID);
+  assert.equal(creditFonts.length, BURMESE_FONT_STYLES.length - 1);
+
+  for (const font of BURMESE_FONT_STYLES) {
+    assert.ok(font.cssFontFamily.length > 0);
+    assert.ok(font.assFontName.length > 0);
+    if (font.freeAllowed) {
+      assert.equal(isBurmeseFontAllowedInMode(font.id, true), true);
+      assert.equal(resolveAllowedBurmeseFontStyle(font.id, true), font.id);
+    } else {
+      assert.equal(isBurmeseFontAllowedInMode(font.id, true), false);
+      assert.equal(resolveAllowedBurmeseFontStyle(font.id, true), FREE_BURMESE_FONT_ID);
+    }
+    // Every font unlocked in Credit Mode
+    assert.equal(isBurmeseFontAllowedInMode(font.id, false), true);
+    assert.equal(resolveAllowedBurmeseFontStyle(font.id, false), font.id);
+  }
+});
+
+test('Translate Captions-Only anti-hallucination strips time-skip/recap filler and parses FFmpeg silence intervals accurately', () => {
+  const mixedCues = [
+    { id: 'c1', start_ms: 500, end_ms: 2100, text: 'မင်း ဘယ်သွားမလို့လဲ' },
+    { id: 'c2', start_ms: 2500, end_ms: 4200, text: '10 မိနစ်ကြာပြီးသောအခါ' },
+    { id: 'c3', start_ms: 4400, end_ms: 5900, text: '၁၀ မီနစ်ကြာပြီးသောအခါ...' },
+    { id: 'c4', start_ms: 6100, end_ms: 7500, text: '10 minutes later' },
+    { id: 'c5', start_ms: 7800, end_ms: 9100, text: 'အဲဒီအချိန်မှာပဲ' },
+    { id: 'c6', start_ms: 9400, end_ms: 11200, text: 'ငါ...အခုပဲ ပြန်လာမယ်' }
+  ];
+  const cleaned = sanitizeCaptionsOnlyDialogueCues(mixedCues);
+  assert.equal(cleaned.length, 2);
+  assert.equal(cleaned[0].text, 'မင်း ဘယ်သွားမလို့လဲ');
+  assert.equal(cleaned[1].text, 'ငါ...အခုပဲ ပြန်လာမယ်');
+
+  const ffmpegStderr = `
+[silencedetect @ 0x1] silence_start: 0
+[silencedetect @ 0x1] silence_end: 1.25 | silence_duration: 1.25
+[silencedetect @ 0x1] silence_start: 4.80
+[silencedetect @ 0x1] silence_end: 6.40 | silence_duration: 1.60
+[silencedetect @ 0x1] silence_start: 11.10
+`;
+  const intervals = parseFfmpegSilenceDetectToSpeechIntervals(ffmpegStderr, 15);
+  assert.deepEqual(intervals, [
+    { startMs: 1250, endMs: 4800 },
+    { startMs: 6400, endMs: 11100 }
+  ]);
+  const guide = formatSpeechIntervalsGuide(intervals);
+  assert.ok(guide.includes('[00:01.25 - 00:04.80]'));
+  assert.ok(guide.includes('6400ms - 11100ms'));
+});
+
 

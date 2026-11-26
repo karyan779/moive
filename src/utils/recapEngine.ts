@@ -31,7 +31,18 @@ export type BurmeseFontStyle =
   | 'Noto_Sans_Bold'
   | 'TharLon_Classic'
   | 'A15_Innwa'
-  | 'Z06-Walone';
+  | 'Z06-Walone'
+  | 'Myanmar_Tagu'
+  | 'Myanmar_Waso'
+  | 'Myanmar_Khyay'
+  | 'Myanmar_Sabae'
+  | 'Myanmar_Gantgaw'
+  | 'Myanmar_Yinmar'
+  | 'Myanmar_Angoun'
+  | 'Myanmar_Square'
+  | 'Cherry_Unicode'
+  | 'Myanmar_Sagar'
+  | 'Noto_Serif_Black';
 
 export const FREE_DAILY_VIDEO_LIMIT = 5; // 5 free videos per day
 export const FREE_MAX_DURATION_SEC = 160; // 2:40 minutes (160s) max per free video
@@ -1968,17 +1979,115 @@ ${speakerRule}
       ? `\n- SPEAKER TURNS: Start a new cue whenever the speaker changes.`
       : '';
   const zeroSkipRule = isCaptionsOnly
-    ? `\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word reaction (such as "等等", "什么?", "快走", "好") from 0ms to the final second! NEVER skip, drop, compress, or summarize away ANY line from the audio, timestamped transcript, or burned-in on-screen subtitles.`
+    ? `\n- AUDIO SPEECH ONLY — STRICTLY NO ON-SCREEN TIME-SKIP CARDS OR NARRATOR FILLER: Subtitle ONLY actual spoken human dialogue heard in the audio track! NEVER translate or invent on-screen intertitle/time-skip cards (such as "10 minutes later" / "10分钟后" / "10 မိနစ်ကြာပြီးသောအခါ", "1 hour later" / "၁ နာရီကြာပြီးသောအခါ", "the next day", chapter titles, logos, or silent visual descriptions). If nobody is speaking during a scene or title card, output ZERO cues for that silent interval!\n- ZERO-SKIP 100% DIALOGUE COVERAGE (MANDATORY): Translate EVERY SINGLE spoken sentence, quick reply, whisper, and short 1–3 word spoken reaction (such as "等等", "什么?", "快走", "好") at the exact moment the voice speaks!`
     : '';
 
   return `You are TTAK MOVIE RECAP's Senior Cinematic Movie Dialogue Translator (${isCaptionsOnly ? 'Subtitles / Captions-Only Mode' : 'Voice Dubbing Mode'}).
 TASK: Translate the characters' ACTUAL SPOKEN DIALOGUE line-by-line into ${langLabel}, synchronized tightly to the exact moments each line is spoken in the video.
 CRITICAL ANTI-RECAP RULES (MUST OBEY):
-1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate what the characters are saying in first/second person as if they are speaking on screen!
-2. STRICTLY FORBIDDEN RECAP PHRASES: NEVER write third-person movie recap narrator commentary such as "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
-3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the exact moment THAT ONE speaker starts and stops speaking that single line. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
+1. DIRECT DIALOGUE TRANSLATION ONLY — NOT A MOVIE RECAP: Translate ONLY what the characters are physically speaking aloud in first/second person!
+2. STRICTLY FORBIDDEN RECAP & TIME-SKIP PHRASES: NEVER write third-person movie recap narrator commentary or time-jump captions such as "10 မိနစ်ကြာပြီးသောအခါ", "မိနစ်ကြာပြီးသောအခါ", "နာရီကြာပြီးသောအခါ", "ဒီဇာတ်ကားထဲမှာ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့", "ကောင်လေးက", "မင်းသားက", or summarizing scenes from the outside!
+3. EXACT SPEECH TIMING: Match each cue's start_ms and end_ms directly to the exact moment THAT ONE speaker starts and stops speaking that single line in the audio. Keep truly silent/music-only gaps uncaptioned instead of inventing filler narration.${zeroSkipRule}${myanmarStyleGuide}${speakerNote}
 4. ${isCaptionsOnly ? 'ONE SHORT LINE PER SPEAKER TURN: Each cue MUST hold ONLY ONE speaker\'s single short utterance (1 to 10 words, max ~46 characters, typically 0.5s–2.5s). Split every speaker change and every back-and-forth reply into its own separate timed cue!' : 'SPEAKABLE DUBBING PHRASES: Match translated phrase duration (~2.0s–3.4s, 5–11 words) cleanly to the speaker window so AI dubbed voices sync naturally with the scene.'}
 5. OUTPUT SCHEMA: Return JSON { title, scriptText, cues: [{ start_ms, end_ms, text }], highlight_clips: [] }.`;
+}
+
+const CAPTIONS_ONLY_HALLUCINATED_RECAP_REGEX =
+  /^(?:[\s"'「“(\[\-—….]*(?:(?:\d+|[၀-၉]+|တစ်|နှစ်|သုံး|လေး|ငါး|ဆယ်|နာရီ|ရက်|လ|နှစ်|အချိန်|ခဏ)\s*(?:စက္ကန့်|မိနစ်|မီနစ်|နာရီ|ရက်|လ|နှစ်)\s*(?:ကြာပြီး(?:သောအခါ|နောက်|တဲ့အခါ)|အကြာ(?:မှာ|တွင်))|(?:\d+|one|two|three|five|ten|twenty|thirty|a few)\s*(?:seconds?|minutes?|hours?|days?|months?|years?)\s+later|the\s+next\s+(?:day|morning)|အဲဒီအချိန်မှာပဲ|နောက်ဆုံးမှာတော့|ဒီဇာတ်ကား(?:ထဲမှာ|မှာ)|ဇာတ်လမ်း(?:အစ|အဆုံး))[\s.,!?။၊…"'」”)\]]*)$/i;
+
+const CAPTIONS_ONLY_TIME_SKIP_PREFIX_REGEX =
+  /(?:^|[\s…])(?:\d+|[၀-၉]+)\s*(?:မိနစ်|မီနစ်|နာရီ|ရက်|နှစ်)\s*(?:ကြာပြီးသောအခါ|ကြာပြီးနောက်)(?:[\s.,!?။၊…]*$)/i;
+
+/**
+ * Filters out hallucinated movie-recap time-skip intertitles (e.g. "10 မိနစ်ကြာပြီးသောအခါ",
+ * "10 minutes later") and standalone third-person recap narrator lines from Captions-Only
+ * dialogue cues while preserving all genuine spoken character dialogue.
+ */
+export function sanitizeCaptionsOnlyDialogueCues(cues: SubtitleCue[]): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  const kept = cues.filter((cue) => {
+    const text = String(cue?.text || '').trim();
+    if (!text) return false;
+    if (CAPTIONS_ONLY_HALLUCINATED_RECAP_REGEX.test(text)) return false;
+    if (CAPTIONS_ONLY_TIME_SKIP_PREFIX_REGEX.test(text) && text.length <= 42) return false;
+    return true;
+  });
+  return kept.map((cue, idx) => ({
+    ...cue,
+    id: `cue-${idx + 1}`
+  }));
+}
+
+export interface SpeechActivityInterval {
+  startMs: number;
+  endMs: number;
+}
+
+/**
+ * Converts FFmpeg `silencedetect` stderr logs for an audio segment into exact millisecond
+ * active-speech intervals `[startMs, endMs]` so Gemini Direct Captions-Only can lock every
+ * subtitle cue directly to real spoken audio instead of drifting or hallucinating during silence.
+ */
+export function parseFfmpegSilenceDetectToSpeechIntervals(
+  ffmpegStderr: string,
+  segmentDurationSec: number
+): SpeechActivityInterval[] {
+  const totalMs = Math.max(0, Math.round(Number(segmentDurationSec || 0) * 1000));
+  if (totalMs <= 0) return [];
+  const raw = String(ffmpegStderr || '');
+  const events: Array<{ type: 'start' | 'end'; ms: number }> = [];
+  const regex = /silence_(start|end):\s*([0-9]+(?:\.[0-9]+)?)/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(raw)) !== null) {
+    const type = m[1] === 'start' ? 'start' : 'end';
+    const ms = Math.max(0, Math.min(totalMs, Math.round(Number(m[2]) * 1000)));
+    events.push({ type, ms });
+  }
+  if (events.length === 0) {
+    return [{ startMs: 0, endMs: totalMs }];
+  }
+
+  const silences: Array<{ startMs: number; endMs: number }> = [];
+  let openStart: number | null = null;
+  for (const ev of events) {
+    if (ev.type === 'start') {
+      if (openStart === null) openStart = ev.ms;
+    } else {
+      const s = openStart !== null ? openStart : 0;
+      if (ev.ms > s) silences.push({ startMs: s, endMs: ev.ms });
+      openStart = null;
+    }
+  }
+  if (openStart !== null && openStart < totalMs) {
+    silences.push({ startMs: openStart, endMs: totalMs });
+  }
+
+  const speech: SpeechActivityInterval[] = [];
+  let cursor = 0;
+  for (const sil of silences) {
+    if (sil.startMs - cursor >= 250) {
+      speech.push({ startMs: cursor, endMs: sil.startMs });
+    }
+    cursor = Math.max(cursor, sil.endMs);
+  }
+  if (totalMs - cursor >= 250) {
+    speech.push({ startMs: cursor, endMs: totalMs });
+  }
+  return speech;
+}
+
+export function formatSpeechIntervalsGuide(intervals: SpeechActivityInterval[]): string {
+  if (!Array.isArray(intervals) || intervals.length === 0) return '';
+  const fmt = (ms: number) => {
+    const sec = ms / 1000;
+    const mins = Math.floor(sec / 60);
+    const rem = (sec - mins * 60).toFixed(2).padStart(5, '0');
+    return `${String(mins).padStart(2, '0')}:${rem}`;
+  };
+  return intervals
+    .slice(0, 45)
+    .map((iv) => `[${fmt(iv.startMs)} - ${fmt(iv.endMs)}] (${iv.startMs}ms - ${iv.endMs}ms) Audio active`)
+    .join('\n');
 }
 
 export interface TimedCueBlock {
@@ -3610,20 +3719,24 @@ export interface BurmeseFontStyleMeta {
   assBold: -1 | 0;
   fontWeight: number;
   letterSpacing?: string;
+  freeAllowed: boolean;
 }
+
+export const FREE_BURMESE_FONT_ID: BurmeseFontStyle = 'Yati_Round';
 
 /**
  * Curated Unicode-Accurate Myanmar Font Styles (`စာမှန်တဲ့ Myanmar Font Style အလှများ`)
  * Every style maps to a genuine OpenType/HarfBuzz Unicode Myanmar font bundled in `/public/fonts/*.ttf`
  * so stacked consonants (`ပါဌ်ဆင့်`), medials (`ြ ျ ွ ှ`), and vowels render 100% accurately (`စာမှန်`)
  * on BOTH live web preview and exported FFmpeg MP4 videos.
+ * Free Mode unlocks ONLY 1 font (`Yati_Round`); all other Myanmar fonts are Credit Mode Only.
  */
 export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
   {
     id: 'Yati_Round',
-    label: 'Yati Round · စာလုံးဝိုင်း ခေတ်မီအလှ (Unicode စာမှန်)',
+    label: 'Yati Round · စာလုံးဝိုင်း ခေတ်မီအလှ (Free · Unicode စာမှန်)',
     shortName: 'Yati Round (စာလုံးဝိုင်း)',
-    badge: 'ROUND · MODERN',
+    badge: 'FREE · ROUND',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
     cssFontFamily: '"Padauk", "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif',
     assFontName: 'Padauk',
@@ -3631,11 +3744,192 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.70,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0.01em'
+    letterSpacing: '0.01em',
+    freeAllowed: true
+  },
+  {
+    id: 'Myanmar_Tagu',
+    label: 'Myanmar Tagu · တန်ခူး စုတ်တံအလှ (Credit · Calligraphy)',
+    shortName: 'Tagu (တန်ခူးအလှ)',
+    badge: 'CALLIGRAPHY',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Tagu", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Tagu',
+    pangoFontDesc: 'Myanmar Tagu Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Sabae',
+    label: 'Myanmar Sabae · စံပယ် စာလုံးဝိုင်းချစ်စရာ (Credit · TikTok Style)',
+    shortName: 'Sabae (စံပယ်ဝိုင်း)',
+    badge: 'CUTE · VIRAL',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Sabae", "Padauk", sans-serif',
+    assFontName: 'Myanmar Sabae',
+    pangoFontDesc: 'Myanmar Sabae Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Khyay',
+    label: 'Myanmar Khyay · ခရေ ရုပ်ရှင်ပိုစတာအလှ (Credit · Cinema Display)',
+    shortName: 'Khyay (ခရေ ရုပ်ရှင်)',
+    badge: 'CINEMA · ART',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Khyay", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Khyay',
+    pangoFontDesc: 'Myanmar Khyay Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Waso',
+    label: 'Myanmar Waso · ဝါဆို ဂန္ထဝင်စာလုံးအလှ (Credit · Classic Art)',
+    shortName: 'Waso (ဝါဆိုအလှ)',
+    badge: 'CLASSIC · ART',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Waso", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Waso',
+    pangoFontDesc: 'Myanmar Waso Regular',
+    pangoAssScale: 0.66,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Cherry_Unicode',
+    label: 'Cherry Unicode · ချယ်ရီ လက်ရေးအလှ (Credit · Cute Hand)',
+    shortName: 'Cherry (ချယ်ရီအလှ)',
+    badge: 'SOFT · HAND',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Cherry Unicode", "Padauk", sans-serif',
+    assFontName: 'Cherry Unicode',
+    pangoFontDesc: 'Cherry Unicode Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Yinmar',
+    label: 'Myanmar Yinmar · ယင်းမာ စာလုံးစောင်းအလှ (Credit · Artistic Brush)',
+    shortName: 'Yinmar (ယင်းမာ)',
+    badge: 'BRUSH · CHIC',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Yinmar", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Yinmar',
+    pangoFontDesc: 'Myanmar Yinmar Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Angoun',
+    label: 'Myanmar Angoun · အံ့ကုန် စာလုံးထူအလှ (Credit · Expressive Bold)',
+    shortName: 'Angoun (အံ့ကုန်)',
+    badge: 'BOLD · DRAMATIC',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Angoun", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Angoun',
+    pangoFontDesc: 'Myanmar Angoun Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 700,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Gantgaw',
+    label: 'Myanmar Gantgaw · ဂန့်ဂေါ် ခန့်ညားစာလုံးအလှ (Credit · Editorial)',
+    shortName: 'Gantgaw (ဂန့်ဂေါ်)',
+    badge: 'EDITORIAL',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Gantgaw", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Gantgaw',
+    pangoFontDesc: 'Myanmar Gantgaw Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Sagar',
+    label: 'Myanmar Sagar · စကားဝါ နူးညံ့စာလုံးအလှ (Credit · Graceful)',
+    shortName: 'Sagar (စကားဝါ)',
+    badge: 'GRACEFUL',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Sagar", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Sagar',
+    pangoFontDesc: 'Myanmar Sagar Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Myanmar_Square',
+    label: 'Myanmar Square · စတုရန်း ခေတ်မီဒီဇိုင်းအလှ (Credit · Modern Box)',
+    shortName: 'Square (စတုရန်း)',
+    badge: 'MODERN · BOX',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Myanmar Square", "Pyidaungsu", sans-serif',
+    assFontName: 'Myanmar Square',
+    pangoFontDesc: 'Myanmar Square Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Noto_Serif_Black',
+    label: 'Royal Black Serif · စာလုံးထူကြီး ရုပ်ရှင်စတိုင် (Credit · Ultra Bold)',
+    shortName: 'Royal Black (ရုပ်ရှင်ထူ)',
+    badge: 'ULTRA · SERIF',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Noto Serif Myanmar Blk", "Noto Serif Myanmar", serif',
+    assFontName: 'Noto Serif Myanmar Blk',
+    pangoFontDesc: 'Noto Serif Myanmar Black',
+    pangoAssScale: 0.42,
+    assBold: -1,
+    fontWeight: 900,
+    letterSpacing: '0.01em',
+    freeAllowed: false
+  },
+  {
+    id: 'Z06-Walone',
+    label: 'Walone Round · ဝလုံး စာလုံးဝိုင်းအလှ (Credit · Masterpiece Uni)',
+    shortName: 'Walone (ဝလုံးဝိုင်း)',
+    badge: 'WALONE · ROUND',
+    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
+    cssFontFamily: '"Masterpiece Uni Round", "Padauk", sans-serif',
+    assFontName: 'Masterpiece Uni Round',
+    pangoFontDesc: 'Masterpiece Uni Round Regular',
+    pangoAssScale: 0.68,
+    assBold: 0,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+    freeAllowed: false
   },
   {
     id: 'Pyidaungsu',
-    label: 'Pyidaungsu Bold · ပြည်ထောင်စု စာလုံးအလှ (Official Unicode)',
+    label: 'Pyidaungsu Bold · ပြည်ထောင်စု စာလုံးအလှ (Credit · Official)',
     shortName: 'Pyidaungsu (ပြည်ထောင်စု)',
     badge: 'OFFICIAL · CLEAR',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3645,11 +3939,12 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.60,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0em'
+    letterSpacing: '0em',
+    freeAllowed: false
   },
   {
     id: 'Padauk_Bold',
-    label: 'Padauk Studio · ပိတောက် စာလုံးထူအလှ (Recap Popular)',
+    label: 'Padauk Studio · ပိတောက် စာလုံးထူအလှ (Credit · Recap Popular)',
     shortName: 'Padauk Bold (ပိတောက်)',
     badge: 'POPULAR · BOLD',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3659,11 +3954,12 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.70,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0.015em'
+    letterSpacing: '0.015em',
+    freeAllowed: false
   },
   {
     id: 'Noto_Serif_Bold',
-    label: 'Myanmar Cinema Serif · ရုပ်ရှင်စာတန်းထိုး အလှ (Editorial)',
+    label: 'Myanmar Cinema Serif · ရုပ်ရှင်စာတန်းထိုး အလှ (Credit · Editorial)',
     shortName: 'Cinema Serif (ရုပ်ရှင်စတိုင်)',
     badge: 'CINEMA · SERIF',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3673,11 +3969,12 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.42,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0.01em'
+    letterSpacing: '0.01em',
+    freeAllowed: false
   },
   {
     id: 'Noto_Sans_Bold',
-    label: 'Noto Sans Clean · ခေတ်မီ စာလုံးသန့်အလှ ( Crisp HD )',
+    label: 'Noto Sans Clean · ခေတ်မီ စာလုံးသန့်အလှ (Credit · Crisp HD)',
     shortName: 'Noto Sans (စာလုံးသန့်)',
     badge: 'CRISP · HD',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3687,11 +3984,12 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.48,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0em'
+    letterSpacing: '0em',
+    freeAllowed: false
   },
   {
     id: 'TharLon_Classic',
-    label: 'TharLon Classic · သာလွန် စာလုံးသွယ်အလှ (Unicode)',
+    label: 'TharLon Classic · သာလွန် စာလုံးသွယ်အလှ (Credit · Slim)',
     shortName: 'TharLon (သာလွန်)',
     badge: 'CLASSIC · SLIM',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3701,11 +3999,12 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.70,
     assBold: 0,
     fontWeight: 600,
-    letterSpacing: '0.01em'
+    letterSpacing: '0.01em',
+    freeAllowed: false
   },
   {
     id: 'A15_Innwa',
-    label: 'Innwa Unicode · အင်းဝ ရိုးရာစာလုံးအလှ (Unicode စာမှန်)',
+    label: 'Innwa Unicode · အင်းဝ ရိုးရာစာလုံးအလှ (Credit · Traditional)',
     shortName: 'Innwa (အင်းဝ)',
     badge: 'TRADITIONAL',
     sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
@@ -3715,23 +4014,57 @@ export const BURMESE_FONT_STYLES: BurmeseFontStyleMeta[] = [
     pangoAssScale: 0.42,
     assBold: -1,
     fontWeight: 700,
-    letterSpacing: '0em'
-  },
-  {
-    id: 'Z06-Walone',
-    label: 'Walone Style · ဝလုံး စာလုံးဝိုင်းအလှ (Unicode စာမှန်)',
-    shortName: 'Walone (ဝလုံးဝိုင်း)',
-    badge: 'WALONE · ROUND',
-    sampleMy: 'သိန်းသုံးဆယ်ကို ဘယ်မှာသုံးလိုက်တာလဲ',
-    cssFontFamily: '"Padauk", "Noto Sans Myanmar", sans-serif',
-    assFontName: 'Padauk',
-    pangoFontDesc: 'Padauk Bold',
-    pangoAssScale: 0.70,
-    assBold: -1,
-    fontWeight: 700,
-    letterSpacing: '0.02em'
+    letterSpacing: '0em',
+    freeAllowed: false
   }
 ];
+
+/**
+ * Subtitle Language tier gate:
+ * Free Mode allows ONLY Burmese (`'my'`). English, Thai, Japanese, Korean, and Chinese
+ * are exclusively available in Credit Mode.
+ */
+export function isSubtitleLanguageAllowedInMode(
+  lang: TargetLanguageCode | string | undefined | null,
+  isFreeTier: boolean
+): boolean {
+  if (!isFreeTier) return true;
+  return !lang || lang === 'my';
+}
+
+export function resolveAllowedSubtitleLanguage(
+  lang: TargetLanguageCode | string | undefined | null,
+  isFreeTier: boolean
+): TargetLanguageCode {
+  if (isFreeTier) return 'my';
+  const valid = TARGET_LANGUAGES.find((l) => l.code === lang);
+  return valid ? valid.code : 'my';
+}
+
+/**
+ * Myanmar Font Style tier gate:
+ * Free Mode allows ONLY 1 font (`Yati_Round`). All other artistic Myanmar fonts
+ * are exclusively available in Credit Mode.
+ */
+export function isBurmeseFontAllowedInMode(
+  fontStyle: BurmeseFontStyle | string | undefined | null,
+  isFreeTier: boolean
+): boolean {
+  if (!isFreeTier) return true;
+  const meta = resolveBurmeseFontMeta(fontStyle || FREE_BURMESE_FONT_ID);
+  return Boolean(meta.freeAllowed);
+}
+
+export function resolveAllowedBurmeseFontStyle(
+  fontStyle: BurmeseFontStyle | string | undefined | null,
+  isFreeTier: boolean
+): BurmeseFontStyle {
+  const meta = resolveBurmeseFontMeta(fontStyle || FREE_BURMESE_FONT_ID);
+  if (isFreeTier && !meta.freeAllowed) {
+    return FREE_BURMESE_FONT_ID;
+  }
+  return meta.id;
+}
 
 export function resolveBurmeseFontMeta(fontStyle?: BurmeseFontStyle | string): BurmeseFontStyleMeta {
   const found = BURMESE_FONT_STYLES.find((f) => f.id === fontStyle);

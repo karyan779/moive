@@ -45,21 +45,98 @@
 }
 @font-face {
   font-family: 'Pyidaungsu';
-  src: url('/fonts/Pyidaungsu-Regular.ttf') format('truetype');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Pyidaungsu';
   src: url('/fonts/Pyidaungsu-Bold.ttf') format('truetype');
-  font-weight: 700;
+  font-weight: 400 700;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: 'TharLon';
   src: url('/fonts/Tharlon-Regular.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Serif Myanmar Blk';
+  src: url('/fonts/NotoSerifMyanmar-Black.ttf') format('truetype');
+  font-weight: 400 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Tagu';
+  src: url('/fonts/MyanmarTagu.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Waso';
+  src: url('/fonts/MyanmarWaso.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Khyay';
+  src: url('/fonts/MyanmarKhyay.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Sabae';
+  src: url('/fonts/MyanmarSabae.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Gantgaw';
+  src: url('/fonts/MyanmarGantgaw.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Yinmar';
+  src: url('/fonts/MyanmarYinmar.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Angoun';
+  src: url('/fonts/MyanmarAngoun.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Square';
+  src: url('/fonts/MyanmarSquare.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Masterpiece Uni Round';
+  src: url('/fonts/MasterpieceUniRound.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Cherry Unicode';
+  src: url('/fonts/Cherry_Unicode.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Myanmar Sagar';
+  src: url('/fonts/MyanmarSagar.ttf') format('truetype');
   font-weight: 400 700;
   font-style: normal;
   font-display: swap;
