@@ -2142,10 +2142,10 @@ ${speakerRule}
       : '';
   const myanmarStyleGuide =
     opts.targetLanguage === 'my'
-      ? `\n- NATURAL BURMESE MOVIE DIALOGUE (100% PURE BURMESE ONLY!): Translate like professional Burmese cinema/drama subtitles & dubbing (using natural spoken pronouns like ငါ/မင်း, ကျွန်တော်/ခင်ဗျား/ရှင် matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation). NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, or Thai words inside Burmese cue.text! Every single word MUST be translated completely into Burmese (e.g. "哎呀，到家了宝宝，下车" -> "အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့", NEVER "အိုက်ယား...到家了宝宝...下车")!\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
+      ? `\n- NATURAL BURMESE MOVIE DIALOGUE (100% PURE BURMESE ONLY!): Translate like professional Burmese cinema/drama subtitles & dubbing matching character relationships, emotion, anger, romance, or urgency — NEVER stiff dictionary/word-for-word translation. NEVER leave ANY untranslated Chinese (汉字), Korean (한글), Japanese, or Thai words inside Burmese cue.text! Every single word MUST be translated completely into Burmese (e.g. "哎呀，到家了宝宝，下车" -> "အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ...ကားပေါ်ကဆင်းတော့", NEVER "အိုက်ယား...到家了宝宝...下车")!\n- STRICT BURMESE GENDER PRONOUN RULE (FEMALE SPEAKER = "ရှင်", NEVER "မင်း"!): Pay close attention to whether a FEMALE voice or MALE voice is speaking in the audio (and visual frames)! Whenever a FEMALE character (ကောင်မလေး / မိန်းကလေး) speaks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" / "ရှင့်ရဲ့" for "you" (and "ကျွန်မ" / "ညီမ" for "I") — NEVER use "မင်း" when a girl/woman is speaking! (Example: Female voice saying "你快点下来" -> "ရှင်...မြန်မြန်ဆင်းလာတော့လေ", NEVER "မင်း မြန်မြန်ဆင်းလာတော့"!). Only use "မင်း" / "ကိုယ်" / "ငါ" when a MALE speaker is talking.\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". DO NOT use "အိုက်ယား" for any other exclamation or line (such as "啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿", "哼", "嗯", or normal dialogue) — translate all other exclamations and sentences normally into natural Burmese!${myanmarCaptionsEllipsisRule}`
       : '';
   const speakerNote = isCaptionsOnly
-    ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE TWO SPEAKERS!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
+    ? `\n- STRICT ONE SPEAKER & ONE SENTENCE PER CUE (NEVER MERGE OR CHAIN CONTINUOUSLY!): Whenever a different person starts speaking (Speaker A finishes -> Speaker B replies), you MUST end Speaker A's cue the EXACT millisecond Speaker A stops talking and create a BRAND NEW separate cue object in cues[] for Speaker B with Speaker B's own exact start_ms and end_ms! Leave a clean uncaptioned gap between speaker turns — NEVER stretch Speaker A's end_ms up to Speaker B's start_ms and NEVER combine two speakers' lines, a question + its answer, or two sentences into one continuous subtitle cue (NEVER write "- Line A - Line B" or "Line A? Line B" in a single cue).`
     : opts.speakerDiarization
       ? `\n- SPEAKER TURNS: Start a new cue whenever the speaker changes.`
       : '';
@@ -2301,7 +2301,7 @@ export function tightenCaptionsOnlyCuePauses(
 
     // 2) Cap extreme trailing linger on short utterances (e.g. 12-char cue stretched to 5.5s)
     const textLen = String(cue.text || '').trim().length;
-    const naturalMaxMs = Math.max(1900, Math.min(4800, 1100 + textLen * 95));
+    const naturalMaxMs = Math.max(1650, Math.min(4200, 950 + textLen * 85));
     if (endMs - startMs > naturalMaxMs) {
       endMs = startMs + naturalMaxMs;
     }
@@ -2313,24 +2313,89 @@ export function tightenCaptionsOnlyCuePauses(
     };
   });
 
-  // 3) Guarantee a crisp visual clear-screen gap (>= 100ms) between consecutive spoken turns
-  //    so subtitles appear cleanly per utterance rather than staying glued continuously.
-  const minClearGapMs = 100;
+  // 3) Guarantee a crisp visual clear-screen gap (>= 150ms) between consecutive spoken turns
+  //    so subtitles visibly clear after each speaker instead of staying continuously stuck together.
+  const minClearGapMs = 150;
   for (let i = 0; i < tightened.length - 1; i++) {
     const cur = tightened[i];
     const next = tightened[i + 1];
     const gap = next.start_ms - cur.end_ms;
     if (gap < minClearGapMs) {
       const targetEnd = next.start_ms - minClearGapMs;
-      if (targetEnd - cur.start_ms >= 420) {
+      if (targetEnd - cur.start_ms >= 380) {
         cur.end_ms = targetEnd;
       } else if (next.start_ms - cur.start_ms >= 360) {
-        cur.end_ms = Math.max(cur.start_ms + 300, next.start_ms - 60);
+        cur.end_ms = Math.max(cur.start_ms + 280, next.start_ms - 90);
       }
     }
   }
 
   return tightened.map((c, idx) => ({ ...c, id: `cue-${idx + 1}` }));
+}
+
+/**
+ * Snaps Gemini Captions-Only subtitle cues onto millisecond-accurate Whisper speech-turn anchors
+ * whenever a cue clearly corresponds 1-to-1 with a real spoken utterance anchor (within <= 950ms).
+ * Keeps Gemini's superior multimodal Burmese translation (female "ရှင်" voice detection + burned-in
+ * subtitle reading) while locking start_ms/end_ms directly to the exact voice onset & offset!
+ */
+export function snapGeminiCaptionsToSpeechAnchors(
+  cues: SubtitleCue[],
+  anchorTranscript: string | undefined | null,
+  totalDurationSec: number
+): SubtitleCue[] {
+  if (!Array.isArray(cues) || cues.length === 0) return [];
+  if (!anchorTranscript || typeof anchorTranscript !== 'string' || !anchorTranscript.trim()) {
+    return cues;
+  }
+  const anchors = parseTimedSttTranscriptToCues(anchorTranscript, totalDurationSec);
+  if (anchors.length === 0) return cues;
+
+  const totalMs = Math.max(
+    1000,
+    Math.round((Number.isFinite(totalDurationSec) && totalDurationSec > 0 ? totalDurationSec : 30) * 1000)
+  );
+  const usedAnchors = new Set<number>();
+
+  // Greedy chronological 1-to-1 anchor matching within 950ms onset/midpoint tolerance
+  const snapped: SubtitleCue[] = cues.map((cue) => {
+    const cStart = Math.max(0, Math.round(Number(cue.start_ms) || 0));
+    const cEnd = Math.max(cStart + 280, Math.round(Number(cue.end_ms) || cStart + 1200));
+    const cMid = (cStart + cEnd) / 2;
+
+    let bestIdx = -1;
+    let bestScore = Infinity;
+    for (let a = 0; a < anchors.length; a++) {
+      if (usedAnchors.has(a)) continue;
+      const anc = anchors[a];
+      const aMid = (anc.start_ms + anc.end_ms) / 2;
+      const startDiff = Math.abs(cStart - anc.start_ms);
+      const midDiff = Math.abs(cMid - aMid);
+      const overlap = Math.min(cEnd, anc.end_ms) - Math.max(cStart, anc.start_ms);
+      if (startDiff <= 950 || (overlap >= 180 && midDiff <= 850)) {
+        const score = startDiff * 0.65 + midDiff * 0.35;
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = a;
+        }
+      }
+    }
+
+    if (bestIdx >= 0) {
+      usedAnchors.add(bestIdx);
+      const anc = anchors[bestIdx];
+      return {
+        ...cue,
+        start_ms: Math.max(0, Math.min(totalMs - 280, anc.start_ms)),
+        end_ms: Math.min(totalMs, Math.max(anc.start_ms + 280, anc.end_ms)),
+        originalText: cue.originalText || anc.text
+      };
+    }
+
+    return cue;
+  });
+
+  return normalizeDialogueSubtitleCues(snapped, totalDurationSec);
 }
 
 export interface TimedCueBlock {

@@ -65,6 +65,7 @@ import {
   sliceTimedTranscriptForWindow,
   normalizeDialogueSubtitleCues,
   tightenCaptionsOnlyCuePauses,
+  snapGeminiCaptionsToSpeechAnchors,
   parseTimedSttTranscriptToCues,
   findUncoveredTranscriptSegments,
   mergeMissingDialogueCues,
@@ -5041,12 +5042,12 @@ async function startServer() {
     }
 
     // 1b. Speech-to-Text pre-pass (strict 35s overall ceiling so 48% NEVER stalls indefinitely)
-    // Skip Whisper STT when user explicitly selected Gemini Direct in Captions-Only mode so
-    // Whisper hallucinations never contaminate Gemini's direct audio + visual subtitle reading.
-    onProgress(48, isGeminiDirectCaptions ? 'Preparing direct audio & frames...' : 'Listening to original audio...');
+    // Provides millisecond speech-turn timing anchors for both Whisper Mode AND Gemini Mode
+    // (Gemini still listens directly to audio + reads visual frames, while locking sync & zero-skip coverage to exact speech timing!).
+    onProgress(48, 'Listening to original audio...');
     let groqTranscript = '';
     let sttProviderUsed: 'cloudflare-workers-ai' | 'groq' | 'none' = 'none';
-    if (!isGeminiDirectCaptions && !isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
+    if (!isWeddingDramaClip && !effectiveTranscriptText && extractedAudioBuffer) {
       const sttOrder = resolveSttStrategyForMode(
         Boolean(isFreeMode),
         Boolean(freeGroqKey),
@@ -5145,7 +5146,7 @@ async function startServer() {
           : '';
         const timeWindows = computeAudioScriptWindows(
           safeDuration,
-          isGeminiDirectCaptions ? 45 : isCaptionsOnlyMode ? 30 : 75
+          isGeminiDirectCaptions ? 24 : isCaptionsOnlyMode ? 30 : 75
         );
 
         const extractVisualKeyframesForSegment = async (
@@ -5365,7 +5366,7 @@ async function startServer() {
                 : '';
             const myanmarAiyaHint =
               targetLanguage === 'my' && !(isSttOnly && sttMode === 'transcribe')
-                ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
+                ? `\n- STRICT BURMESE GENDER PRONOUN RULE (FEMALE SPEAKER = "ရှင်", NEVER "မင်း"!): Listen to the speaker's voice gender (and check who is speaking in the frames)! Whenever a FEMALE character (ကောင်မလေး / မိန်းကလေး) speaks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" / "ရှင့်ရဲ့" for "you" (NEVER use "မင်း" when a female speaks!). Only use "မင်း" / "ကိုယ်" / "ငါ" for MALE speakers.\n- STRICT "哎呀" (Āiyā) RULE: ONLY when the speaker literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated dialogue!`
                 : '';
             const pureTargetLanguageRule =
               !(isSttOnly && sttMode === 'transcribe')
@@ -5382,7 +5383,7 @@ Target Language: ${isSttOnly && sttMode === 'transcribe' ? 'Original Spoken Lang
 Video Title / Filename: ${title || 'Movie Clip'}.
 ${
               winContext
-                ? `Detected Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — align your cue start_ms & end_ms tightly to when the voices actually speak inside these windows!):\n${winContext}`
+                ? `Millisecond Speech Timing Anchors / Source Transcript for THIS exact segment (0ms to ${Math.round(winDurSec * 1000)}ms — translate EVERY SINGLE spoken line without skipping ANY, verify the exact words & speaker gender directly from the attached audio${hasVisualKeyframes ? ' and burned-in subtitles in the frames' : ''}, and LOCK each cue's start_ms & end_ms tightly to when that speaker starts and stops talking!):\n${winContext}`
                 : isSttOnly && sttMode === 'transcribe'
                   ? 'Listen carefully to the attached audio segment and transcribe every actual spoken human dialogue line verbatim at its exact millisecond timestamp.'
                   : `Listen carefully to the attached audio segment${hasVisualKeyframes ? ' and cross-check any burned-in dialogue subtitles visible in the attached frames' : ''}, then TRANSLATE every actual spoken human dialogue line 100% into pure ${langLabel} at its exact millisecond timestamp.`
@@ -5391,7 +5392,7 @@ ${
 CRITICAL DIALOGUE & TIMING RULES:
 - ONLY output actual SPOKEN human dialogue heard in THIS audio segment! NEVER invent movie-recap commentary, time-skip intertitles (such as "10 မိနစ်ကြာပြီးသောအခါ", "10 minutes later", "နာရီကြာပြီးသောအခါ", "အဲဒီအချိန်မှာပဲ", "နောက်ဆုံးမှာတော့"), or subtitles during music-only / silent parts! If this segment has only music or silence with no speech, return an empty cues array [].${pureTargetLanguageRule}${
               isCaptionsOnlyMode
-                ? `\n- ONE SPEAKER = ONE SEPARATE CUE (NEVER MERGE TWO PEOPLE!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST create a BRAND NEW separate cue object with its own exact start_ms and end_ms! NEVER join two people's dialogue or a question + answer into one cue (NEVER output "- Line A - Line B" or "Line A? Line B" together).\n- ZERO-SKIP 100% SPOKEN COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue locked to the exact voice timing!`
+                ? `\n- ONE SPEAKER = ONE SEPARATE CUE WITH CLEAN PAUSE GAPS (NEVER MERGE OR CHAIN CONTINUOUSLY!): Whenever Speaker A finishes and Speaker B replies (or a character speaks a second separate sentence), you MUST end Speaker A's cue the EXACT millisecond Speaker A stops speaking and create a BRAND NEW separate cue object for Speaker B with Speaker B's own exact start_ms and end_ms! Leave an uncaptioned gap between speaker turns — NEVER stretch Speaker A's end_ms up to Speaker B's start_ms and NEVER join two people's lines into one cue.\n- ZERO-SKIP 100% SPOKEN COVERAGE: Translate EVERY SINGLE spoken sentence and short 1–3 word reaction (such as "等等", "什么?", "好", "快走") into its own individual cue locked to the exact voice timing!`
                 : ''
             }${captionsVisualHint}${myanmarAiyaHint}
 - Lock every cue start_ms and end_ms directly to the exact milliseconds within THIS segment (0ms to ${Math.floor(winDurSec * 1000)}ms) when that ONE speaker talks. Leave silent/music-only pauses completely uncaptioned.
@@ -5767,7 +5768,7 @@ CRITICAL MOVIE RECAP NARRATION & TIMESTAMP SYNC RULES:
                   .join('\n');
                 const aiyaBatchRule =
                   targetLanguage === 'my'
-                    ? `\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a source line literally contains "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated line!`
+                    ? `\n- STRICT BURMESE FEMALE PRONOUN RULE: Whenever a FEMALE speaker addresses a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" (NEVER use "မင်း" for a female speaker!).\n- STRICT "哎呀" (Āiyā) RULE: ONLY when a source line literally contains "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation ("啊", "啊呀", "哎哟", "哇", "哦", "天啊", "糟糕", "喂", "嘿") or unrelated line!`
                     : '';
                 const batchPrompt = `Translate ALL ${batch.length} numbered movie dialogue lines below into natural spoken ${langLabel} (1-to-1, exact same order, NEVER skip, merge, or reorder any line!).
 ${prevTailHint ? `Previous dialogue context (for pronoun/story consistency ONLY — do NOT repeat): ${prevTailHint}\n` : ''}RULES:
@@ -5920,10 +5921,11 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
                 win.index === timeWindows.length - 1
               );
 
-              let winTranscript = isGeminiDirectCaptions
-                ? winSpeechGuide
-                : sliceTimedTranscriptForWindow(effectiveContext, win.startSec, win.endSec);
-              if (!isGeminiDirectCaptions && !winTranscript && winAudioBuffer) {
+              let winTranscript = sliceTimedTranscriptForWindow(effectiveContext, win.startSec, win.endSec);
+              if (!winTranscript && isGeminiDirectCaptions) {
+                winTranscript = winSpeechGuide;
+              }
+              if (!winTranscript && winAudioBuffer) {
                 try {
                   const winSttOpts = isTranslateMode
                     ? { maxSegments: 1000, preciseMs: true }
@@ -6112,7 +6114,7 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
           }
           const singlePassPrompt = buildPromptForWindow(
             safeDuration,
-            isGeminiDirectCaptions ? singlePassSpeechGuide : effectiveContext,
+            effectiveContext || singlePassSpeechGuide,
             0,
             1,
             0,
@@ -6167,12 +6169,25 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
           }
         }
 
+        // 2b-snap. Lock Gemini Captions-Only cues tightly to exact millisecond Whisper speech-turn anchors
+        // whenever available so Gemini's multimodal translation (female "ရှင်" + burned-in subtitle reading)
+        // stays 100% synced to real voice onset/offset with clean pauses between speakers.
+        if (
+          isGeminiDirectCaptions &&
+          !whisperLockedSucceeded &&
+          usedLiveGemini &&
+          effectiveContext &&
+          finalCues.length > 0
+        ) {
+          finalCues = snapGeminiCaptionsToSpeechAnchors(finalCues, effectiveContext, safeDuration);
+          finalScriptText = finalCues.map((c) => c.text).join(' ');
+        }
+
         // 2c. Captions-Only Missing-Line Coverage Audit & Targeted 1-to-1 Repair Pass
-        // Only run when Whisper transcript was actually used (skip in Gemini Direct mode and Whisper 1:1 locked mode).
+        // Runs whenever timestamped speech anchors exist (both standard & Gemini Mode) so zero spoken lines are skipped!
         if (
           isCaptionsOnlyMode &&
           !whisperLockedSucceeded &&
-          !isGeminiDirectCaptions &&
           !(isSttOnly && sttMode === 'transcribe') &&
           usedLiveGemini &&
           effectiveContext
@@ -6188,8 +6203,8 @@ Return JSON { title: "${String(finalTitle || title || 'Captions').replace(/"/g, 
               const repairLinesText = uncoveredSegs
                 .map((seg, idx) => `${idx + 1}. [${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.text}`)
                 .join('\n');
-              const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below into ${langLabel} (1-to-1, do NOT skip ANY line!).
-${targetLanguage === 'my' ? 'STRICT RULE: ONLY when a line literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation or line.\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
+              const repairPrompt = `You MUST translate ALL ${uncoveredSegs.length} missed spoken dialogue lines below 100% into pure ${langLabel} (1-to-1, do NOT skip ANY line, ZERO untranslated Chinese/source words!).
+${targetLanguage === 'my' ? 'STRICT RULES:\n- FEMALE SPEAKER PRONOUN: Whenever a female speaker talks to a man/partner/adult, ALWAYS use "ရှင်" / "ရှင်က" / "ရှင့်ကို" (NEVER use "မင်း" for a female speaker!).\n- ONLY when a line literally says "哎呀" (Āiyā), translate that exact word as "အိုက်ယား". NEVER use "အိုက်ယား" for any other exclamation or line.\n' : ''}Keep the EXACT start_ms and end_ms milliseconds for every single item:
 ${repairLinesText}
 
 Return JSON { title: "${String(finalTitle || 'Captions').replace(/"/g, '')}", scriptText: "...", cues: [{ start_ms, end_ms, text }] } containing ALL ${uncoveredSegs.length} translated cues in the exact same order.`;

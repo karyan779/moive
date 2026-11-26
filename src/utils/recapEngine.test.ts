@@ -2163,10 +2163,45 @@ test('tightenCaptionsOnlyCuePauses trims trailing silence bloat and guarantees c
     10
   );
   assert.ok(
-    tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms >= 100,
-    `Expected >= 100ms visual clear gap, got ${tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms}ms`
+    tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms >= 150,
+    `Expected >= 150ms visual clear gap, got ${tightenedNoIntervals[1].start_ms - tightenedNoIntervals[0].end_ms}ms`
   );
 });
+
+import { snapGeminiCaptionsToSpeechAnchors } from './recapEngine.ts';
+
+test('Gemini Captions-Only enforces female pronoun ရှင် (not မင်း) and snaps drifted cues onto millisecond speech anchors', () => {
+  // 1) System prompt enforces female speaker pronoun "ရှင်" instead of "မင်း"
+  const capPrompt = buildCinematicTranslateSystemPrompt({
+    targetLanguage: 'my',
+    translateAudio: 'captions-only'
+  });
+  assert.ok(capPrompt.includes('FEMALE SPEAKER = "ရှင်"'));
+  assert.ok(capPrompt.includes('NEVER use "မင်း" when a girl/woman is speaking'));
+  assert.ok(capPrompt.includes('Leave a clean uncaptioned gap between speaker turns'));
+
+  // 2) Drifted & continuously chained Gemini cues snap cleanly onto millisecond speech anchors with clear gaps
+  const driftedGeminiCues = [
+    { id: 'g1', start_ms: 1550, end_ms: 3500, text: 'အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ' },
+    { id: 'g2', start_ms: 3500, end_ms: 5900, text: 'ရှင်...မြန်မြန်ဆင်းလာတော့လေ' }
+  ];
+  const anchorTranscript = [
+    '[00:01.05 - 00:02.45] 哎呀到家了宝宝',
+    '[00:03.10 - 00:04.70] 你快点下来了'
+  ].join('\n');
+
+  const snapped = snapGeminiCaptionsToSpeechAnchors(driftedGeminiCues, anchorTranscript, 12);
+  assert.equal(snapped.length, 2);
+  assert.equal(snapped[0].start_ms, 1050);
+  assert.equal(snapped[0].end_ms, 2450);
+  assert.equal(snapped[0].text, 'အိုက်ယား...အိမ်ရောက်ပြီ ဘေဘီ');
+  assert.equal(snapped[1].start_ms, 3100);
+  assert.equal(snapped[1].end_ms, 4700);
+  assert.equal(snapped[1].text, 'ရှင်...မြန်မြန်ဆင်းလာတော့လေ');
+  // Clear 650ms gap between Speaker 1 finishing (2450ms) and Speaker 2 starting (3100ms)!
+  assert.equal(snapped[1].start_ms - snapped[0].end_ms, 650);
+});
+
 
 
 
